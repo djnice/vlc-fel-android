@@ -2,9 +2,9 @@
 
 Dolby Vision Profile 7 **FEL** playback at full quality in VLC for Android (3.7.2 Beta 3) on the Android firmware of Amlogic S928X players: base and enhancement layer decoded in hardware, composed on the GPU (12-bit, dither), Dolby Vision output, with a **lead time**: VLC presents every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds the composed frame back to its vsync, so the GPU has ~2.5 frame periods instead of ~1.
 
-Measured on a Dune HD Pro 8K Plus (4K 24p P7 FEL with MMR chroma, 2 minutes): **0 repeated or dropped frames** (without the lead time ~25 a minute), picture in sync with the audio (before: 84 ms late).
+Measured (4K 24p P7 FEL, 2 minutes each): **0 repeated or dropped frames** on a Dune HD Pro 8K Plus (R22, MMR chroma; without the lead time ~25 a minute) and on a Dune HD Pro One 8K Plus (R24), picture in sync with the audio (before: 84 ms late).
 
-**Tested:** Dune HD Pro 8K Plus, firmware `250815_1012_r22`. R24 (`260303_1721_r24`): the kernel symbols the module uses have the same versions there (one module build for both), not tested with VLC FEL yet – reports welcome. On other S928X Dune HD / R_volution players please report how it works (model, firmware and `adb logcat -s dvfelplay`).
+**Tested:** Dune HD Pro 8K Plus, firmware `250815_1012_r22`; Dune HD Pro One 8K Plus, firmware `260303_1721_r24` (one module build for both). On other S928X Dune HD / R_volution players please report how it works (model, firmware and `adb logcat -s dvfelplay`).
 
 ### Install
 1. Install `VLC-FEL-0.1.0-poc-armeabi-v7a.apk` ("VLC FEL", `org.videolan.vlc.fel`, next to the official VLC).

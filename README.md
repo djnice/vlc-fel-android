@@ -23,8 +23,8 @@ VLC demux ─ mediacodec module ─ libdvfelplay: RPU → profile 8.1 (no-op map
 With a **lead time**: VLC presents every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds
 the composed frame back to its vsync. The GPU has ~2.5 frame periods instead of ~1, so its time spikes during
 playback (up to ~110 ms measured) no longer repeat or drop frames, and the picture is in sync with the audio
-(before: 84 ms late). Measured on a Dune HD Pro 8K Plus, 4K 24p P7 FEL with MMR chroma, 2 minutes: 0 repeated
-or dropped frames (without the lead time: ~25 a minute).
+(before: 84 ms late). Measured, 4K 24p P7 FEL, 2 minutes each: 0 repeated or dropped frames on a Dune HD
+Pro 8K Plus (R22, MMR chroma; without the lead time: ~25 a minute) and on a Dune HD Pro One 8K Plus (R24).
 
 ## Download
 
@@ -33,8 +33,9 @@ Releases: <https://github.com/djnice/vlc-fel-android/releases> (APK, read `READM
 ## Requirements
 
 - Amlogic S928X Dune HD or R_volution player with the Dune HD **R22 or R24** Android firmware.
-  Tested: Dune HD Pro 8K Plus, firmware `250815_1012_r22`. R24 (`260303_1721_r24`): the kernel symbols
-  the module uses have the same versions there (one module build for both), not tested with VLC FEL yet.
+  Tested: Dune HD Pro 8K Plus, firmware `250815_1012_r22`; Dune HD Pro One 8K Plus, firmware
+  `260303_1721_r24` (one module build for both, no symbol version differences): playback, pause / seek,
+  the module installation (R22 with root access off, R24 with it on) and the module loading at boot.
 - Profile 7 FEL files with the enhancement layer in the base layer's track (**single track, STDL**, e.g. MKV
   remuxes). Dual track (DTDL) files are not supported yet.
 - Root access for the one-time module installation (the firmware's `sud`; VLC FEL asks to switch it on for
@@ -94,7 +95,7 @@ module is not loaded (or older):
 - **Single track (STDL) only**: the enhancement layer must be in the same video track as the base layer (as in
   MKV remuxes, e.g. MakeMKV). Dual track files (DTDL: the EL in a separate track or PID, e.g. Blu-ray m2ts /
   ISO, dual track MP4) play the base layer only, without Dolby Vision.
-- Proof of concept: one firmware version / model tested with VLC FEL. 4K 50/60p FEL is too heavy (GPU time).
+- Proof of concept: two firmware versions / models tested. 4K 50/60p FEL is too heavy (GPU time).
 - 32-bit (armeabi-v7a) only, like the players' userspace.
 - The Dune auto frame rate does not switch back after stop until you return to the Dune home screen.
 - After a seek, 1–2 frames may be shown with the RPU mapping only (no EL residual), and the first frames

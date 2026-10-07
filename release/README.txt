@@ -16,15 +16,15 @@ Előfutással működik: a VLC minden képet
 3 vsync-kel (24 Hz-en 125 ms) korábban ad ki, a kernelmodul pedig a kész képet a saját vsyncjéig
 visszatartja. Így a GPU-nak ~2,5 képkockányi ideje van ~1 helyett: a lejátszás közbeni GPU-kiugrások
 nem okoznak akadást, és a kép a hanggal szinkronban van.
-Mérve (Dune HD Pro 8K Plus, 4K 24p P7 FEL, MMR-es króma, 2 perc): 0 ismételt / eldobott képkocka
-(előfutás nélkül ~25 percenként).
+Mérve (4K 24p P7 FEL, 2-2 perc): 0 ismételt / eldobott képkocka Dune HD Pro 8K Plus-on (R22,
+MMR-es króma; előfutás nélkül ~25 percenként) és Dune HD Pro One 8K Plus-on (R24).
 
 FELTÉTELEK
 ----------
 - Amlogic S928X-es Dune HD vagy R_volution lejátszó, Dune HD R22-es vagy R24-es Android firmware-rel.
-  Tesztelve: Dune HD Pro 8K Plus, firmware 250815_1012_r22. R24 (260303_1721_r24): a modul által
-  használt kernelszimbólumok ott is ugyanazok (egy build mindkettőre), VLC FEL-lel még nem
-  teszteltük. Más firmware-en / modellen kérjük jelezd,
+  Tesztelve: Dune HD Pro 8K Plus, firmware 250815_1012_r22;
+             Dune HD Pro One 8K Plus, firmware 260303_1721_r24 (egy modul mindkettőre).
+  Más firmware-en / modellen kérjük jelezd,
   hogyan működik (adb logcat -s dvfelplay: a telepítő a tesztelt firmware-től eltérő
   kernelszimbólumokat is kiírja).
 - Root-hozzáférés a modul telepítéséhez. Ha a lejátszón ki van kapcsolva, a VLC FEL megkérdezi,
@@ -85,14 +85,14 @@ It works with a lead time: VLC presents
 every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds the composed frame back to
 its vsync. The GPU gets ~2.5 frame periods instead of ~1: its time spikes during playback no longer
 cause stutter, and the picture is in sync with the audio.
-Measured (Dune HD Pro 8K Plus, 4K 24p P7 FEL with MMR chroma, 2 minutes): 0 repeated / dropped
-frames (without the lead time ~25 a minute).
+Measured (4K 24p P7 FEL, 2 minutes each): 0 repeated / dropped frames on a Dune HD Pro 8K Plus
+(R22, MMR chroma; without the lead time ~25 a minute) and on a Dune HD Pro One 8K Plus (R24).
 
 REQUIREMENTS
 ------------
 - An Amlogic S928X Dune HD or R_volution player with Dune HD R22 or R24 Android firmware.
-  Tested: Dune HD Pro 8K Plus, firmware 250815_1012_r22. R24 (260303_1721_r24): the kernel symbols
-  the module uses have the same versions there (one build for both), not tested with VLC FEL yet.
+  Tested: Dune HD Pro 8K Plus, firmware 250815_1012_r22;
+          Dune HD Pro One 8K Plus, firmware 260303_1721_r24 (one module build for both).
   On other firmware / models please report how it
   works (adb logcat -s dvfelplay: the installer also lists kernel symbols whose versions differ from
   the tested firmware).
