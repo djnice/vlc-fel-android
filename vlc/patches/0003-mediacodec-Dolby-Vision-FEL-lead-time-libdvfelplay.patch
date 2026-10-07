@@ -1,0 +1,55 @@
+From 6838d449935f77e3debb61f896d1332deb62ef6c Mon Sep 17 00:00:00 2001
+Message-ID: <6838d449935f77e3debb61f896d1332deb62ef6c.1791360898.git.djnice@freemail.hu>
+From: djnice <djnice@freemail.hu>
+Date: Wed, 7 Oct 2026 10:14:58 +0200
+Subject: [PATCH] mediacodec: Dolby Vision FEL lead time (libdvfelplay)
+
+With FEL composition the decoder's pictures are dated dvfp_present_lead_ns()
+(whole vsyncs, e.g. 3 at 24 Hz) earlier: the vout presents and releases them
+that much ahead, and the dvfel kernel module holds the composed frames back
+to the vsync they are meant for. The GPU compositor gets that much more time
+(on Android the video composer hands each frame out only at its display
+vsync), the audio/video sync stays as it was.
+
+Message-Id: <20261007-dvfel-mediacodec-dovi-lead@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 905fd7c7fc..47841beaa2 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -89,6 +89,7 @@ static struct
+     void (*commit)(dvfp *, int64_t);
+     void (*flush)(dvfp *);
+     int64_t (*snap_present_ns)(int64_t); /* optional */
++    int64_t (*present_lead_ns)(const dvfp *); /* optional */
+ } dvfp_api;
+ 
+ static void DoviLoadOnce(void)
+@@ -103,6 +104,7 @@ static void DoviLoadOnce(void)
+      && dvfp_api.api_version() == DVFP_API_VERSION)
+     {
+         DVFP_SYM(snap_present_ns);
++        DVFP_SYM(present_lead_ns);
+         dvfp_api.loaded = true;
+     }
+ #undef DVFP_SYM
+@@ -1096,6 +1098,11 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+             p_pic->date = p_out->buf.i_ts;
+         else
+             p_pic->date = forced_ts;
++        /* FEL composition with a lead time: the picture is presented (and
++         * released to the display) that many vsyncs early, the kernel
++         * module holds the composed frame back to its time */
++        if (p_sys->video.b_dovi && p_sys->video.p_dvfp && dvfp_api.present_lead_ns)
++            p_pic->date -= dvfp_api.present_lead_ns(p_sys->video.p_dvfp) / 1000;
+         p_pic->b_progressive = true;
+ 
+         if (p_sys->api.b_direct_rendering)
+-- 
+2.55.0.windows.3
+

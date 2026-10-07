@@ -1,0 +1,93 @@
+From 5d6ddea5790cef9506fec9155884c38b78b351a8 Mon Sep 17 00:00:00 2001
+Message-ID: <5d6ddea5790cef9506fec9155884c38b78b351a8.1791365138.git.djnice@freemail.hu>
+From: djnice <djnice@freemail.hu>
+Date: Wed, 7 Oct 2026 11:22:42 +0200
+Subject: [PATCH] mediacodec: install the Dolby Vision FEL kernel module
+ (libdvfelplay)
+
+The first profile 7 FEL stream installs the dvfel kernel module bundled with
+libdvfelplay when it is missing or older (dvfp_module_install): root access
+is asked for with a question dialog when the firmware has it switched off
+(and switched off again afterwards); failures are reported once.
+
+Message-Id: <20261007-dvfel-mediacodec-dovi-module-install@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 34 ++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index ba6bf69493..fb2f7ec4af 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -39,6 +39,7 @@
+ #include <vlc_timestamp_helper.h>
+ #include <vlc_threads.h>
+ #include <vlc_bits.h>
++#include <vlc_dialog.h>
+ 
+ #include "mediacodec.h"
+ #include "../codec/hxxx_helper.h"
+@@ -90,6 +91,8 @@ static struct
+     void (*flush)(dvfp *);
+     int64_t (*snap_present_ns)(int64_t); /* optional */
+     int64_t (*present_lead_ns)(const dvfp *); /* optional */
++    int (*module_install)(const char *, int (*)(void *, const char *, const char *),
++                          void *, char *, size_t); /* optional */
+ } dvfp_api;
+ 
+ /*
+@@ -115,11 +118,40 @@ static void DoviLoadOnce(void)
+     {
+         DVFP_SYM(snap_present_ns);
+         DVFP_SYM(present_lead_ns);
++        DVFP_SYM(module_install);
+         dvfp_api.loaded = true;
+     }
+ #undef DVFP_SYM
+ }
+ 
++/* the module installer's question (root access for the installation) */
++static int DoviAsk(void *opaque, const char *psz_title, const char *psz_text)
++{
++    decoder_t *p_dec = opaque;
++    return vlc_dialog_wait_question(p_dec, VLC_DIALOG_QUESTION_NORMAL, _("No"),
++                                    _("Install"), NULL, psz_title, "%s", psz_text) == 1;
++}
++
++/* the dvfel kernel module bundled with libdvfelplay: installed when missing
++ * or older (asks for root access once), see dvfp_module_install() */
++static void DoviInstallModule(decoder_t *p_dec)
++{
++    static bool b_told;
++    char psz_msg[160];
++
++    if (!dvfp_api.module_install)
++        return;
++    int i_ret = dvfp_api.module_install(NULL, DoviAsk, p_dec, psz_msg, sizeof(psz_msg));
++    if (i_ret == 0)
++        return;
++    msg_Info(p_dec, "Dolby Vision FEL kernel module: %s", psz_msg);
++    if (i_ret < -1 && !b_told)
++    {
++        b_told = true;
++        vlc_dialog_display_error(p_dec, "Dolby Vision FEL", "%s", psz_msg);
++    }
++}
++
+ static bool DoviLoad(void)
+ {
+     static pthread_once_t once = PTHREAD_ONCE_INIT;
+@@ -1863,6 +1895,8 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+     const char *psz_mode = "";
+     if (info.profile == 7)
+     {
++        if (info.el_type == DVFP_EL_FEL && var_InheritBool(p_dec, CFG_PREFIX "dovi-fel"))
++            DoviInstallModule(p_dec);
+         const bool b_fel = info.el_type == DVFP_EL_FEL
+             && var_InheritBool(p_dec, CFG_PREFIX "dovi-fel") && dvfp_api.available();
+         if (b_fel)
+-- 
+2.55.0.windows.3
+

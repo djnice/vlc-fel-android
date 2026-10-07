@@ -1,0 +1,75 @@
+From 8688916d75fed349d040b9821b2b1a16c0d817c9 Mon Sep 17 00:00:00 2001
+Message-ID: <8688916d75fed349d040b9821b2b1a16c0d817c9.1791357812.git.djnice@freemail.hu>
+In-Reply-To: <e357b49bb25cecdfa4e3698fabfb55c56e9b39ec.1791357812.git.djnice@freemail.hu>
+References: <e357b49bb25cecdfa4e3698fabfb55c56e9b39ec.1791357812.git.djnice@freemail.hu>
+From: djnice <djnice@freemail.hu>
+Date: Wed, 7 Oct 2026 09:23:32 +0200
+Subject: [PATCH 2/2] mediacodec: Dolby Vision render times between the
+ display's vsyncs (libdvfelplay)
+
+The Dolby Vision decoder's output buffers are released at a time snapped to
+the middle between two vsyncs (dvfp_snap_present_ns, AChoreographer): VLC's
+clock jitter no longer moves two frames into one vsync (a drop in
+SurfaceFlinger / the video composer) and none into the next.
+
+Message-Id: <20261007-dvfel-mediacodec-dovi-snap@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index a6b367c7d3..905fd7c7fc 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -88,6 +88,7 @@ static struct
+     int (*filter)(dvfp *, const uint8_t *, size_t, const uint8_t **, size_t *);
+     void (*commit)(dvfp *, int64_t);
+     void (*flush)(dvfp *);
++    int64_t (*snap_present_ns)(int64_t); /* optional */
+ } dvfp_api;
+ 
+ static void DoviLoadOnce(void)
+@@ -100,7 +101,10 @@ static void DoviLoadOnce(void)
+      && DVFP_SYM(probe) && DVFP_SYM(open) && DVFP_SYM(close)
+      && DVFP_SYM(filter) && DVFP_SYM(commit) && DVFP_SYM(flush)
+      && dvfp_api.api_version() == DVFP_API_VERSION)
++    {
++        DVFP_SYM(snap_present_ns);
+         dvfp_api.loaded = true;
++    }
+ #undef DVFP_SYM
+ }
+ 
+@@ -185,6 +189,7 @@ struct decoder_sys_t
+             bool b_dovi_probe;
+             int i_profile; /* the HEVC profile the decoder was chosen for */
+             dvfp *p_dvfp;
++            bool b_dovi; /* the Dolby Vision decoder is in use */
+         } video;
+         struct {
+             date_t i_end_date;
+@@ -1003,7 +1008,12 @@ static void ReleasePictureTs(decoder_t *p_dec, unsigned i_index, vlc_tick_t i_ts
+     decoder_sys_t *p_sys = p_dec->p_sys;
+     assert(p_sys->api.release_out_ts);
+ 
+-    p_sys->api.release_out_ts(&p_sys->api, i_index, i_ts * INT64_C(1000));
++    int64_t i_ns = i_ts * INT64_C(1000);
++    /* Dolby Vision decoder: render times between the display's vsyncs, so
++     * that clock jitter never puts two frames into one vsync (a drop) */
++    if (p_sys->video.b_dovi && dvfp_api.snap_present_ns)
++        i_ns = dvfp_api.snap_present_ns(i_ns);
++    p_sys->api.release_out_ts(&p_sys->api, i_index, i_ns);
+ }
+ 
+ static void InvalidateAllPictures(decoder_t *p_dec)
+@@ -1867,6 +1877,7 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+              info.profile, info.el_type == DVFP_EL_FEL ? "FEL" : info.has_el ? "MEL" : "no EL",
+              psz_mode, p_sys->api.psz_name, dvfp_api.version());
+     p_sys->video.p_dvfp = p_dvfp;
++    p_sys->video.b_dovi = true;
+     p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+ 
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,326 @@
+From e357b49bb25cecdfa4e3698fabfb55c56e9b39ec Mon Sep 17 00:00:00 2001
+Message-ID: <e357b49bb25cecdfa4e3698fabfb55c56e9b39ec.1791357812.git.djnice@freemail.hu>
+From: djnice <djnice@freemail.hu>
+Date: Tue, 6 Oct 2026 17:06:43 +0200
+Subject: [PATCH 1/2] mediacodec: Dolby Vision decoder and FEL composition
+ through libdvfelplay
+
+The first access unit of an HEVC stream decides: with an RPU, the decoder
+is restarted as the Dolby Vision decoder (video/dolby-vision, profile 4,
+5 or 8; profile 7 converted to 8.1). libdvfelplay (loaded at run time)
+filters the access units and, on Amlogic S5 with the dvfel kernel module,
+composes the profile 7 full enhancement layer on the GPU.
+
+Options: mediacodec-dovi, mediacodec-dovi-fel (both on).
+
+Message-Id: <20261006-dvfel-mediacodec-dovi@djnice>
+---
+ modules/codec/omxil/mediacodec.c     | 207 +++++++++++++++++++++++++++
+ modules/codec/omxil/mediacodec_jni.c |   3 +
+ 2 files changed, 210 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 68e968eb8c..a6b367c7d3 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -47,10 +47,69 @@
+ #include "omxil_utils.h"
+ #include "../../video_output/android/display.h"
+ 
++#include <dlfcn.h>
++#include <pthread.h>
++
+ #define BLOCK_FLAG_CSD (0x01 << BLOCK_FLAG_PRIVATE_SHIFT)
+ 
+ #define DECODE_FLAG_RESTART (0x01)
+ #define DECODE_FLAG_DRAIN (0x02)
++
++/*
++ * Dolby Vision through libdvfelplay (optional, loaded at run time): the first
++ * HEVC access unit's RPU decides; the decoder is restarted as the Dolby Vision
++ * decoder ("video/dolby-vision"). Profile 7 goes to it converted to profile
++ * 8.1 (EL removed); with the dvfel kernel module (Amlogic S5), the full
++ * enhancement layer is composed on the GPU (see dvfelplay.h). The types below
++ * are those of the library's API version 1.
++ */
++typedef struct dvfp dvfp;
++struct dvfp_rpu_info
++{
++    int has_rpu;
++    int profile;
++    int el_type;
++    int has_el;
++};
++#define DVFP_API_VERSION 1
++#define DVFP_EL_FEL 2
++#define DVFP_MODE_CONVERT 0
++#define DVFP_MODE_FEL 1
++
++static struct
++{
++    bool loaded;
++    int (*api_version)(void);
++    const char *(*version)(void);
++    int (*available)(void);
++    int (*probe)(const uint8_t *, size_t, struct dvfp_rpu_info *);
++    dvfp *(*open)(int, int, int);
++    void (*close)(dvfp *);
++    int (*filter)(dvfp *, const uint8_t *, size_t, const uint8_t **, size_t *);
++    void (*commit)(dvfp *, int64_t);
++    void (*flush)(dvfp *);
++} dvfp_api;
++
++static void DoviLoadOnce(void)
++{
++    void *lib = dlopen("libdvfelplay.so", RTLD_NOW);
++    if (!lib)
++        return;
++#define DVFP_SYM(name) (*(void **)&dvfp_api.name = dlsym(lib, "dvfp_" #name))
++    if (DVFP_SYM(api_version) && DVFP_SYM(version) && DVFP_SYM(available)
++     && DVFP_SYM(probe) && DVFP_SYM(open) && DVFP_SYM(close)
++     && DVFP_SYM(filter) && DVFP_SYM(commit) && DVFP_SYM(flush)
++     && dvfp_api.api_version() == DVFP_API_VERSION)
++        dvfp_api.loaded = true;
++#undef DVFP_SYM
++}
++
++static bool DoviLoad(void)
++{
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, DoviLoadOnce);
++    return dvfp_api.loaded;
++}
+ /**
+  * Callback called when a new block is processed from DecodeBlock.
+  * It returns -1 in case of error, 0 if block should be dropped, 1 otherwise.
+@@ -122,6 +181,10 @@ struct decoder_sys_t
+             unsigned int i_inflight_pictures;
+             timestamp_fifo_t *timestamp_fifo;
+             int i_mpeg_dar_num, i_mpeg_dar_den;
++            /* Dolby Vision: decided by the first access unit */
++            bool b_dovi_probe;
++            int i_profile; /* the HEVC profile the decoder was chosen for */
++            dvfp *p_dvfp;
+         } video;
+         struct {
+             date_t i_end_date;
+@@ -146,6 +209,8 @@ static int Video_OnNewBlock(decoder_t *, block_t **);
+ static int VideoHXXX_OnNewBlock(decoder_t *, block_t **);
+ static int VideoMPEG2_OnNewBlock(decoder_t *, block_t **);
+ static int VideoVC1_OnNewBlock(decoder_t *, block_t **);
++static void DoviProbe(decoder_t *, const block_t *);
++static int DoviFilter(decoder_t *, block_t **);
+ static void Video_OnFlush(decoder_t *);
+ static int Video_ProcessOutput(decoder_t *, mc_api_out *, picture_t **,
+                                block_t **);
+@@ -176,6 +241,15 @@ static void RemoveInflightPictures(decoder_t *);
+ 
+ #define MEDIACODEC_TUNNELEDPLAYBACK_TEXT "Use a tunneled surface for playback"
+ 
++#define MEDIACODEC_DOVI_TEXT "Dolby Vision decoder"
++#define MEDIACODEC_DOVI_LONGTEXT \
++    "Decode Dolby Vision HEVC streams with the Dolby Vision decoder " \
++    "(needs libdvfelplay; profile 7 is converted to profile 8.1)."
++#define MEDIACODEC_DOVI_FEL_TEXT "Dolby Vision FEL composition"
++#define MEDIACODEC_DOVI_FEL_LONGTEXT \
++    "Compose the full enhancement layer of Dolby Vision profile 7 streams " \
++    "on the GPU (Amlogic S5 with the dvfel kernel module)."
++
+ #define CFG_PREFIX "mediacodec-"
+ 
+ vlc_module_begin ()
+@@ -190,6 +264,10 @@ vlc_module_begin ()
+              MEDIACODEC_AUDIO_TEXT, MEDIACODEC_AUDIO_LONGTEXT, true)
+     add_bool(CFG_PREFIX "tunneled-playback", false,
+              MEDIACODEC_TUNNELEDPLAYBACK_TEXT, NULL, true)
++    add_bool(CFG_PREFIX "dovi", true,
++             MEDIACODEC_DOVI_TEXT, MEDIACODEC_DOVI_LONGTEXT, true)
++    add_bool(CFG_PREFIX "dovi-fel", true,
++             MEDIACODEC_DOVI_FEL_TEXT, MEDIACODEC_DOVI_FEL_LONGTEXT, true)
+     set_callbacks(OpenDecoderNdk, CloseDecoder)
+     add_shortcut("mediacodec_ndk")
+     add_submodule ()
+@@ -717,6 +795,12 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+                              p_dec->fmt_in.i_codec, false);
+             break;
+         }
++        p_sys->video.i_profile = i_profile;
++        /* Dolby Vision: only with direct rendering (the decoder's metadata
++         * stays with the frames on the way to the display) */
++        p_sys->video.b_dovi_probe = p_dec->fmt_in.i_codec == VLC_CODEC_HEVC
++            && var_InheritBool(p_dec, CFG_PREFIX "dovi")
++            && var_InheritBool(p_dec, CFG_PREFIX "dr");
+         p_sys->pf_on_new_block = Video_OnNewBlock;
+         p_sys->pf_on_flush = Video_OnFlush;
+         p_sys->pf_process_output = Video_ProcessOutput;
+@@ -871,6 +955,9 @@ static void CleanDecoder(decoder_t *p_dec)
+ 
+     if (p_dec->fmt_in.i_cat == VIDEO_ES)
+     {
++        if (p_sys->video.p_dvfp)
++            dvfp_api.close(p_sys->video.p_dvfp);
++
+         if (p_dec->fmt_in.i_codec == VLC_CODEC_H264
+          || p_dec->fmt_in.i_codec == VLC_CODEC_HEVC)
+             hxxx_helper_clean(&p_sys->video.hh);
+@@ -1256,6 +1343,8 @@ static void DecodeFlushLocked(decoder_t *p_dec)
+         AbortDecoderLocked(p_dec);
+         return;
+     }
++    if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_dvfp)
++        dvfp_api.flush(p_sys->video.p_dvfp);
+ 
+     vlc_cond_broadcast(&p_sys->cond);
+ 
+@@ -1445,6 +1534,10 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+                     if (p_block->i_flags & BLOCK_FLAG_PREROLL)
+                         p_sys->i_preroll_end = i_ts;
+ 
++                    /* the RPU and EL of the access unit belong to this pts */
++                    if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_dvfp)
++                        dvfp_api.commit(p_sys->video.p_dvfp, i_ts);
++
+                     /* One input buffer is queued, signal OutThread that will
+                      * fetch output buffers */
+                     p_sys->b_output_ready = true;
+@@ -1685,9 +1778,123 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+         }
+     }
+ 
++    if (p_sys->video.b_dovi_probe)
++        DoviProbe(p_dec, *pp_block);
++    if (p_sys->video.p_dvfp)
++    {
++        int i_ret = DoviFilter(p_dec, pp_block);
++        if (i_ret != 1)
++            return i_ret;
++    }
++
+     return Video_OnNewBlock(p_dec, pp_block);
+ }
+ 
++/* the Dolby Vision decoder's profile constant for a Dolby Vision profile */
++static int DoviMediaCodecProfile(int i_dv_profile)
++{
++    switch (i_dv_profile)
++    {
++        case 4: return 0x10;  /* DolbyVisionProfileDvheDtr */
++        case 5: return 0x20;  /* DolbyVisionProfileDvheStn */
++        case 7:               /* converted to 8.1 */
++        case 8: return 0x100; /* DolbyVisionProfileDvheSt */
++        default: return -1;
++    }
++}
++
++/*
++ * First access unit of an HEVC stream: Dolby Vision (an RPU)? The decoder is
++ * restarted as the Dolby Vision decoder then (before anything was queued).
++ */
++static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    struct dvfp_rpu_info info;
++
++    p_sys->video.b_dovi_probe = false;
++    if (p_dec->fmt_out.i_codec != VLC_CODEC_ANDROID_OPAQUE || !DoviLoad()
++     || dvfp_api.probe(p_block->p_buffer, p_block->i_buffer, &info) != 0
++     || !info.has_rpu)
++        return;
++
++    const int i_mc_profile = DoviMediaCodecProfile(info.profile);
++    if (i_mc_profile < 0)
++    {
++        msg_Info(p_dec, "Dolby Vision profile %d: not supported, HEVC base layer",
++                 info.profile);
++        return;
++    }
++
++    const unsigned i_width = p_dec->fmt_out.video.i_width;
++    const unsigned i_height = p_dec->fmt_out.video.i_height;
++    dvfp *p_dvfp = NULL;
++    const char *psz_mode = "";
++    if (info.profile == 7)
++    {
++        const bool b_fel = info.el_type == DVFP_EL_FEL
++            && var_InheritBool(p_dec, CFG_PREFIX "dovi-fel") && dvfp_api.available();
++        if (b_fel)
++        {
++            p_dvfp = dvfp_api.open(i_width, i_height, DVFP_MODE_FEL);
++            psz_mode = ", FEL composition";
++        }
++        if (!p_dvfp)
++        {
++            p_dvfp = dvfp_api.open(i_width, i_height, DVFP_MODE_CONVERT);
++            psz_mode = ", converted to profile 8.1";
++        }
++        if (!p_dvfp)
++        {
++            msg_Warn(p_dec, "Dolby Vision profile 7: libdvfelplay failed, HEVC base layer");
++            return;
++        }
++    }
++
++    const char *psz_mime = p_sys->api.psz_mime;
++    p_sys->api.psz_mime = "video/dolby-vision";
++    if (p_sys->api.configure(&p_sys->api, i_mc_profile) != 0
++     && p_sys->api.configure(&p_sys->api, 0) != 0)
++    {
++        msg_Warn(p_dec, "no Dolby Vision decoder, HEVC base layer");
++        p_sys->api.psz_mime = psz_mime;
++        p_sys->api.configure(&p_sys->api, p_sys->video.i_profile);
++        if (p_dvfp)
++            dvfp_api.close(p_dvfp);
++        return;
++    }
++    msg_Info(p_dec, "Dolby Vision profile %d (%s)%s: decoder %s, libdvfelplay %s",
++             info.profile, info.el_type == DVFP_EL_FEL ? "FEL" : info.has_el ? "MEL" : "no EL",
++             psz_mode, p_sys->api.psz_name, dvfp_api.version());
++    p_sys->video.p_dvfp = p_dvfp;
++    p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
++}
++
++/* the access unit as the Dolby Vision decoder gets it */
++static int DoviFilter(decoder_t *p_dec, block_t **pp_block)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    block_t *p_block = *pp_block;
++    const uint8_t *p_out;
++    size_t i_out;
++
++    if (dvfp_api.filter(p_sys->video.p_dvfp, p_block->p_buffer, p_block->i_buffer,
++                        &p_out, &i_out) != 0)
++        return 1;
++    block_t *p_new = block_Alloc(i_out);
++    if (!p_new)
++    {
++        block_Release(p_block);
++        *pp_block = NULL;
++        return 0;
++    }
++    memcpy(p_new->p_buffer, p_out, i_out);
++    block_CopyProperties(p_new, p_block);
++    block_Release(p_block);
++    *pp_block = p_new;
++    return 1;
++}
++
+ static int VideoMPEG2_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+ {
+     if (pp_block == NULL || (*pp_block)->i_buffer <= 7)
+diff --git a/modules/codec/omxil/mediacodec_jni.c b/modules/codec/omxil/mediacodec_jni.c
+index a9721c18de..de136b0ecd 100644
+--- a/modules/codec/omxil/mediacodec_jni.c
++++ b/modules/codec/omxil/mediacodec_jni.c
+@@ -463,6 +463,9 @@ char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
+                                     break;
+                             }
+                         }
++                        else if (strcmp(psz_mime, "video/dolby-vision") == 0)
++                            /* CodecProfileLevel.DolbyVisionProfile* */
++                            codec_profile = omx_profile;
+                         if (codec_profile != profile)
+                             continue;
+                         /* Some encoders set the level too high, thus we ignore it for the moment.
+-- 
+2.55.0.windows.3
+
