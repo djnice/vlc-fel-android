@@ -35,6 +35,8 @@ Releases: <https://github.com/djnice/vlc-fel-android/releases> (APK, read `READM
 - Amlogic S928X Dune HD or R_volution player with the Dune HD **R22 or R24** Android firmware.
   Tested: Dune HD Pro 8K Plus, firmware `250815_1012_r22`. R24 (`260303_1721_r24`): the kernel symbols
   the module uses have the same versions there (one module build for both), not tested with VLC FEL yet.
+- Profile 7 FEL files with the enhancement layer in the base layer's track (**single track, STDL**, e.g. MKV
+  remuxes). Dual track (DTDL) files are not supported yet.
 - Root access for the one-time module installation (the firmware's `sud`; VLC FEL asks to switch it on for
   the installation and switches it off again).
 
@@ -78,7 +80,7 @@ module is not loaded (or older):
 
 ## Use / switches
 
-- Plays like VLC; profile 7 FEL files are composed, MEL and profile 7 without EL play as profile 8.1,
+- Plays like VLC; profile 7 FEL files (single track, STDL – see the limits below) are composed, MEL and profile 7 without EL play as profile 8.1,
   other Dolby Vision profiles through the Dolby Vision decoder. VLC option `--no-mediacodec-dovi-fel`
   (Settings → Advanced → Custom libVLC options) turns FEL composition off.
 - Test switches (`adb shell setprop`, read by libdvfelplay): `debug.dvfp.lead_ms` (lead time, 0: off),
@@ -89,6 +91,9 @@ module is not loaded (or older):
 
 ## Status / known limits
 
+- **Single track (STDL) only**: the enhancement layer must be in the same video track as the base layer (as in
+  MKV remuxes, e.g. MakeMKV). Dual track files (DTDL: the EL in a separate track or PID, e.g. Blu-ray m2ts /
+  ISO, dual track MP4) play the base layer only, without Dolby Vision.
 - Proof of concept: one firmware version / model tested with VLC FEL. 4K 50/60p FEL is too heavy (GPU time).
 - 32-bit (armeabi-v7a) only, like the players' userspace.
 - The Dune auto frame rate does not switch back after stop until you return to the Dune home screen.
