@@ -1,0 +1,867 @@
+From 572f14291a57e0e85768c6b5c72d2832778b67c5 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 12 Oct 2026 15:12:46 +0200
+Subject: [PATCH] mp4, ts: Dolby Vision dual track / dual PID enhancement layer
+ merged into the base layer
+
+Profile 7 dual layer content with the enhancement layer (EL and RPU) in a
+track or PID of its own is turned into the single track form: each EL access
+unit is appended to the base layer access unit with the same DTS, every EL NAL
+unit wrapped in a NAL unit of type 63 and the RPU (type 62) last.
+
+MP4: an EL track (dvhe/dvh1 at a quarter of the base layer's size) gets no ES
+(handled like a chapters track) and is read along with the base layer; its
+hvcC parameter sets are added at IRAP pictures when the samples have none.
+The presentation times are now computed from the decoding time before the edit
+list clamping, which gave the first pictures of B-frame streams wrong (even
+duplicate) times.
+
+TS: the dependent PID comes from the full PMT (ts_psi.c; Ultra HD Blu-ray PMTs
+span several packets): the Dolby Vision video stream descriptor without the
+base layer, or HEVC 0x1015 next to 0x1011; the 3D MVC merging is reused with
+the EL wrapped. Also for 3D MVC: a dependent PES is finished at a base PES
+start only in .ssif files (elsewhere the next base AU may be interleaved with
+it), the base PES wait in a queue of 8 for their dependent AUs, and the .ssif
+seek read back searches the extents in steps smaller than an extent (the
+exponential steps could skip a whole extent pair) and handles a position
+inside a dependent view extent.
+
+Message-Id: <20261012-dvfel-dovi-dual-layer-merge@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/demux/mp4/mp4.c     | 278 +++++++++++++++++++++++++++++++++++-
+ modules/demux/mpeg/ts.c     | 265 ++++++++++++++++++++++++----------
+ modules/demux/mpeg/ts.h     |  19 ++-
+ modules/demux/mpeg/ts_psi.c |  48 +++++++
+ 4 files changed, 530 insertions(+), 80 deletions(-)
+
+diff --git a/modules/demux/mp4/mp4.c b/modules/demux/mp4/mp4.c
+index e5db797c8b..af4ebdeff3 100644
+--- a/modules/demux/mp4/mp4.c
++++ b/modules/demux/mp4/mp4.c
+@@ -109,6 +109,16 @@ struct demux_sys_t
+     /* */
+     MP4_Box_t    *p_tref_chap;
+ 
++    /* Dolby Vision dual track: the enhancement layer track, merged into the
++     * base layer's samples */
++    struct
++    {
++        mp4_track_t *p_bl;
++        mp4_track_t *p_el;
++        unsigned     i_merged;
++        unsigned     i_missed;
++    } dv;
++
+     /* */
+     input_title_t *p_title;
+     vlc_meta_t    *p_meta;
+@@ -432,6 +442,28 @@ static inline vlc_tick_t MP4_TrackGetDTS( demux_t *p_demux, mp4_track_t *p_track
+     return MP4_rescale_mtime( sdts, p_track->i_timescale );
+ }
+ 
++/* the decoding time before MP4_TrackTimeApplyELST() clamps it: negative for
++ * the first samples when the edit list skips the composition delay (the
++ * presentation times are computed from it) */
++static inline vlc_tick_t MP4_TrackGetDTSUnclamped( demux_t *p_demux, mp4_track_t *p_track )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    const mp4_chunk_t *p_chunk = &p_track->chunk[p_track->i_chunk];
++
++    stime_t sdts = MP4_ChunkGetSampleDTS( p_chunk,
++                                          p_track->i_sample - p_chunk->i_sample_first );
++    if( p_track->p_elst && p_track->BOXDATA(p_elst)->i_entry_count )
++    {
++        const MP4_Box_data_elst_t *elst = p_track->BOXDATA(p_elst);
++        if( elst->i_media_time[p_track->i_elst] > 0 &&
++            ( elst->i_media_rate_integer[p_track->i_elst] > 0 ||
++              elst->i_media_rate_fraction[p_track->i_elst] > 0 ) )
++            sdts -= elst->i_media_time[p_track->i_elst];
++        sdts += MP4_rescale( p_track->i_elst_time, p_sys->i_timescale, p_track->i_timescale );
++    }
++    return MP4_rescale_mtime( sdts, p_track->i_timescale );
++}
++
+ static inline bool MP4_TrackGetPTSDelta( demux_t *p_demux, const mp4_track_t *p_track,
+                                          vlc_tick_t *pi_delta )
+ {
+@@ -714,12 +746,251 @@ static block_t * MP4_Block_Convert( demux_t *p_demux, const mp4_track_t *p_track
+     return p_block;
+ }
+ 
++/*****************************************************************************
++ * Dolby Vision dual track (profile 7 Blu-ray remuxes): the enhancement layer
++ * (EL and RPU) is a track of its own (dvhe/dvh1, a quarter of the base
++ * layer's size). Its samples are merged into the base layer's samples the
++ * way single track files carry them: every EL NAL unit wrapped in a NAL unit
++ * of type 63, the RPU (type 62) last.
++ *****************************************************************************/
++static int TrackTimeToSampleChunk( demux_t *, mp4_track_t *, vlc_tick_t,
++                                   uint32_t *, uint32_t * );
++static int TrackGotoChunkSample( demux_t *, mp4_track_t *, unsigned int, unsigned int );
++
++static unsigned DVNalLengthSize( const es_format_t *p_fmt )
++{
++    if( p_fmt->i_extra < 23 )
++        return 0;
++    return ( ((const uint8_t *)p_fmt->p_extra)[21] & 0x03 ) + 1;
++}
++
++static void DVSetupDualTrack( demux_t *p_demux )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++
++    for( unsigned i = 0; i < p_sys->i_tracks; i++ )
++    {
++        mp4_track_t *p_el = &p_sys->track[i];
++        if( !p_el->b_ok || p_el->b_chapters_source || p_el->fmt.i_cat != VIDEO_ES ||
++            !p_el->p_sample || !DVNalLengthSize( &p_el->fmt ) ||
++            ( p_el->p_sample->i_type != VLC_FOURCC( 'd', 'v', 'h', 'e' ) &&
++              p_el->p_sample->i_type != VLC_FOURCC( 'd', 'v', 'h', '1' ) ) )
++            continue;
++
++        for( unsigned j = 0; j < p_sys->i_tracks; j++ )
++        {
++            mp4_track_t *p_bl = &p_sys->track[j];
++            if( j == i || !p_bl->b_ok || p_bl->b_chapters_source ||
++                p_bl->fmt.i_cat != VIDEO_ES || !p_bl->p_sample ||
++                !DVNalLengthSize( &p_bl->fmt ) ||
++                p_bl->fmt.video.i_width != 2 * p_el->fmt.video.i_width ||
++                p_bl->fmt.video.i_height != 2 * p_el->fmt.video.i_height )
++                continue;
++            switch( p_bl->p_sample->i_type )
++            {
++                case VLC_FOURCC( 'h', 'v', 'c', '1' ):
++                case VLC_FOURCC( 'h', 'e', 'v', '1' ):
++                case VLC_FOURCC( 'd', 'v', 'h', 'e' ):
++                case VLC_FOURCC( 'd', 'v', 'h', '1' ):
++                    break;
++                default:
++                    continue;
++            }
++
++            /* no ES and not demuxed on its own (like a chapters track), but
++             * selected so that its samples can be stepped through */
++            if( p_el->p_es )
++                es_out_Del( p_demux->out, p_el->p_es );
++            p_el->p_es = NULL;
++            p_el->b_chapters_source = true;
++            p_el->b_selected = true;
++            p_sys->dv.p_bl = p_bl;
++            p_sys->dv.p_el = p_el;
++            msg_Info( p_demux, "Dolby Vision dual track: enhancement layer track[Id 0x%x] "
++                      "%ux%u merged into track[Id 0x%x]", p_el->i_track_ID,
++                      p_el->fmt.video.i_width, p_el->fmt.video.i_height,
++                      p_bl->i_track_ID );
++            return;
++        }
++    }
++}
++
++/* the EL sample with the base layer sample's DTS (or NULL) */
++static block_t *DVReadEL( demux_t *p_demux, vlc_tick_t i_nzdts )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    mp4_track_t *p_el = p_sys->dv.p_el;
++    const vlc_tick_t i_tolerance = VLC_TICK_FROM_MS(5);
++
++    /* after a seek (or at the start): from the sample before */
++    if( p_el->i_sample >= p_el->i_sample_count ||
++        MP4_TrackGetDTSUnclamped( p_demux, p_el ) > i_nzdts + i_tolerance ||
++        MP4_TrackGetDTSUnclamped( p_demux, p_el ) + VLC_TICK_FROM_SEC(2) < i_nzdts )
++    {
++        uint32_t i_chunk, i_sample;
++        p_el->b_selected = true;
++        if( TrackTimeToSampleChunk( p_demux, p_el, __MAX( i_nzdts, 0 ), &i_chunk, &i_sample ) ||
++            TrackGotoChunkSample( p_demux, p_el, i_chunk, i_sample ) )
++            return NULL;
++    }
++    while( p_el->i_sample < p_el->i_sample_count &&
++           MP4_TrackGetDTSUnclamped( p_demux, p_el ) + i_tolerance < i_nzdts )
++    {
++        if( MP4_TrackNextSample( p_demux, p_el, 1 ) )
++            return NULL;
++    }
++    if( p_el->i_sample >= p_el->i_sample_count ||
++        MP4_TrackGetDTSUnclamped( p_demux, p_el ) > i_nzdts + i_tolerance )
++        return NULL;
++
++    uint32_t i_nb_samples = 0;
++    uint32_t i_size = MP4_TrackGetReadSize( p_el, &i_nb_samples );
++    block_t *p_block = NULL;
++    if( i_size > 0 && i_nb_samples == 1 &&
++        MP4_Seek( p_demux->s, MP4_TrackGetPos( p_el ) ) == VLC_SUCCESS )
++        p_block = vlc_stream_Block( p_demux->s, i_size );
++    MP4_TrackNextSample( p_demux, p_el, 1 );
++    return p_block;
++}
++
++static uint8_t *DVPutNal( uint8_t *p, unsigned i_len_size, const uint8_t *p_nal,
++                          size_t i_nal, bool b_wrap )
++{
++    const size_t i_total = i_nal + (b_wrap ? 2 : 0);
++    for( unsigned k = 0; k < i_len_size; k++ )
++        *p++ = i_total >> (8 * (i_len_size - 1 - k));
++    if( b_wrap )
++    {
++        *p++ = 0x7E; /* NAL unit type 63, layer 0, temporal id 0 */
++        *p++ = 0x01;
++    }
++    memcpy( p, p_nal, i_nal );
++    return p + i_nal;
++}
++
++/* the VPS, SPS and PPS of a hvcC, wrapped (at most 32) */
++static uint8_t *DVPutParamSets( uint8_t *p, unsigned i_len_size, const es_format_t *p_fmt )
++{
++    const uint8_t *h = p_fmt->p_extra, *h_end = h + p_fmt->i_extra;
++    unsigned i_arrays = h[22], i_added = 0;
++
++    h += 23;
++    for( ; i_arrays > 0 && h + 3 <= h_end; i_arrays-- )
++    {
++        unsigned i_nalus = (h[1] << 8) | h[2];
++        h += 3;
++        for( ; i_nalus > 0 && h + 2 <= h_end; i_nalus-- )
++        {
++            const size_t i_len = (h[0] << 8) | h[1];
++            h += 2;
++            if( i_len > (size_t)(h_end - h) || i_added == 32 )
++                return p;
++            p = DVPutNal( p, i_len_size, h, i_len, true );
++            i_added++;
++            h += i_len;
++        }
++    }
++    return p;
++}
++
++/* the base layer sample with the enhancement layer appended */
++static block_t *DVMerge( demux_t *p_demux, block_t *p_bl )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    const unsigned i_bl_len = DVNalLengthSize( &p_sys->dv.p_bl->fmt );
++    const unsigned i_el_len = DVNalLengthSize( &p_sys->dv.p_el->fmt );
++    const es_format_t *p_el_fmt = &p_sys->dv.p_el->fmt;
++
++    block_t *p_el = DVReadEL( p_demux, MP4_TrackGetDTSUnclamped( p_demux, p_sys->dv.p_bl ) );
++    if( !p_el )
++    {
++        if( p_sys->dv.i_missed++ % 100 == 0 )
++            msg_Warn( p_demux, "Dolby Vision dual track: no EL sample for dts %"PRId64
++                      " (%u merged, %u missed)", p_bl->i_dts, p_sys->dv.i_merged,
++                      p_sys->dv.i_missed );
++        return p_bl;
++    }
++
++    /* the EL's NAL units; parameter sets from its hvcC at IRAP pictures
++     * when the sample has none */
++    bool b_irap = false, b_ps = false;
++    size_t i_out = p_bl->i_buffer;
++    for( size_t i = 0; i + i_el_len <= p_el->i_buffer; )
++    {
++        size_t n = 0;
++        for( unsigned k = 0; k < i_el_len; k++ )
++            n = (n << 8) | p_el->p_buffer[i + k];
++        i += i_el_len;
++        if( n < 2 || n > p_el->i_buffer - i )
++            break;
++        const unsigned i_type = (p_el->p_buffer[i] >> 1) & 0x3f;
++        b_irap |= i_type >= 16 && i_type <= 21;
++        b_ps |= i_type >= 32 && i_type <= 34;
++        i_out += i_bl_len + 2 + n;
++        i += n;
++    }
++    bool b_add_ps = b_irap && !b_ps && p_el_fmt->i_extra > 23;
++    if( b_add_ps )
++        i_out += p_el_fmt->i_extra + 32 * (i_bl_len + 2);
++
++    block_t *p_out = block_Alloc( i_out );
++    if( !p_out )
++    {
++        block_Release( p_el );
++        return p_bl;
++    }
++    block_CopyProperties( p_out, p_bl );
++    memcpy( p_out->p_buffer, p_bl->p_buffer, p_bl->i_buffer );
++    uint8_t *p = p_out->p_buffer + p_bl->i_buffer;
++    const uint8_t *p_rpu = NULL;
++    size_t i_rpu = 0;
++
++    for( size_t i = 0; i + i_el_len <= p_el->i_buffer; )
++    {
++        size_t n = 0;
++        for( unsigned k = 0; k < i_el_len; k++ )
++            n = (n << 8) | p_el->p_buffer[i + k];
++        i += i_el_len;
++        if( n < 2 || n > p_el->i_buffer - i )
++            break;
++        const uint8_t *p_nal = &p_el->p_buffer[i];
++        const unsigned i_type = (p_nal[0] >> 1) & 0x3f;
++        i += n;
++
++        if( i_type == 62 )
++        {
++            p_rpu = p_nal;
++            i_rpu = n;
++            continue;
++        }
++        if( b_add_ps && i_type != 35 ) /* after the access unit delimiter */
++        {
++            p = DVPutParamSets( p, i_bl_len, p_el_fmt );
++            b_add_ps = false;
++        }
++        p = DVPutNal( p, i_bl_len, p_nal, n, true );
++    }
++    if( p_rpu )
++        p = DVPutNal( p, i_bl_len, p_rpu, i_rpu, false );
++    p_out->i_buffer = p - p_out->p_buffer;
++
++    if( p_sys->dv.i_merged++ == 0 )
++        msg_Info( p_demux, "Dolby Vision dual track: EL merged (%zu + %zu bytes, IRAP %d, "
++                  "in-band parameter sets %d)", p_bl->i_buffer, p_el->i_buffer, b_irap, b_ps );
++    block_Release( p_el );
++    block_Release( p_bl );
++    return p_out;
++}
++
+ static void MP4_Block_Send( demux_t *p_demux, mp4_track_t *p_track, block_t *p_block )
+ {
+     p_block = MP4_Block_Convert( p_demux, p_track, p_block );
+     if( p_block == NULL )
+         return;
+ 
++    if( p_track == p_demux->p_sys->dv.p_bl && p_block->i_dts != VLC_TICK_INVALID )
++        p_block = DVMerge( p_demux, p_block );
++
+     if ( p_track->i_chans_to_reorder )
+     {
+         aout_ChannelReorder( p_block->p_buffer, p_block->i_buffer,
+@@ -1090,6 +1361,8 @@ static int Open( vlc_object_t * p_this )
+         }
+     }
+ 
++    DVSetupDualTrack( p_demux );
++
+     p_mvex = MP4_BoxGet( p_sys->p_moov, "mvex" );
+     if( p_mvex != NULL )
+     {
+@@ -1414,9 +1687,10 @@ static int DemuxTrack( demux_t *p_demux, mp4_track_t *tk, uint64_t i_readpos,
+ 
+             /* dts */
+             p_block->i_dts = VLC_TICK_0 + i_current_nzdts;
+-            /* pts */
++            /* pts (from the decoding time before it was clamped at 0) */
+             if( MP4_TrackGetPTSDelta( p_demux, tk, &i_delta ) )
+-                p_block->i_pts = p_block->i_dts + i_delta;
++                p_block->i_pts = VLC_TICK_0 +
++                    __MAX( MP4_TrackGetDTSUnclamped( p_demux, tk ) + i_delta, 0 );
+             else if( tk->fmt.i_cat != VIDEO_ES )
+                 p_block->i_pts = p_block->i_dts;
+             else
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 6c8ad7d687..b8d32e5832 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -723,10 +723,11 @@ static int Demux( demux_t *p_demux )
+                 MVCGatherDep( p_demux, p_pkt, i_header );
+                 continue;
+             }
+-            /* the dependent view AU in progress is complete once a base
+-             * view AU starts (both orders, .ssif extents end with an AU) */
+-            if( p_pid->i_pid == p_sys->mvc.i_base_pid && p_sys->mvc.p_gather &&
+-                (p_pkt->p_buffer[1] & 0x40) )
++            /* .ssif: the dependent view AU in progress is complete once a
++             * base view AU starts (extents end with an AU); elsewhere the
++             * next base view AU may be interleaved with it */
++            if( p_sys->mvc.b_ssif && p_pid->i_pid == p_sys->mvc.i_base_pid &&
++                p_sys->mvc.p_gather && (p_pkt->p_buffer[1] & 0x40) )
+                 MVCFinishDep( p_demux );
+         }
+         if( p_pid->type == TYPE_PMT && MVCHandlePMT( p_demux, p_pkt, i_header ) )
+@@ -1544,8 +1545,9 @@ static void MVCReset( demux_sys_t *p_sys )
+     p_sys->mvc.p_queue = NULL;
+     p_sys->mvc.pp_queue_last = &p_sys->mvc.p_queue;
+     p_sys->mvc.i_queue = 0;
+-    block_ChainRelease( p_sys->mvc.p_held );
+-    p_sys->mvc.p_held = NULL;
++    for( unsigned i = 0; i < p_sys->mvc.i_held; i++ )
++        block_ChainRelease( p_sys->mvc.held[i].p_pes );
++    p_sys->mvc.i_held = 0;
+ }
+ 
+ static int64_t MVCDiff( ts_90khz_t a, ts_90khz_t b ) /* a - b, 33 bit wrap */
+@@ -1553,45 +1555,74 @@ static int64_t MVCDiff( ts_90khz_t a, ts_90khz_t b ) /* a - b, 33 bit wrap */
+     return (int64_t)((uint64_t)(a - b) << 31) >> 31;
+ }
+ 
++/* the oldest held base view PES goes on (merged if its AU is there) */
+ static void MVCReleaseHeld( demux_t *p_demux )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+-    block_t *p_pes = p_sys->mvc.p_held;
+ 
+-    if( !p_pes )
++    if( !p_sys->mvc.i_held )
+         return;
+-    p_sys->mvc.p_held = NULL;
++    const struct ts_mvc_held h = p_sys->mvc.held[0];
++    p_sys->mvc.i_held--;
++    memmove( &p_sys->mvc.held[0], &p_sys->mvc.held[1],
++             p_sys->mvc.i_held * sizeof(p_sys->mvc.held[0]) );
+     p_sys->mvc.b_no_hold = true;
+-    ParsePESDataChain( p_demux, p_sys->mvc.p_held_pid, p_pes, p_sys->mvc.i_held_pcr );
++    ParsePESDataChain( p_demux, h.p_pid, h.p_pes, h.i_pcr );
+     p_sys->mvc.b_no_hold = false;
+ }
+ 
+-/* A base view PES can be complete (PES_packet_length) before its dependent
+- * view AU, which follows it: then it waits for it, at most until the next
+- * base view PES. true: held */
++/* A base view PES can be complete before its dependent view AU, which comes
++ * after it (and may be gathered only at the next dependent view PES start):
++ * then it waits for it, in order, with at most 7 others. true: held */
+ static bool MVCHold( demux_t *p_demux, ts_pid_t *pid, block_t *p_pes,
+                      ts_90khz_t i_append_pcr, ts_90khz_t i_dts )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
++    const unsigned i_max = ARRAY_SIZE(p_sys->mvc.held);
+ 
+     if( p_sys->mvc.b_no_hold )
+         return false;
+-    MVCReleaseHeld( p_demux );
+-    if( i_dts == TS_90KHZ_INVALID )
+-        return false;
+-    /* there already, or the dependent view is ahead (.ssif) */
+-    for( const block_t *p = p_sys->mvc.p_queue; p; p = p->p_next )
+-        if( MVCDiff( p->i_dts, i_dts ) >= 0 )
++    if( !p_sys->mvc.i_held )
++    {
++        if( i_dts == TS_90KHZ_INVALID )
+             return false;
+-
+-    p_sys->mvc.p_held = p_pes;
+-    p_sys->mvc.p_held_pid = pid;
+-    p_sys->mvc.i_held_pcr = i_append_pcr;
+-    p_sys->mvc.i_held_dts = i_dts;
++        /* there already, or the dependent view is ahead (.ssif) */
++        for( const block_t *p = p_sys->mvc.p_queue; p; p = p->p_next )
++            if( MVCDiff( p->i_dts, i_dts ) >= 0 )
++                return false;
++    }
++    else if( p_sys->mvc.i_held == i_max )
++        MVCReleaseHeld( p_demux ); /* waited long enough */
++
++    p_sys->mvc.held[p_sys->mvc.i_held].p_pes = p_pes;
++    p_sys->mvc.held[p_sys->mvc.i_held].p_pid = pid;
++    p_sys->mvc.held[p_sys->mvc.i_held].i_pcr = i_append_pcr;
++    p_sys->mvc.held[p_sys->mvc.i_held].i_dts = i_dts;
++    p_sys->mvc.i_held++;
+     return true;
+ }
+ 
+-/* true if the PMT only lists dependent views (to be dropped) */
++/* from the PMT (ts_psi.c): a 3D MVC dependent view or a Dolby Vision
++ * enhancement layer PID, merged into the i_base PID (0: unchanged) */
++void ts_mvc_SetPids( demux_t *p_demux, uint16_t i_dep, uint16_t i_base, bool b_dovi )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++
++    if( i_dep == p_sys->mvc.i_dep_pid && b_dovi == p_sys->mvc.b_dovi &&
++        ( !i_base || i_base == p_sys->mvc.i_base_pid ) )
++        return;
++    MVCReset( p_sys );
++    p_sys->mvc.i_dep_pid = i_dep;
++    if( i_base )
++        p_sys->mvc.i_base_pid = i_base;
++    p_sys->mvc.b_dovi = b_dovi;
++    msg_Info( p_demux, "%s pid %u merged into pid %u", b_dovi ?
++              "Dolby Vision dual PID: enhancement layer" : "3D MVC: dependent view",
++              i_dep, p_sys->mvc.i_base_pid );
++}
++
++/* .ssif: a PMT packet; true if the PMT only lists dependent views (to be
++ * dropped: the base view's PMT has the same PID and version) */
+ static bool MVCHandlePMT( demux_t *p_demux, const block_t *p_pkt, int i_header )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+@@ -1684,7 +1715,10 @@ static void MVCFinishDep( demux_t *p_demux )
+         p_sys->mvc.i_queue--;
+     }
+ 
+-    if( p_sys->mvc.p_held && MVCDiff( p_au->i_dts, p_sys->mvc.i_held_dts ) >= 0 )
++    /* the held base view PES up to this AU go on */
++    while( p_sys->mvc.i_held &&
++           ( p_sys->mvc.held[0].i_dts == TS_90KHZ_INVALID ||
++             MVCDiff( p_au->i_dts, p_sys->mvc.held[0].i_dts ) >= 0 ) )
+         MVCReleaseHeld( p_demux );
+ }
+ 
+@@ -1723,6 +1757,66 @@ static void MVCGatherDep( demux_t *p_demux, block_t *p_pkt, int i_header )
+         MVCFinishDep( p_demux );
+ }
+ 
++/* Dolby Vision dual PID: the enhancement layer AU (Annex B) the way single
++ * PID streams carry it, after the base layer's NAL units: every NAL unit
++ * wrapped in a NAL unit of type 63, the RPU (type 62) last */
++static block_t *DVWrapEL( block_t *p_el )
++{
++    const uint8_t *p = p_el->p_buffer, *p_end = p + p_el->i_buffer;
++    size_t i_nals = 0;
++
++    for( const uint8_t *q = p; q + 3 <= p_end; q++ )
++        if( q[0] == 0 && q[1] == 0 && q[2] == 1 )
++            i_nals++;
++    block_t *p_out = block_Alloc( p_el->i_buffer + 5 * i_nals + 8 );
++    if( !p_out )
++    {
++        block_Release( p_el );
++        return NULL;
++    }
++
++    uint8_t *o = p_out->p_buffer;
++    const uint8_t *p_rpu = NULL;
++    size_t i_rpu = 0;
++    const uint8_t *q = p;
++    while( q + 3 <= p_end && !(q[0] == 0 && q[1] == 0 && q[2] == 1) )
++        q++;
++    while( q + 3 < p_end )
++    {
++        const uint8_t *p_nal = q + 3;
++        const uint8_t *n = p_nal;
++        while( n + 3 <= p_end && !(n[0] == 0 && n[1] == 0 && n[2] == 1) )
++            n++;
++        if( n + 3 > p_end )
++            n = p_end;
++        const uint8_t *p_nal_end = n;
++        while( p_nal_end > p_nal && p_nal_end[-1] == 0 ) /* trailing zero bytes */
++            p_nal_end--;
++        const size_t i_nal = p_nal_end - p_nal;
++        q = n;
++        if( i_nal < 2 )
++            continue;
++        if( ((p_nal[0] >> 1) & 0x3f) == 62 )
++        {
++            p_rpu = p_nal;
++            i_rpu = i_nal;
++            continue;
++        }
++        memcpy( o, "\x00\x00\x01\x7E\x01", 5 );
++        memcpy( o + 5, p_nal, i_nal );
++        o += 5 + i_nal;
++    }
++    if( p_rpu )
++    {
++        memcpy( o, "\x00\x00\x01", 3 );
++        memcpy( o + 3, p_rpu, i_rpu );
++        o += 3 + i_rpu;
++    }
++    p_out->i_buffer = o - p_out->p_buffer;
++    block_Release( p_el );
++    return p_out;
++}
++
+ static block_t *MVCMerge( demux_t *p_demux, block_t *p_pes, ts_90khz_t i_dts )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+@@ -1748,18 +1842,23 @@ static block_t *MVCMerge( demux_t *p_demux, block_t *p_pes, ts_90khz_t i_dts )
+         block_Release( p_head );
+     }
+ 
++    if( p_dep && p_sys->mvc.b_dovi )
++        p_dep = DVWrapEL( p_dep );
+     if( p_dep )
+     {
+         p_dep->i_dts = VLC_TICK_INVALID;
+         if( p_sys->mvc.i_merged++ == 0 )
+-            msg_Info( p_demux, "3D MVC: dependent view merged (%u queued)",
+-                     p_sys->mvc.i_queue );
++            msg_Info( p_demux, "%s merged (%u queued)", p_sys->mvc.b_dovi ?
++                      "Dolby Vision: enhancement layer" : "3D MVC: dependent view",
++                      p_sys->mvc.i_queue );
+         block_ChainAppend( &p_pes, p_dep );
+     }
+-    else if( p_sys->mvc.i_missed++ % 100 == 0 )
+-        msg_Warn( p_demux, "3D MVC: no dependent view for dts %"PRId64
+-                  " (%u merged, %u missed)", i_dts, p_sys->mvc.i_merged,
+-                  p_sys->mvc.i_missed );
++    else if( p_sys->mvc.i_missed++ % 20 == 0 )
++        msg_Warn( p_demux, "%s for dts %"PRId64 " (%u merged, %u missed, %u queued from %"PRId64")",
++                  p_sys->mvc.b_dovi ? "Dolby Vision: no enhancement layer"
++                                    : "3D MVC: no dependent view",
++                  i_dts, p_sys->mvc.i_merged, p_sys->mvc.i_missed, p_sys->mvc.i_queue,
++                  p_sys->mvc.p_queue ? p_sys->mvc.p_queue->i_dts : -1 );
+     return p_pes;
+ }
+ 
+@@ -1789,10 +1888,13 @@ static int MVCUnitKind( demux_t *p_demux, uint64_t i_unit, uint8_t *p_buf )
+     return i_dep > i_other ? 1 : i_other ? 2 : 0;
+ }
+ 
+-/* .ssif after a seek into a base view extent: the dependent view AUs for
+- * it are in the dependent view extent right before it (extents are aligned
+- * units, the dependent view one first): read them, then go on from there */
++/* .ssif after a seek: the extents are aligned units, a dependent view one
++ * before the base view one with the same pictures. Landed in a base view
++ * extent: its dependent view AUs are in the extent right before it; landed
++ * in a dependent view extent: the AUs of it before the position are needed
++ * too. Read them, then go on from the position */
+ #define MVC_SSIF_MAX_BACK (64 << 20)
++#define MVC_SSIF_STEP 32 /* units: back in steps smaller than any extent, then bisection */
+ static void MVCSsifPrefetch( demux_t *p_demux )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+@@ -1800,49 +1902,55 @@ static void MVCSsifPrefetch( demux_t *p_demux )
+     const uint64_t i_pos = vlc_stream_Tell( p_sys->stream );
+     const uint64_t i_min = i_pos > MVC_SSIF_MAX_BACK ? (i_pos - MVC_SSIF_MAX_BACK) / i_size : 0;
+     uint8_t *p_buf = malloc( i_size );
+-    uint64_t i_base = i_pos / i_size, i_dep = 0, i_step = 1;
++    uint64_t i_base = i_pos / i_size, i_dep = 0, i_end;
+     int i_kind;
+ 
+     if( !p_buf )
+         goto end;
+-    i_kind = MVCUnitKind( p_demux, i_base, p_buf );
+-    p_sys->mvc.b_dep_extent = i_kind == 1;
+-    if( i_kind != 2 )
+-        goto end; /* in a dependent view extent: nothing missed */
+-
+-    /* the last unit of the dependent view extent */
+-    for( ;; )
++    const int i_landed = MVCUnitKind( p_demux, i_base, p_buf );
++    p_sys->mvc.b_dep_extent = i_landed == 1;
++    if( i_landed == 1 )
+     {
+-        if( i_base <= i_min )
+-            goto end;
+-        const uint64_t w = i_base > i_min + i_step ? i_base - i_step : i_min;
+-        if( (i_kind = MVCUnitKind( p_demux, w, p_buf )) < 0 )
+-            goto end;
+-        if( i_kind == 1 )
+-        {
+-            i_dep = w;
+-            break;
+-        }
+-        i_base = w;
+-        i_step *= 2;
++        i_dep = i_base; /* read up to the position */
++        i_end = i_pos;
+     }
+-    while( i_base - i_dep > 1 )
++    else if( i_landed == 2 )
+     {
+-        const uint64_t m = i_dep + (i_base - i_dep) / 2;
+-        if( (i_kind = MVCUnitKind( p_demux, m, p_buf )) < 0 )
+-            goto end;
+-        if( i_kind == 1 )
+-            i_dep = m;
+-        else
+-            i_base = m;
++        /* the last unit of the dependent view extent before */
++        for( ;; )
++        {
++            if( i_base <= i_min )
++                goto end;
++            const uint64_t w = i_base > i_min + MVC_SSIF_STEP ? i_base - MVC_SSIF_STEP : i_min;
++            if( (i_kind = MVCUnitKind( p_demux, w, p_buf )) < 0 )
++                goto end;
++            if( i_kind == 1 )
++            {
++                i_dep = w;
++                break;
++            }
++            i_base = w;
++        }
++        while( i_base - i_dep > 1 )
++        {
++            const uint64_t m = i_dep + (i_base - i_dep) / 2;
++            if( (i_kind = MVCUnitKind( p_demux, m, p_buf )) < 0 )
++                goto end;
++            if( i_kind == 1 )
++                i_dep = m;
++            else
++                i_base = m;
++        }
++        i_end = (i_dep + 1) * i_size;
+     }
++    else
++        goto end;
+ 
+-    /* its first unit */
++    /* the first unit of that dependent view extent */
+     uint64_t i_first = i_dep, i_before = UINT64_MAX;
+-    i_step = 1;
+     while( i_first > i_min )
+     {
+-        const uint64_t w = i_first > i_min + i_step ? i_first - i_step : i_min;
++        const uint64_t w = i_first > i_min + MVC_SSIF_STEP ? i_first - MVC_SSIF_STEP : i_min;
+         if( (i_kind = MVCUnitKind( p_demux, w, p_buf )) < 0 )
+             goto end;
+         if( i_kind == 2 )
+@@ -1851,7 +1959,6 @@ static void MVCSsifPrefetch( demux_t *p_demux )
+             break;
+         }
+         i_first = w;
+-        i_step *= 2;
+     }
+     while( i_before != UINT64_MAX && i_first - i_before > 1 )
+     {
+@@ -1866,11 +1973,14 @@ static void MVCSsifPrefetch( demux_t *p_demux )
+ 
+     if( vlc_stream_Seek( p_sys->stream, i_first * i_size ) != VLC_SUCCESS )
+         goto end;
+-    for( uint64_t u = i_first; u <= i_dep; u++ )
++    int i_cc = -1;
++    for( uint64_t i_at = i_first * i_size; i_at < i_end; )
+     {
+-        if( vlc_stream_Read( p_sys->stream, p_buf, i_size ) != (ssize_t)i_size )
++        const size_t i_read = __MIN( i_size, i_end - i_at );
++        if( vlc_stream_Read( p_sys->stream, p_buf, i_read ) != (ssize_t)i_read )
+             break;
+-        for( size_t i = 0; i < i_size; i += p_sys->i_packet_size )
++        i_at += i_read;
++        for( size_t i = 0; i + p_sys->i_packet_size <= i_read; i += p_sys->i_packet_size )
+         {
+             const uint8_t *p = &p_buf[i + p_sys->i_packet_header_size];
+             if( p[0] != 0x47 || (((p[1] & 0x1f) << 8) | p[2]) != p_sys->mvc.i_dep_pid )
+@@ -1879,13 +1989,22 @@ static void MVCSsifPrefetch( demux_t *p_demux )
+             if( !p_pkt )
+                 continue;
+             memcpy( p_pkt->p_buffer, p, TS_PACKET_SIZE_188 );
++            if( p[3] & 0x10 )
++                i_cc = p[3] & 0x0f;
+             MVCGatherDep( p_demux, p_pkt, 4 + ((p[3] & 0x20) ? 1 + p[4] : 0) );
+         }
+     }
+-    if( p_sys->mvc.p_gather ) /* the extent ends with a whole AU */
++    if( i_landed == 2 && p_sys->mvc.p_gather ) /* the extent ends with a whole AU */
+         MVCFinishDep( p_demux );
+-    msg_Info( p_demux, "3D MVC: .ssif seek, %u dependent view AUs read back (%"PRIu64" KiB)",
+-              p_sys->mvc.i_queue, (i_dep + 1 - i_first) * i_size / 1024 );
++    if( i_cc >= 0 ) /* the dependent view continues after the position */
++        GetPID( p_sys, p_sys->mvc.i_dep_pid )->i_cc = i_cc;
++    msg_Info( p_demux, "3D MVC: .ssif seek into a %s view extent at %"PRIu64", %u dependent "
++              "view AUs read back from %"PRIu64" (%"PRIu64" KiB, dts %"PRId64"..%"PRId64")",
++              i_landed == 1 ? "dependent" : "base", i_pos, p_sys->mvc.i_queue,
++              i_first * i_size, (i_end - i_first * i_size) / 1024,
++              p_sys->mvc.p_queue ? p_sys->mvc.p_queue->i_dts : -1,
++              p_sys->mvc.pp_queue_last != &p_sys->mvc.p_queue ?
++              container_of( p_sys->mvc.pp_queue_last, block_t, p_next )->i_dts : -1 );
+ 
+ end:
+     vlc_stream_Seek( p_sys->stream, i_pos );
+diff --git a/modules/demux/mpeg/ts.h b/modules/demux/mpeg/ts.h
+index 1800fe44ad..4a0e769f16 100644
+--- a/modules/demux/mpeg/ts.h
++++ b/modules/demux/mpeg/ts.h
+@@ -125,7 +125,9 @@ struct demux_sys_t
+ 
+     vdr_info_t  vdr;
+ 
+-    /* Blu-ray 3D: dependent view PID (stream type 0x20) merged into the base view */
++    /* Blu-ray 3D: dependent view PID (stream type 0x20) merged into the base
++     * view; the same for a Dolby Vision enhancement layer PID (dual PID),
++     * see ts_mvc_SetPids() */
+     struct
+     {
+         uint16_t i_dep_pid; /* 0: none */
+@@ -138,11 +140,16 @@ struct demux_sys_t
+         block_t *p_queue; /* dependent view AUs, i_dts = 90 kHz DTS */
+         block_t **pp_queue_last;
+         unsigned i_queue;
+-        block_t *p_held; /* base view PES waiting for its dependent view AU */
+-        ts_pid_t *p_held_pid;
+-        ts_90khz_t i_held_pcr;
+-        ts_90khz_t i_held_dts;
++        struct ts_mvc_held /* base view PES waiting for their dependent view AUs */
++        {
++            block_t   *p_pes;
++            ts_pid_t  *p_pid;
++            ts_90khz_t i_pcr;
++            ts_90khz_t i_dts;
++        } held[8];
++        unsigned i_held;
+         bool     b_no_hold;
++        bool     b_dovi; /* not MVC: a Dolby Vision enhancement layer (dual PID) */
+         bool     b_ssif; /* the dependent view has its own PMT */
+         bool     b_dep_extent; /* .ssif: in a dependent view extent (own PCRs) */
+         unsigned i_merged;
+@@ -166,6 +173,8 @@ int ProbeStart( demux_t *p_demux, int i_program );
+ int ProbeEnd( demux_t *p_demux, int i_program );
+ 
+ void AddAndCreateES( demux_t *p_demux, ts_pid_t *pid, bool b_create_delayed );
++
++void ts_mvc_SetPids( demux_t *p_demux, uint16_t i_dep, uint16_t i_base, bool b_dovi );
+ int FindPCRCandidate( ts_pmt_t *p_pmt );
+ 
+ #endif
+diff --git a/modules/demux/mpeg/ts_psi.c b/modules/demux/mpeg/ts_psi.c
+index ebb4b72833..bcef57ce4f 100644
+--- a/modules/demux/mpeg/ts_psi.c
++++ b/modules/demux/mpeg/ts_psi.c
+@@ -1665,6 +1665,52 @@ static en50221_capmt_info_t * CreateCAPMTInfo( const dvbpsi_pmt_t *p_pmt )
+     return p_en;
+ }
+ 
++/* a stream merged into another one by the demux: the 3D MVC dependent view
++ * (stream type 0x20) into the H.264 base view; a Dolby Vision enhancement
++ * layer (the Dolby Vision video stream descriptor without the base layer,
++ * giving the base layer's PID, or Ultra HD Blu-ray's HEVC 0x1015 next to the
++ * HEVC 0x1011) into the base layer */
++static void PMTSetupDependentPid( demux_t *p_demux, const dvbpsi_pmt_t *p_dvbpsipmt )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    uint16_t i_mvc = 0, i_avc = 0, i_el = 0, i_bl = 0;
++    bool b_bd_bl = false, b_bd_el = false;
++
++    for( const dvbpsi_pmt_es_t *p_es = p_dvbpsipmt->p_first_es; p_es; p_es = p_es->p_next )
++    {
++        if( p_es->i_type == 0x20 && !i_mvc )
++            i_mvc = p_es->i_pid;
++        if( p_es->i_type == 0x1b && !i_avc )
++            i_avc = p_es->i_pid;
++        if( p_es->i_type == 0x24 )
++        {
++            b_bd_bl |= p_es->i_pid == 0x1011;
++            b_bd_el |= p_es->i_pid == 0x1015;
++        }
++        for( const dvbpsi_descriptor_t *p_dr = p_es->p_first_descriptor; p_dr; p_dr = p_dr->p_next )
++        {
++            if( p_dr->i_tag == 0xB0 && p_dr->i_length >= 6 &&
++                !(p_dr->p_data[3] & 0x01) /* bl_present_flag */ )
++            {
++                i_el = p_es->i_pid;
++                i_bl = (p_dr->p_data[4] << 5) | (p_dr->p_data[5] >> 3);
++            }
++        }
++    }
++    if( !i_el && b_bd_bl && b_bd_el )
++    {
++        i_el = 0x1015;
++        i_bl = 0x1011;
++    }
++
++    if( i_mvc )
++        ts_mvc_SetPids( p_demux, i_mvc, i_avc, false );
++    else if( i_el && i_bl )
++        ts_mvc_SetPids( p_demux, i_el, i_bl, true );
++    else if( i_avc && p_sys->mvc.i_dep_pid && !p_sys->mvc.b_dovi )
++        p_sys->mvc.i_base_pid = i_avc; /* .ssif: the base view's own PMT */
++}
++
+ static void PMTCallBack( void *data, dvbpsi_pmt_t *p_dvbpsipmt )
+ {
+     demux_t      *p_demux = data;
+@@ -2041,6 +2087,8 @@ static void PMTCallBack( void *data, dvbpsi_pmt_t *p_dvbpsipmt )
+             p_pmt->i_last_dts = TimeStampWrapAround( p_pmt->pcr.i_first_dts, p_pmt->i_last_dts );
+     }
+ 
++    PMTSetupDependentPid( p_demux, p_dvbpsipmt );
++
+     dvbpsi_pmt_delete( p_dvbpsipmt );
+ }
+ 
+-- 
+2.55.0.windows.3
+

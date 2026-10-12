@@ -178,7 +178,84 @@ static const struct {
 } fp_firmwares[] = {
 	{ "#1 SMP PREEMPT Thu Mar 5 00:38:53 UTC 2026", 0x2f08, "Dune HD R24 (260303)" },
 	{ "#1 SMP PREEMPT Fri Aug 15 10:17:40 UTC 2025", 0x2ee8, "Dune HD R22 (250815)" },
+	{ "#1 SMP PREEMPT Wed Aug 26 23:07:59 UTC 2026", 0x2f08, "Dune HD R24 (260827)" },
 };
+
+/*
+ * The offset straight from the firmware's code: config_store()'s "3dfp"
+ * branch sets the flag with
+ *	mov w8, #off; ldrb w9, [x0, x8]; mov w1, wzr; and w9, w9, #0xf8; orr w9, w9, #0x1
+ * (x0 = &hdmitx21_device). Searched in aml_media around get_hdmitx21_device
+ * with fault tolerant reads; a match must lie in config_store and all
+ * matches must agree.
+ */
+#define FP_SCAN_RANGE	(4 << 20)
+
+void *get_hdmitx21_device(void);
+
+static int fp_flags_scan(void)
+{
+	static const u32 tail[] = { 0x38686809, 0x2a1f03e1, 0x121d1129, 0x32000129 };
+	unsigned long base = (unsigned long)get_hdmitx21_device;
+	unsigned long a, start = base - FP_SCAN_RANGE, end = base + FP_SCAN_RANGE;
+	char sym[KSYM_SYMBOL_LEN];
+	int found = -1, matches = 0, i;
+	u32 *page;
+
+	page = kmalloc(PAGE_SIZE + sizeof(tail), GFP_KERNEL);
+	if (!page)
+		return -1;
+	for (a = start & PAGE_MASK; a < end; a += PAGE_SIZE) {
+		if (probe_kernel_read(page, (void *)a, PAGE_SIZE))
+			continue;
+		/* the instructions after the page (a match across the border) */
+		if (probe_kernel_read(page + PAGE_SIZE / 4, (void *)(a + PAGE_SIZE), sizeof(tail)))
+			memset(page + PAGE_SIZE / 4, 0, sizeof(tail));
+		for (i = 0; i < PAGE_SIZE / 4; i++) {
+			u32 mov = page[i];
+			int off;
+
+			unsigned long pc, dev;
+			u32 adrp, add;
+
+			/* movz w8, #imm16 */
+			if ((mov & 0xffe0001f) != 0x52800008 || memcmp(&page[i + 1], tail, sizeof(tail)))
+				continue;
+			sprint_symbol(sym, a + 4 * i);
+			if (strncmp(sym, "config_store+", 13))
+				continue;
+			/*
+			 * x0 must be hdmitx21's device (the 2.0 driver in the same
+			 * module has the same code for its own): adrp x0 + add x0
+			 * right before, decoded and compared with get_hdmitx21_device()
+			 */
+			pc = a + 4 * i - 8;
+			if (probe_kernel_read(&adrp, (void *)pc, 4) ||
+			    probe_kernel_read(&add, (void *)(pc + 4), 4) ||
+			    (adrp & 0x9f00001f) != 0x90000000 || (add & 0xffc003ff) != 0x91000000)
+				continue;
+			dev = (pc & ~0xfffUL) +
+			      ((long)sign_extend64(((adrp >> 5) & 0x7ffff) << 2 | ((adrp >> 29) & 3), 20) << 12) +
+			      ((add >> 10) & 0xfff);
+			if (dev != (unsigned long)get_hdmitx21_device())
+				continue;
+			off = (mov >> 5) & 0xffff;
+			if (found >= 0 && off != found) {
+				pr_warn(DRV_NAME ": 3D flag offsets %#x and %#x in the hdmitx config code\n",
+					found, off);
+				kfree(page);
+				return -1;
+			}
+			found = off;
+			matches++;
+		}
+	}
+	kfree(page);
+	if (found >= 0)
+		pr_info(DRV_NAME ": 3D flags at %#x (hdmitx config code, %d match%s)\n", found,
+			matches, matches > 1 ? "es" : "");
+	return found;
+}
 
 /*
  * the kernel build from /proc/version (not utsname(): task and namespace
@@ -210,7 +287,6 @@ static int fp_flags_offset(void)
 	return -1;
 }
 
-void *get_hdmitx21_device(void);
 
 static bool fp_probe_on;
 static bool fp_client;		/* the compositor wants frame packing */
@@ -1861,6 +1937,9 @@ static int __init m3_init(void)
 	d->dbg = debugfs_create_dir(DRV_NAME, NULL);
 	debugfs_create_file("stats", 0444, d->dbg, NULL, &stats_fops);
 	debugfs_create_file("stats_reset", 0200, d->dbg, NULL, &stats_reset_fops);
+	/* the firmware's code tells; the list of checked kernel builds is the fallback */
+	if (fp_flags_off < 0)
+		fp_flags_off = fp_flags_scan();
 	if (fp_flags_off < 0)
 		fp_flags_off = fp_flags_offset();
 	if (fp_flags_off < 0) {

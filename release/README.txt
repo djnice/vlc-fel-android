@@ -15,6 +15,9 @@ saját beállításokkal.
 A 0.2.0 óta a 3D MVC (Blu-ray 3D) filmeket is 3D-ben játssza, mindkét nézet teljes felbontásban,
 HDMI 1.4 frame packinggel (1080p24), 3D-s TV-n / projektoron (lásd lent: 3D MVC).
 
+A 0.2.1 óta a kétsávos (DTDL) Profile 7 FEL fájlokat is (az EL külön sávban / PID-en: MP4, m2ts,
+Ultra HD Blu-ray stream), és a 3D-t Blu-ray m2ts / .ssif fájlokból is.
+
 Előfutással működik: a VLC minden képet
 3 vsync-kel (24 Hz-en 125 ms) korábban ad ki, a kernelmodul pedig a kész képet a saját vsyncjéig
 visszatartja. Így a GPU-nak ~2,5 képkockányi ideje van ~1 helyett: a lejátszás közbeni GPU-kiugrások
@@ -26,26 +29,41 @@ FELTÉTELEK
 ----------
 - Amlogic S928X-es Dune HD vagy R_volution lejátszó, Dune HD R22-es vagy R24-es Android firmware-rel.
   Tesztelve: Dune HD Pro 8K Plus, firmware 250815_1012_r22;
-             Dune HD Pro One 8K Plus, firmware 260303_1721_r24 (egy modul mindkettőre).
+             Dune HD Pro One 8K Plus, firmware 260303_1721_r24 és a 2026-08-27-i R24 frissítés
+             (egy modul mindegyikre).
   Más firmware-en / modellen kérjük jelezd,
   hogyan működik (adb logcat -s dvfelplay: a telepítő a tesztelt firmware-től eltérő
   kernelszimbólumokat is kiírja).
 - Root-hozzáférés a modul telepítéséhez. Ha a lejátszón ki van kapcsolva, a VLC FEL megkérdezi,
   bekapcsolhatja-e a telepítés idejére („Install”); utána visszakapcsolja.
 
+KÉTSÁVOS (DTDL) FEL
+-------------------
+- Profile 7 FEL, ahol az EL (és az RPU) külön sávban / PID-en van: kétsávos MP4 (dvhe/dvh1 EL-sáv),
+  m2ts / ts (Dolby Vision leíró, vagy Ultra HD Blu-ray: EL a 0x1015-ös PID-en). A VLC demuxa az EL-t
+  a BL azonos idejű képéhez fűzi, utána ugyanúgy megy, mint egy egysávos (STDL) fájl.
+- Tesztelve LG OLED-en: két DTDL MP4, ugyanezek m2ts-ben, és egy Ultra HD Blu-ray főfilm-m2ts
+  részlete (80 Mbps, FEL): minden kép komponálva, szünet és ugrás is.
+- Blu-ray ISO / mappa és töredezett (fragmented) MP4 nem támogatott.
+
 3D MVC (BLU-RAY 3D)
 -------------------
 - MVC-s MKV / .mk3d fájlok (a függő nézet ugyanabban a sávban, pl. MakeMKV), 1080p vagy 720p.
+- 0.2.1 óta: Blu-ray m2ts, a függő nézet külön PID-en (pl. tsMuxeR), és a lemez .ssif fájljai
+  (BDMV/STREAM/SSIF/*.ssif; ha a fájlböngésző nem mutatja, nevezd át .m2ts-re).
 - Ha a kijelző EDID-je 3D-t jelez, a lejátszás 3D-ben indul: a VLC FEL mindkét nézetet szoftveresen
   dekódolja, frame packing képet állít össze (1920x2205), a kimenet 1080p 24 Hz 3D (frame packing).
   A firmware AFR-je vált, 1080p-s és 2160p-s asztalról is működik.
 - 2D-s kijelzőn a bázisnézet 2D-ben megy, mint eddig. Kézzel: Beállítások → Speciális → Egyéni
   libVLC opciók: --mediacodec-mvc=1 (mindig 2D) vagy --mediacodec-mvc=2 (mindig 3D).
-- Az első 3D-s lejátszáskor a VLC FEL telepíti az mvc3d kernelmodult is (2026.10.12.2), a dvfel-hez
-  hasonlóan (config/boot/mvc3d.sh, ha kell, root-kérdéssel).
-- A GUI (VLC vezérlők, felirat) 3D-ben csak a bal szem képén látszik. Blu-ray mappa / ISO / m2ts
-  (a függő nézet külön PID-en) egyelőre 2D-ben megy.
-- Seek után 1-2 képkocka kimaradhat, amíg a szoftveres dekóder utoléri.
+- Az első 3D-s lejátszáskor a VLC FEL telepíti (vagy frissíti) az mvc3d kernelmodult (2026.10.12.3),
+  a dvfel-hez hasonlóan (config/boot/mvc3d.sh, ha kell, root-kérdéssel).
+- A GUI (VLC vezérlők, felirat) 3D-ben csak a bal szem képén látszik. Blu-ray ISO / mappa 2D-ben megy
+  (a VLC Blu-ray-kezelője csak a bázisnézetet adja).
+- Seek után 1-2 képkocka kimaradhat, amíg a szoftveres dekóder utoléri; Blu-ray lemezről (nyitott GOP)
+  egy-egy ugrás után ~1 másodpercig 2D lehet a kép.
+- Egyes projektorok 2160p-s asztalról frame packingre váltáskor bontják a HDMI-kapcsolatot, ettől
+  megáll a lejátszás: ilyenkor 1080p-s asztalt használj.
 
 TELEPÍTÉS
 ---------
@@ -71,6 +89,9 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.1-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.3) – kétsávos (DTDL) FEL: MP4 és m2ts (Ultra HD
+          Blu-ray is); 3D m2ts-ből és .ssif-ből; az R24 2026-08-27-i frissítésén is 3D (0.2.0-val
+          2D volt); a 3D nem akad el bizonyos ugrások után.
 0.2.0-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.2) – 3D MVC (Blu-ray 3D) 3D-ben, HDMI frame packing.
 0.1.0-poc (kernelmodul 2026.10.07.1) – első kiadás.
 
@@ -103,6 +124,9 @@ GPU (12-bit reconstruction with dither), output is Dolby Vision. It installs as 
 Since 0.2.0 it also plays 3D MVC (Blu-ray 3D) in 3D, both views at full resolution, as HDMI 1.4 frame
 packing (1080p24), on 3D TVs / projectors (see 3D MVC below).
 
+Since 0.2.1 also dual track (DTDL) Profile 7 FEL files (the EL in its own track / PID: MP4, m2ts,
+Ultra HD Blu-ray streams), and 3D from Blu-ray m2ts / .ssif files.
+
 It works with a lead time: VLC presents
 every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds the composed frame back to
 its vsync. The GPU gets ~2.5 frame periods instead of ~1: its time spikes during playback no longer
@@ -114,26 +138,41 @@ REQUIREMENTS
 ------------
 - An Amlogic S928X Dune HD or R_volution player with Dune HD R22 or R24 Android firmware.
   Tested: Dune HD Pro 8K Plus, firmware 250815_1012_r22;
-          Dune HD Pro One 8K Plus, firmware 260303_1721_r24 (one module build for both).
+          Dune HD Pro One 8K Plus, firmware 260303_1721_r24 and its 2026-08-27 R24 update
+          (one module build for all).
   On other firmware / models please report how it
   works (adb logcat -s dvfelplay: the installer also lists kernel symbols whose versions differ from
   the tested firmware).
 - Root access for the module installation. If it is switched off on the player, VLC FEL asks whether
   to switch it on for the installation ("Install"), and switches it off again afterwards.
 
+DUAL TRACK (DTDL) FEL
+---------------------
+- Profile 7 FEL with the EL (and RPU) in its own track / PID: dual track MP4 (dvhe/dvh1 EL track),
+  m2ts / ts (Dolby Vision descriptor, or Ultra HD Blu-ray: the EL on PID 0x1015). VLC's demux appends
+  the EL to the base layer picture with the same time; it then plays like a single track (STDL) file.
+- Tested on an LG OLED: two DTDL MP4s, the same as m2ts, and a cut of an Ultra HD Blu-ray main movie
+  m2ts (80 Mbps, FEL): all frames composed, pause and seeks too.
+- Blu-ray ISO / folders and fragmented MP4 are not supported.
+
 3D MVC (BLU-RAY 3D)
 -------------------
 - MVC MKV / .mk3d files (the dependent view in the same track, e.g. MakeMKV), 1080p or 720p.
+- Since 0.2.1: Blu-ray m2ts with the dependent view on its own PID (e.g. tsMuxeR), and the disc's
+  .ssif files (BDMV/STREAM/SSIF/*.ssif; rename to .m2ts if the file browser does not list them).
 - When the display's EDID reports 3D, playback starts in 3D: VLC FEL decodes both views in software,
   composes a frame packed picture (1920x2205), the output is 1080p 24 Hz 3D (frame packing). The
   firmware's AFR switches; works from 1080p and from 2160p desktops.
 - On 2D displays the base view plays in 2D as before. By hand: Settings → Advanced → Custom libVLC
   options: --mediacodec-mvc=1 (always 2D) or --mediacodec-mvc=2 (always 3D).
-- The first 3D playback also installs the mvc3d kernel module (2026.10.12.2), like dvfel
+- The first 3D playback also installs (or updates) the mvc3d kernel module (2026.10.12.3), like dvfel
   (config/boot/mvc3d.sh, with the root question if needed).
-- In 3D the GUI (VLC's controls, subtitles) shows in the left eye's view only. Blu-ray folders / ISO /
-  m2ts (the dependent view in a separate PID) play in 2D for now.
-- After a seek 1-2 frames may be skipped while the software decoder catches up.
+- In 3D the GUI (VLC's controls, subtitles) shows in the left eye's view only. Blu-ray ISO / folders
+  play in 2D (VLC's Blu-ray access only gives the base view).
+- After a seek 1-2 frames may be skipped while the software decoder catches up; from Blu-ray discs
+  (open GOP) the picture may be 2D for ~1 second after some seeks.
+- Some projectors drop the HDMI connection when switching from a 2160p desktop to frame packing,
+  which stops playback: use a 1080p desktop then.
 
 INSTALLATION
 ------------
@@ -158,6 +197,9 @@ NOTES
 
 CHANGES
 -------
+0.2.1-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.3) – dual track (DTDL) FEL: MP4 and m2ts (Ultra HD
+          Blu-ray too); 3D from m2ts and .ssif; 3D on the R24 2026-08-27 update too (2D with 0.2.0);
+          3D no longer stalls after some seeks.
 0.2.0-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.2) – 3D MVC (Blu-ray 3D) in 3D, HDMI frame packing.
 0.1.0-poc (kernel module 2026.10.07.1) – first release.
 

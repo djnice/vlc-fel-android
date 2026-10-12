@@ -294,7 +294,7 @@ static void *compose_thread(void *arg)
 /* ------------------------------------------------------------------ */
 
 static long st_decoded, st_single, st_bad_nal, st_composed_us, st_comp_max_us, st_size;
-static long st_shown, st_dropped, st_skipped, st_stale, st_late_found;
+static long st_shown, st_dropped, st_skipped, st_stale, st_late_found, st_resets;
 
 static int dequeue_buf(unsigned gen)
 {
@@ -395,13 +395,35 @@ static void decode_au(struct au *a, unsigned gen)
 		const uint8_t *nal_end = next;
 		while (nal_end > nal && nal_end < end && nal_end[-1] == 0)
 			nal_end--;
+		int64_t stuck_since = 0;
+
 		while ((res = edge264_decode_NAL(dec, nal, nal_end, NULL, NULL)) == ENOBUFS && !quit) {
 			Edge264Frame f;
 
-			if (!edge264_get_frame(dec, &f, 0))
+			if (!edge264_get_frame(dec, &f, 0)) {
 				output_frame(&f, gen);
-			else
-				usleep(1000);	/* frames still decoding */
+				stuck_since = 0;
+				continue;
+			}
+			/*
+			 * no picture to take out: frames still decoding, or (after a
+			 * seek into broken references) never: a flush ends the wait,
+			 * else the decoder starts over at the next key picture
+			 */
+			pthread_mutex_lock(&rm);
+			int flushed = gen != flush_gen;
+			pthread_mutex_unlock(&rm);
+			if (flushed)
+				return;
+			if (!stuck_since) {
+				stuck_since = now_us();
+			} else if (now_us() - stuck_since > 500000) {
+				logf_("no picture out of the decoder for 500 ms (au %lld): reset", (long long)a->n);
+				st_resets++;
+				edge264_flush(dec);
+				return;
+			}
+			usleep(1000);
 		}
 		if (res == EBADMSG)
 			st_bad_nal++;
@@ -596,8 +618,8 @@ static void *stats_thread(void *arg)
 	while (!quit) {
 		for (int i = 0; i < 100 && !quit; i++)
 			usleep(100000);
-		logf_("stats: decoded %ld (single view %ld, other size %ld), bad NALs %ld, shown %ld, dropped %ld, skipped %ld, stale %ld, waited %ld, compose avg %.1f ms max %.1f ms, input queue %zu KiB",
-		      st_decoded, st_single, st_size, st_bad_nal, st_shown, st_dropped, st_skipped, st_stale,
+		logf_("stats: decoded %ld (single view %ld, other size %ld), bad NALs %ld, resets %ld, shown %ld, dropped %ld, skipped %ld, stale %ld, waited %ld, compose avg %.1f ms max %.1f ms, input queue %zu KiB",
+		      st_decoded, st_single, st_size, st_bad_nal, st_resets, st_shown, st_dropped, st_skipped, st_stale,
 		      st_late_found, st_decoded ? st_composed_us / 1000.0 / st_decoded : 0.0,
 		      st_comp_max_us / 1000.0, q_bytes >> 10);
 	}

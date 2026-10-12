@@ -1,0 +1,659 @@
+From a94b26ed81f75bb68bb1b14758a6d07dfea623d1 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 12 Oct 2026 14:24:19 +0200
+Subject: [PATCH] ts: Blu-ray 3D MVC dependent view merged into the base view
+
+The dependent view of Blu-ray 3D is a stream of its own (stream type 0x20,
+NAL 24 delimited MVC sub-bitstream). tsMuxeR style m2ts list it in the
+program's PMT; .ssif files interleave the base and the dependent view files
+(two PMTs with the same PID and version alternate: the dependent view one is
+dropped). The ts demux gathers the dependent view and appends each AU to the
+base view AU with the same DTS; the h264 packetizer keeps that NAL 24 suffix
+in the picture; MediaCodec only gets the base view part, libmvc3dplay the
+whole MVC access unit.
+
+Message-Id: <20261012-dvfel-ts-mvc3d-dependent-view@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c |  36 ++-
+ modules/demux/mpeg/ts.c          | 425 ++++++++++++++++++++++++++++++-
+ modules/demux/mpeg/ts.h          |  24 ++
+ modules/packetizer/h264.c        |  17 +-
+ 4 files changed, 497 insertions(+), 5 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index d5b82c1df0..dba55bef29 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -214,6 +214,21 @@ static bool MvcLoad(void)
+     return mvc_api.loaded;
+ }
+ 
++/* Blu-ray 3D from ts: the demux appends the dependent view (from its NAL 24
++ * delimiter on) to the base view access unit: size of the base view part */
++static size_t MvcBaseViewSize(const uint8_t *p, size_t i_size)
++{
++    for (size_t i = 0; i + 3 < i_size; i++)
++    {
++        if (p[i + 2] > 1)
++            i += 2; /* no start code begins at i, i + 1 or i + 2 */
++        else if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1
++              && (p[i + 3] & 0x1f) == 24)
++            return i > 0 && p[i - 1] == 0 ? i - 1 : i;
++    }
++    return i_size;
++}
++
+ /* CFG_PREFIX "mvc" */
+ #define MVC_MODE_AUTO 0
+ #define MVC_MODE_2D 1
+@@ -1675,7 +1690,12 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+                 i_size = p_block->i_buffer;
+             }
+ 
+-            if (p_sys->api.queue_in(&p_sys->api, i_index, p_buf, i_size,
++            /* Blu-ray 3D from ts: MediaCodec only gets the base view */
++            size_t i_hw_size = i_size;
++            if (p_buf != NULL && !b_config && p_dec->fmt_in.i_codec == VLC_CODEC_H264)
++                i_hw_size = MvcBaseViewSize(p_buf, i_size);
++
++            if (p_sys->api.queue_in(&p_sys->api, i_index, p_buf, i_hw_size,
+                                     i_ts, b_config) == 0)
+             {
+                 if (!b_config && p_block != NULL)
+@@ -2056,8 +2076,18 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+     p_sys->video.i_mvc_probe = 0;
+ 
+     const int i_mode = var_InheritInteger(p_dec, CFG_PREFIX "mvc");
+-    const unsigned i_width = p_dec->fmt_out.video.i_width;
+-    const unsigned i_height = p_dec->fmt_out.video.i_height;
++    /* the cropped picture size from the SPS (ts: the format has the coded
++     * size, 1920x1088) */
++    unsigned i_width = p_dec->fmt_out.video.i_width;
++    unsigned i_height = p_dec->fmt_out.video.i_height;
++    unsigned i_cw, i_ch, i_vw, i_vh;
++    if (hxxx_helper_get_current_picture_size(&p_sys->video.hh, &i_cw, &i_ch,
++                                             &i_vw, &i_vh) == VLC_SUCCESS
++     && i_vw > 0 && i_vh > 0)
++    {
++        i_width = i_vw;
++        i_height = i_vh;
++    }
+     /* the mvc3d kernel module bundled with libmvc3dplay: installed when
+      * missing or older (asks for root access once), as for Dolby Vision */
+     if (mvc_api.module_install && (i_mode == MVC_MODE_3D || mvc_api.display_3d()))
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 73b95d0167..6c8ad7d687 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -203,6 +203,14 @@ static void ReadyQueuesPostSeek( demux_t *p_demux );
+ static void PCRHandle( demux_t *p_demux, ts_pid_t *, ts_90khz_t );
+ static void PCRFixHandle( demux_t *, ts_pmt_t *, block_t * );
+ 
++static void MVCReset( demux_sys_t * );
++static bool MVCHandlePMT( demux_t *, const block_t *, int );
++static void MVCGatherDep( demux_t *, block_t *, int );
++static void MVCFinishDep( demux_t * );
++static block_t *MVCMerge( demux_t *, block_t *, ts_90khz_t );
++static bool MVCHold( demux_t *, ts_pid_t *, block_t *, ts_90khz_t, ts_90khz_t );
++static void ParsePESDataChain( demux_t *, ts_pid_t *, block_t *, ts_90khz_t );
++
+ #define TS_PACKET_SIZE_188 188
+ #define TS_PACKET_SIZE_192 192
+ #define TS_PACKET_SIZE_204 204
+@@ -383,6 +391,7 @@ static int Open( vlc_object_t *p_this )
+         return VLC_ENOMEM;
+     memset( p_sys, 0, sizeof( demux_sys_t ) );
+     vlc_mutex_init( &p_sys->csa_lock );
++    MVCReset( p_sys );
+ 
+     p_demux->pf_demux = Demux;
+     p_demux->pf_control = Control;
+@@ -591,6 +600,8 @@ static void Close( vlc_object_t *p_this )
+     /* Release all non default pids */
+     ts_pid_list_Release( p_demux, &p_sys->pids );
+ 
++    MVCReset( p_sys );
++
+     /* Clear up attachments */
+     vlc_dictionary_clear( &p_sys->attachments, FreeDictAttachment, NULL );
+ 
+@@ -693,9 +704,37 @@ static int Demux( demux_t *p_demux )
+ 
+         /* Adaptation field cannot be scrambled */
+         ts_90khz_t i_pcr = GetPCR( p_pkt );
+-        if( i_pcr != TS_90KHZ_INVALID )
++        /* .ssif: the dependent view file's PCRs (same PID) run ahead */
++        if( p_sys->mvc.b_ssif )
++        {
++            if( p_pid->i_pid == p_sys->mvc.i_dep_pid )
++                p_sys->mvc.b_dep_extent = true;
++            else if( p_pid->i_pid == p_sys->mvc.i_base_pid )
++                p_sys->mvc.b_dep_extent = false;
++        }
++        if( i_pcr != TS_90KHZ_INVALID && !(p_sys->mvc.b_ssif && p_sys->mvc.b_dep_extent) )
+             PCRHandle( p_demux, p_pid, i_pcr );
+ 
++        /* Blu-ray 3D: the dependent view is gathered on its own */
++        if( p_sys->mvc.i_dep_pid )
++        {
++            if( p_pid->i_pid == p_sys->mvc.i_dep_pid )
++            {
++                MVCGatherDep( p_demux, p_pkt, i_header );
++                continue;
++            }
++            /* the dependent view AU in progress is complete once a base
++             * view AU starts (both orders, .ssif extents end with an AU) */
++            if( p_pid->i_pid == p_sys->mvc.i_base_pid && p_sys->mvc.p_gather &&
++                (p_pkt->p_buffer[1] & 0x40) )
++                MVCFinishDep( p_demux );
++        }
++        if( p_pid->type == TYPE_PMT && MVCHandlePMT( p_demux, p_pkt, i_header ) )
++        {
++            block_Release( p_pkt );
++            continue;
++        }
++
+         /* Probe streams to build PAT/PMT after MIN_PAT_INTERVAL in case we don't see any PAT */
+         if( !SEEN( GetPID( p_sys, 0 ) ) &&
+             (p_pid->probed.i_fourcc == 0 || p_pid->i_pid == p_sys->patfix.i_timesourcepid) &&
+@@ -1484,6 +1523,375 @@ static void SendDataChain( demux_t *p_demux, ts_es_t *p_es, block_t *p_chain )
+     }
+ }
+ 
++/****************************************************************************
++ * Blu-ray 3D (MVC): the dependent view is a stream of its own (stream type
++ * 0x20, NAL 24 delimited MVC sub-bitstream). tsMuxeR style m2ts list it in
++ * the program's PMT. .ssif files interleave the base and the dependent view
++ * files, so two PMTs alternate on the same PID with the same version: the
++ * dependent view one only lists 0x20 streams and is dropped. The dependent
++ * view AUs are gathered here and appended to the base view AU with the same
++ * DTS, so the H.264 decoder gets whole MVC access units.
++ ****************************************************************************/
++#define MVC_QUEUE_MAX 400 /* .ssif: a dependent view extent is a few seconds ahead */
++
++static void MVCReset( demux_sys_t *p_sys )
++{
++    block_ChainRelease( p_sys->mvc.p_gather );
++    p_sys->mvc.p_gather = NULL;
++    p_sys->mvc.pp_gather_last = &p_sys->mvc.p_gather;
++    p_sys->mvc.i_gathered = 0;
++    block_ChainRelease( p_sys->mvc.p_queue );
++    p_sys->mvc.p_queue = NULL;
++    p_sys->mvc.pp_queue_last = &p_sys->mvc.p_queue;
++    p_sys->mvc.i_queue = 0;
++    block_ChainRelease( p_sys->mvc.p_held );
++    p_sys->mvc.p_held = NULL;
++}
++
++static int64_t MVCDiff( ts_90khz_t a, ts_90khz_t b ) /* a - b, 33 bit wrap */
++{
++    return (int64_t)((uint64_t)(a - b) << 31) >> 31;
++}
++
++static void MVCReleaseHeld( demux_t *p_demux )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    block_t *p_pes = p_sys->mvc.p_held;
++
++    if( !p_pes )
++        return;
++    p_sys->mvc.p_held = NULL;
++    p_sys->mvc.b_no_hold = true;
++    ParsePESDataChain( p_demux, p_sys->mvc.p_held_pid, p_pes, p_sys->mvc.i_held_pcr );
++    p_sys->mvc.b_no_hold = false;
++}
++
++/* A base view PES can be complete (PES_packet_length) before its dependent
++ * view AU, which follows it: then it waits for it, at most until the next
++ * base view PES. true: held */
++static bool MVCHold( demux_t *p_demux, ts_pid_t *pid, block_t *p_pes,
++                     ts_90khz_t i_append_pcr, ts_90khz_t i_dts )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++
++    if( p_sys->mvc.b_no_hold )
++        return false;
++    MVCReleaseHeld( p_demux );
++    if( i_dts == TS_90KHZ_INVALID )
++        return false;
++    /* there already, or the dependent view is ahead (.ssif) */
++    for( const block_t *p = p_sys->mvc.p_queue; p; p = p->p_next )
++        if( MVCDiff( p->i_dts, i_dts ) >= 0 )
++            return false;
++
++    p_sys->mvc.p_held = p_pes;
++    p_sys->mvc.p_held_pid = pid;
++    p_sys->mvc.i_held_pcr = i_append_pcr;
++    p_sys->mvc.i_held_dts = i_dts;
++    return true;
++}
++
++/* true if the PMT only lists dependent views (to be dropped) */
++static bool MVCHandlePMT( demux_t *p_demux, const block_t *p_pkt, int i_header )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    const uint8_t *p = p_pkt->p_buffer;
++    const uint8_t *p_end = &p[TS_PACKET_SIZE_188];
++
++    if( !(p[1] & 0x40) || !(p[3] & 0x10) || i_header >= TS_PACKET_SIZE_188 )
++        return false;
++    const uint8_t *s = &p[i_header + 1 + p[i_header]];
++    if( s + 16 > p_end || s[0] != 0x02 )
++        return false;
++    const uint8_t *s_end = s + 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4 /* CRC */;
++    if( s_end > p_end )
++        return false;
++
++    uint16_t i_dep_pid = 0, i_avc_pid = 0;
++    unsigned i_other = 0;
++    for( const uint8_t *es = s + 12 + (((s[10] & 0x0f) << 8) | s[11]);
++         es + 5 <= s_end; es += 5 + (((es[3] & 0x0f) << 8) | es[4]) )
++    {
++        const uint16_t i_pid = ((es[1] & 0x1f) << 8) | es[2];
++        if( es[0] == 0x20 )
++        {
++            if( !i_dep_pid )
++                i_dep_pid = i_pid;
++            continue;
++        }
++        i_other++;
++        if( es[0] == 0x1b && !i_avc_pid )
++            i_avc_pid = i_pid;
++    }
++
++    if( i_avc_pid && (i_dep_pid || !p_sys->mvc.i_base_pid) )
++        p_sys->mvc.i_base_pid = i_avc_pid;
++    if( i_dep_pid && i_dep_pid != p_sys->mvc.i_dep_pid )
++    {
++        MVCReset( p_sys );
++        p_sys->mvc.i_dep_pid = i_dep_pid;
++        msg_Info( p_demux, "3D MVC: dependent view pid %u%s", i_dep_pid,
++                 i_other ? "" : " (own PMT, dropped)" );
++    }
++    /* .ssif: each extent starts with its file's PAT, PMT and PCR */
++    if( i_dep_pid && !i_other )
++        p_sys->mvc.b_ssif = p_sys->mvc.b_dep_extent = true;
++    else if( i_other )
++        p_sys->mvc.b_dep_extent = false;
++    return i_dep_pid && !i_other;
++}
++
++static void MVCFinishDep( demux_t *p_demux )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    block_t *p_au = block_ChainGather( p_sys->mvc.p_gather );
++    const size_t i_pes_size = p_sys->mvc.i_pes_size;
++
++    p_sys->mvc.p_gather = NULL;
++    p_sys->mvc.pp_gather_last = &p_sys->mvc.p_gather;
++    p_sys->mvc.i_gathered = 0;
++    if( !p_au )
++        return;
++
++    unsigned i_skip = 0;
++    ts_90khz_t i_dts = TS_90KHZ_INVALID, i_pts = TS_90KHZ_INVALID;
++    uint8_t i_stream_id;
++    bool b_scrambled = false;
++    if( i_pes_size && i_pes_size < p_au->i_buffer )
++        p_au->i_buffer = i_pes_size;
++    if( p_sys->mvc.b_broken ||
++        ParsePESHeader( VLC_OBJECT(p_demux), p_au->p_buffer, p_au->i_buffer, &i_skip,
++                        &i_dts, &i_pts, &i_stream_id, &b_scrambled ) != VLC_SUCCESS ||
++        b_scrambled || i_skip >= p_au->i_buffer ||
++        (i_dts == TS_90KHZ_INVALID && i_pts == TS_90KHZ_INVALID) )
++    {
++        block_Release( p_au );
++        return;
++    }
++    p_au->p_buffer += i_skip;
++    p_au->i_buffer -= i_skip;
++    p_au->i_dts = i_dts != TS_90KHZ_INVALID ? i_dts : i_pts;
++    p_au->i_pts = VLC_TICK_INVALID;
++    p_au->i_flags = 0;
++
++    block_ChainLastAppend( &p_sys->mvc.pp_queue_last, p_au );
++    if( ++p_sys->mvc.i_queue > MVC_QUEUE_MAX )
++    {
++        block_t *p_old = p_sys->mvc.p_queue;
++        p_sys->mvc.p_queue = p_old->p_next;
++        p_old->p_next = NULL;
++        block_Release( p_old );
++        p_sys->mvc.i_queue--;
++    }
++
++    if( p_sys->mvc.p_held && MVCDiff( p_au->i_dts, p_sys->mvc.i_held_dts ) >= 0 )
++        MVCReleaseHeld( p_demux );
++}
++
++static void MVCGatherDep( demux_t *p_demux, block_t *p_pkt, int i_header )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    const uint8_t *p = p_pkt->p_buffer;
++    const bool b_start = p[1] & 0x40;
++
++    if( b_start && p_sys->mvc.p_gather )
++        MVCFinishDep( p_demux );
++    if( !(p[3] & 0x10) || i_header >= TS_PACKET_SIZE_188 ||
++        (!b_start && !p_sys->mvc.p_gather) )
++    {
++        block_Release( p_pkt );
++        return;
++    }
++
++    p_pkt->p_buffer += i_header;
++    p_pkt->i_buffer = TS_PACKET_SIZE_188 - i_header;
++    if( b_start )
++    {
++        p_sys->mvc.b_broken = false;
++        p_sys->mvc.i_pes_size = 0;
++        if( p_pkt->i_buffer >= 6 && (p_pkt->p_buffer[4] | p_pkt->p_buffer[5]) )
++            p_sys->mvc.i_pes_size = 6 + GetWBE( &p_pkt->p_buffer[4] );
++    }
++    /* (a gap before a PES start, e.g. after a seek, does not matter) */
++    if( (p_pkt->i_flags & (BLOCK_FLAG_CORRUPTED | BLOCK_FLAG_SCRAMBLED)) ||
++        (!b_start && (p_pkt->i_flags & BLOCK_FLAG_DISCONTINUITY)) )
++        p_sys->mvc.b_broken = true;
++
++    p_sys->mvc.i_gathered += p_pkt->i_buffer;
++    block_ChainLastAppend( &p_sys->mvc.pp_gather_last, p_pkt );
++    if( p_sys->mvc.i_pes_size && p_sys->mvc.i_gathered >= p_sys->mvc.i_pes_size )
++        MVCFinishDep( p_demux );
++}
++
++static block_t *MVCMerge( demux_t *p_demux, block_t *p_pes, ts_90khz_t i_dts )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    block_t *p_dep = NULL;
++
++    /* in DTS order: the older ones lost their base view AU */
++    while( i_dts != TS_90KHZ_INVALID && p_sys->mvc.p_queue )
++    {
++        block_t *p_head = p_sys->mvc.p_queue;
++        const int64_t i_diff = MVCDiff( p_head->i_dts, i_dts );
++        if( i_diff > 0 )
++            break;
++        p_sys->mvc.p_queue = p_head->p_next;
++        if( !p_sys->mvc.p_queue )
++            p_sys->mvc.pp_queue_last = &p_sys->mvc.p_queue;
++        p_sys->mvc.i_queue--;
++        p_head->p_next = NULL;
++        if( i_diff == 0 )
++        {
++            p_dep = p_head;
++            break;
++        }
++        block_Release( p_head );
++    }
++
++    if( p_dep )
++    {
++        p_dep->i_dts = VLC_TICK_INVALID;
++        if( p_sys->mvc.i_merged++ == 0 )
++            msg_Info( p_demux, "3D MVC: dependent view merged (%u queued)",
++                     p_sys->mvc.i_queue );
++        block_ChainAppend( &p_pes, p_dep );
++    }
++    else if( p_sys->mvc.i_missed++ % 100 == 0 )
++        msg_Warn( p_demux, "3D MVC: no dependent view for dts %"PRId64
++                  " (%u merged, %u missed)", i_dts, p_sys->mvc.i_merged,
++                  p_sys->mvc.i_missed );
++    return p_pes;
++}
++
++/* .ssif: what the aligned unit (32 packets) i_unit holds: 1 dependent view,
++ * 2 base view, 0 neither, -1 read error */
++static int MVCUnitKind( demux_t *p_demux, uint64_t i_unit, uint8_t *p_buf )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    const size_t i_size = 32 * p_sys->i_packet_size;
++
++    if( vlc_stream_Seek( p_sys->stream, i_unit * i_size ) != VLC_SUCCESS ||
++        vlc_stream_Read( p_sys->stream, p_buf, i_size ) != (ssize_t)i_size )
++        return -1;
++
++    unsigned i_dep = 0, i_other = 0;
++    for( size_t i = 0; i < i_size; i += p_sys->i_packet_size )
++    {
++        const uint8_t *p = &p_buf[i + p_sys->i_packet_header_size];
++        const uint16_t i_pid = ((p[1] & 0x1f) << 8) | p[2];
++        if( p[0] != 0x47 || i_pid < 0x20 || i_pid == 0x1FFF )
++            continue;
++        if( i_pid == p_sys->mvc.i_dep_pid )
++            i_dep++;
++        else
++            i_other++;
++    }
++    return i_dep > i_other ? 1 : i_other ? 2 : 0;
++}
++
++/* .ssif after a seek into a base view extent: the dependent view AUs for
++ * it are in the dependent view extent right before it (extents are aligned
++ * units, the dependent view one first): read them, then go on from there */
++#define MVC_SSIF_MAX_BACK (64 << 20)
++static void MVCSsifPrefetch( demux_t *p_demux )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    const size_t i_size = 32 * p_sys->i_packet_size;
++    const uint64_t i_pos = vlc_stream_Tell( p_sys->stream );
++    const uint64_t i_min = i_pos > MVC_SSIF_MAX_BACK ? (i_pos - MVC_SSIF_MAX_BACK) / i_size : 0;
++    uint8_t *p_buf = malloc( i_size );
++    uint64_t i_base = i_pos / i_size, i_dep = 0, i_step = 1;
++    int i_kind;
++
++    if( !p_buf )
++        goto end;
++    i_kind = MVCUnitKind( p_demux, i_base, p_buf );
++    p_sys->mvc.b_dep_extent = i_kind == 1;
++    if( i_kind != 2 )
++        goto end; /* in a dependent view extent: nothing missed */
++
++    /* the last unit of the dependent view extent */
++    for( ;; )
++    {
++        if( i_base <= i_min )
++            goto end;
++        const uint64_t w = i_base > i_min + i_step ? i_base - i_step : i_min;
++        if( (i_kind = MVCUnitKind( p_demux, w, p_buf )) < 0 )
++            goto end;
++        if( i_kind == 1 )
++        {
++            i_dep = w;
++            break;
++        }
++        i_base = w;
++        i_step *= 2;
++    }
++    while( i_base - i_dep > 1 )
++    {
++        const uint64_t m = i_dep + (i_base - i_dep) / 2;
++        if( (i_kind = MVCUnitKind( p_demux, m, p_buf )) < 0 )
++            goto end;
++        if( i_kind == 1 )
++            i_dep = m;
++        else
++            i_base = m;
++    }
++
++    /* its first unit */
++    uint64_t i_first = i_dep, i_before = UINT64_MAX;
++    i_step = 1;
++    while( i_first > i_min )
++    {
++        const uint64_t w = i_first > i_min + i_step ? i_first - i_step : i_min;
++        if( (i_kind = MVCUnitKind( p_demux, w, p_buf )) < 0 )
++            goto end;
++        if( i_kind == 2 )
++        {
++            i_before = w;
++            break;
++        }
++        i_first = w;
++        i_step *= 2;
++    }
++    while( i_before != UINT64_MAX && i_first - i_before > 1 )
++    {
++        const uint64_t m = i_before + (i_first - i_before) / 2;
++        if( (i_kind = MVCUnitKind( p_demux, m, p_buf )) < 0 )
++            goto end;
++        if( i_kind == 2 )
++            i_before = m;
++        else
++            i_first = m;
++    }
++
++    if( vlc_stream_Seek( p_sys->stream, i_first * i_size ) != VLC_SUCCESS )
++        goto end;
++    for( uint64_t u = i_first; u <= i_dep; u++ )
++    {
++        if( vlc_stream_Read( p_sys->stream, p_buf, i_size ) != (ssize_t)i_size )
++            break;
++        for( size_t i = 0; i < i_size; i += p_sys->i_packet_size )
++        {
++            const uint8_t *p = &p_buf[i + p_sys->i_packet_header_size];
++            if( p[0] != 0x47 || (((p[1] & 0x1f) << 8) | p[2]) != p_sys->mvc.i_dep_pid )
++                continue;
++            block_t *p_pkt = block_Alloc( TS_PACKET_SIZE_188 );
++            if( !p_pkt )
++                continue;
++            memcpy( p_pkt->p_buffer, p, TS_PACKET_SIZE_188 );
++            MVCGatherDep( p_demux, p_pkt, 4 + ((p[3] & 0x20) ? 1 + p[4] : 0) );
++        }
++    }
++    if( p_sys->mvc.p_gather ) /* the extent ends with a whole AU */
++        MVCFinishDep( p_demux );
++    msg_Info( p_demux, "3D MVC: .ssif seek, %u dependent view AUs read back (%"PRIu64" KiB)",
++              p_sys->mvc.i_queue, (i_dep + 1 - i_first) * i_size / 1024 );
++
++end:
++    vlc_stream_Seek( p_sys->stream, i_pos );
++    free( p_buf );
++}
++
+ /****************************************************************************
+  * gathering stuff
+  ****************************************************************************/
+@@ -1543,6 +1951,11 @@ static void ParsePESDataChain( demux_t *p_demux, ts_pid_t *pid, block_t *p_pes,
+             p_pes->i_flags |= BLOCK_FLAG_SCRAMBLED;
+     }
+ 
++    if( pid->i_pid == p_demux->p_sys->mvc.i_base_pid && p_demux->p_sys->mvc.i_dep_pid &&
++        MVCHold( p_demux, pid, p_pes, i_append_pcr,
++                 i_pktdts != TS_90KHZ_INVALID ? i_pktdts : i_pktpts ) )
++        return;
++
+     if( p_es->i_sl_es_id )
+         p_mpeg4desc = GetMPEG4DescByEsId( p_es->p_program, p_es->i_sl_es_id );
+ 
+@@ -1596,6 +2009,12 @@ static void ParsePESDataChain( demux_t *p_demux, ts_pid_t *pid, block_t *p_pes,
+         }
+     }
+ 
++    /* Blu-ray 3D: the dependent view AU follows the base view AU */
++    if( p_pes && pid->i_pid == p_demux->p_sys->mvc.i_base_pid &&
++        p_demux->p_sys->mvc.i_dep_pid )
++        p_pes = MVCMerge( p_demux, p_pes,
++                          i_pktdts != TS_90KHZ_INVALID ? i_pktdts : i_pktpts );
++
+     /* ISO/IEC 13818-1 2.7.5: if no pts and no dts, then dts == pts */
+     if( i_pts != VLC_TICK_INVALID && i_dts == VLC_TICK_INVALID )
+         i_dts = i_pts;
+@@ -1906,6 +2325,10 @@ static void ReadyQueuesPostSeek( demux_t *p_demux )
+         }
+         p_pmt->pcr.i_current = VLC_TICK_INVALID;
+     }
++
++    MVCReset( p_sys );
++    if( p_sys->mvc.b_ssif && p_sys->mvc.i_dep_pid && p_sys->b_canseek )
++        MVCSsifPrefetch( p_demux );
+ }
+ 
+ static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_seektime )
+diff --git a/modules/demux/mpeg/ts.h b/modules/demux/mpeg/ts.h
+index 05c6c32aac..1800fe44ad 100644
+--- a/modules/demux/mpeg/ts.h
++++ b/modules/demux/mpeg/ts.h
+@@ -125,6 +125,30 @@ struct demux_sys_t
+ 
+     vdr_info_t  vdr;
+ 
++    /* Blu-ray 3D: dependent view PID (stream type 0x20) merged into the base view */
++    struct
++    {
++        uint16_t i_dep_pid; /* 0: none */
++        uint16_t i_base_pid;
++        block_t *p_gather; /* dependent view PES being gathered */
++        block_t **pp_gather_last;
++        size_t   i_gathered;
++        size_t   i_pes_size; /* from PES_packet_length, 0: unbounded */
++        bool     b_broken; /* packet lost or scrambled: dropped */
++        block_t *p_queue; /* dependent view AUs, i_dts = 90 kHz DTS */
++        block_t **pp_queue_last;
++        unsigned i_queue;
++        block_t *p_held; /* base view PES waiting for its dependent view AU */
++        ts_pid_t *p_held_pid;
++        ts_90khz_t i_held_pcr;
++        ts_90khz_t i_held_dts;
++        bool     b_no_hold;
++        bool     b_ssif; /* the dependent view has its own PMT */
++        bool     b_dep_extent; /* .ssif: in a dependent view extent (own PCRs) */
++        unsigned i_merged;
++        unsigned i_missed;
++    } mvc;
++
+     /* downloadable content */
+     vlc_dictionary_t attachments;
+ 
+diff --git a/modules/packetizer/h264.c b/modules/packetizer/h264.c
+index a756199287..e9650c94df 100644
+--- a/modules/packetizer/h264.c
++++ b/modules/packetizer/h264.c
+@@ -76,6 +76,7 @@ struct decoder_sys_t
+ 
+     /* */
+     bool    b_slice;
++    bool    b_mvc_dep; /* in the Blu-ray 3D dependent view suffix (NAL 24 on) */
+     struct
+     {
+         block_t *p_head;
+@@ -360,6 +361,7 @@ static int Open( vlc_object_t *p_this )
+                      p_dec );
+ 
+     p_sys->b_slice = false;
++    p_sys->b_mvc_dep = false;
+     p_sys->frame.p_head = NULL;
+     p_sys->frame.pp_append = &p_sys->frame.p_head;
+     p_sys->leading.p_head = NULL;
+@@ -561,6 +563,7 @@ static void ResetOutputVariables( decoder_sys_t *p_sys )
+     p_sys->b_new_sps = false;
+     p_sys->b_new_pps = false;
+     p_sys->b_slice = false;
++    p_sys->b_mvc_dep = false;
+     /* From SEI */
+     p_sys->i_dpb_output_delay = 0;
+     p_sys->i_pic_struct = UINT8_MAX;
+@@ -645,7 +648,19 @@ static block_t *ParseNALBlock( decoder_t *p_dec, bool *pb_ts_used, block_t *p_fr
+         cc_storage_reset( p_sys->p_ccs );
+     }
+ 
+-    switch( i_nal_type )
++    /* Blu-ray 3D: the ts demux appends the dependent view access unit (MVC
++     * sub-bitstream delimited by NAL 24: subset SPS, PPS, SEI, NAL 20 slices)
++     * to the base view access unit; it stays in the picture as is */
++    if( i_nal_type == 24 && p_sys->b_slice )
++        p_sys->b_mvc_dep = true;
++    else if( p_sys->b_mvc_dep && i_nal_type != H264_NAL_SUBSET_SPS &&
++             i_nal_type != H264_NAL_PPS && i_nal_type != H264_NAL_SEI &&
++             i_nal_type != H264_NAL_SLICE_EXT && i_nal_type != H264_NAL_FILLER_DATA )
++        p_sys->b_mvc_dep = false;
++
++    if( p_sys->b_mvc_dep )
++        block_ChainLastAppend( &p_sys->frame.pp_append, p_frag );
++    else switch( i_nal_type )
+     {
+         /*** Slices ***/
+         case H264_NAL_SLICE:
+-- 
+2.55.0.windows.3
+

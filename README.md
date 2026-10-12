@@ -21,7 +21,9 @@ VLC demux ─ mediacodec module ─ libdvfelplay: RPU → profile 8.1 (no-op map
 ```
 
 Since v0.2.0 it also plays **3D MVC (Blu-ray 3D)** in 3D – both views at full resolution, HDMI 1.4 frame
-packing (1080p24) – on 3D displays and projectors, see [3D MVC](#3d-mvc-blu-ray-3d).
+packing (1080p24) – on 3D displays and projectors, see [3D MVC](#3d-mvc-blu-ray-3d). Since v0.2.1 also from
+Blu-ray **m2ts / .ssif** files, and profile 7 FEL from **dual track / dual PID** files (MP4, m2ts, Ultra HD
+Blu-ray streams), see [Dual layer files](#dual-layer-files-dtdl).
 
 With a **lead time**: VLC presents every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds
 the composed frame back to its vsync. The GPU has ~2.5 frame periods instead of ~1, so its time spikes during
@@ -31,9 +33,16 @@ Pro 8K Plus (R22, MMR chroma; without the lead time: ~25 a minute) and on a Dune
 
 ## 3D MVC (Blu-ray 3D)
 
-H.264 MVC files (e.g. MakeMKV `.mk3d`, the dependent view in the same track) are shown in 3D when the display
-reports 3D support (HDMI EDID), with both views at full resolution as HDMI 1.4 **frame packing**
-(1920x2205, 1080p24):
+H.264 MVC files are shown in 3D when the display reports 3D support (HDMI EDID), with both views at full
+resolution as HDMI 1.4 **frame packing** (1920x2205, 1080p24). Sources:
+
+- MKV / `.mk3d` (e.g. MakeMKV): the dependent view in the same track.
+- Blu-ray **m2ts** with the dependent view on its own PID (stream type 0x20, e.g. tsMuxeR), and the disc's
+  **`.ssif`** files (`BDMV/STREAM/SSIF/*.ssif`: the base and the dependent view file interleaved; rename to
+  `.m2ts` if the file browser does not list them). VLC's ts demux merges the dependent view into the base
+  view's access units (by DTS); for `.ssif` it drops the dependent view file's PMT and PCRs and, after a seek,
+  reads back the dependent view extent the position needs.
+- Not from Blu-ray ISO images / folders: VLC's Blu-ray access (libbluray) only gives the 2D base view.
 
 ```
 VLC demux ─ mediacodec module ─┬─ MediaCodec H.264 (base view, the timing) → HWC → video_composer.0
@@ -53,6 +62,21 @@ stock hdmitx21 make it 1080p24 frame packing (timing, 3D vendor infoframe).
   (Settings → Advanced → Custom libVLC options).
 - Needs the `mvc3d` kernel module, installed by VLC FEL like `dvfel` (one root question).
 
+## Dual layer files (DTDL)
+
+Profile 7 with the enhancement layer (EL + RPU) in a track or PID of its own is turned into the single track
+form by VLC's demux: each EL access unit is appended to the base layer access unit with the same DTS (every EL
+NAL unit wrapped in a NAL unit of type 63, the RPU last), so it plays exactly like an STDL file.
+
+- **MP4**: an EL track `dvhe`/`dvh1` at a quarter of the base layer's size next to the HEVC base layer track
+  (the EL track gets no stream of its own; its parameter sets are added at IRAP pictures when not in-band).
+- **m2ts / ts**: the Dolby Vision video stream descriptor without the base layer (its dependency PID), or
+  Ultra HD Blu-ray's HEVC PID 0x1015 next to 0x1011 (also when the PMT spans several packets).
+- Tested on an LG OLED (Dolby Vision): two DTDL MP4s, the same as m2ts, and a cut of an Ultra HD Blu-ray
+  main movie m2ts (80 Mbps, FEL): all frames composed, pause and seeks.
+- Also fixed on the way, in VLC's MP4 demux: with an edit list skipping the composition delay, the first
+  pictures of B-frame streams got wrong (even duplicate) presentation times.
+
 ## Download
 
 Releases: <https://github.com/djnice/vlc-fel-android/releases> (APK, read `README.txt`).
@@ -61,12 +85,12 @@ Releases: <https://github.com/djnice/vlc-fel-android/releases> (APK, read `READM
 
 - Amlogic S928X Dune HD or R_volution player with the Dune HD **R22 or R24** Android firmware.
   Tested: Dune HD Pro 8K Plus, firmware `250815_1012_r22`; Dune HD Pro One 8K Plus, firmware
-  `260303_1721_r24` (one module build for both, no symbol version differences): playback, pause / seek,
-  the module installation (R22 with root access off, R24 with it on) and the module loading at boot.
-- Profile 7 FEL files with the enhancement layer in the base layer's track (**single track, STDL**, e.g. MKV
-  remuxes). Dual track (DTDL) files are not supported yet.
-- 3D MVC: files with the dependent view in the base view's track (MKV / `.mk3d`); a 3D display (frame
-  packing 1080p24). Tested with an Optoma 1080p 3D projector on both players.
+  `260303_1721_r24` and its 2026-08-27 R24 update (one module build for all; no symbol version differences): playback,
+  pause / seek, the module installation (R22 with root access off, R24 with it on) and the module loading
+  at boot.
+- Profile 7 FEL files: single track (STDL, e.g. MKV remuxes) or dual track / dual PID (DTDL: MP4, m2ts).
+- 3D MVC: MKV / `.mk3d`, m2ts with the dependent view PID, `.ssif`; a 3D display (frame packing 1080p24).
+  Tested with an Optoma 1080p 3D projector on both players.
 - Root access for the one-time module installation (the firmware's `sud`; VLC FEL asks to switch it on for
   the installation and switches it off again).
 
@@ -96,7 +120,7 @@ the first MVC file is to play in 3D.
 | `libdvfelplay/` | The player side as a C library (GPL-2.0+): access unit filter (P7 → P8.1, EL extraction), EL decoder, GPU composer (`felgpu`), BL/EL pairing, vsync-aligned render times, lead time, the bundled module and its installer. `include/dvfelplay.h` is the API. Builds with NDK r28c. |
 | `kernel/mvc3d/` | `mvc3d` kernel module (GPL-2.0+): vfm node between video_composer and video_render that replaces the frames by user space's frame packed pictures (`mvc3d_uapi.h`), lead time, and the HDMI frame packing probes for the stock hdmitx21 (R22 and R24). |
 | `libmvc3dplay/` | 3D MVC, player side (GPL-2.0+): the library in the player, `mvc3dhelper` (static aarch64: edge264-mvc decoding, frame packing), the bundled module and its installer, `edge264/` (edge264-mvc at `5757e71` + the picture tag patch). `include/mvc3dplay.h` is the API. |
-| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation. |
+| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix). |
 | `vlc/build-in-docker.sh` | The APK build (vlc-android `fc5fa1f`, libvlcjni-3.x, armeabi-v7a) in VideoLAN's docker image; package `org.videolan.vlc.fel`, name "VLC FEL". |
 | `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `sync.sh` (maintainer: copies the working sources here), `tests/` (cadence and pause/seek measurements over adb). |
 | `docs/NOTES.md` | Technical notes and pitfalls of this firmware, the lead time, VLC. |
@@ -118,7 +142,7 @@ the first MVC file is to play in 3D.
 
 ## Use / switches
 
-- Plays like VLC; profile 7 FEL files (single track, STDL – see the limits below) are composed, MEL and profile 7 without EL play as profile 8.1,
+- Plays like VLC; profile 7 FEL files (single or dual track) are composed, MEL and profile 7 without EL play as profile 8.1,
   other Dolby Vision profiles through the Dolby Vision decoder. VLC option `--no-mediacodec-dovi-fel`
   (Settings → Advanced → Custom libVLC options) turns FEL composition off.
 - Test switches (`adb shell setprop`, read by libdvfelplay): `debug.dvfp.lead_ms` (lead time, 0: off),
@@ -130,21 +154,26 @@ the first MVC file is to play in 3D.
 
 ## Status / known limits
 
-- **Single track (STDL) only**: the enhancement layer must be in the same video track as the base layer (as in
-  MKV remuxes, e.g. MakeMKV). Dual track files (DTDL: the EL in a separate track or PID, e.g. Blu-ray m2ts /
-  ISO, dual track MP4) play the base layer only, without Dolby Vision.
-- Proof of concept: two firmware versions / models tested. 4K 50/60p FEL is too heavy (GPU time).
+- Dual layer: MP4 (non-fragmented) and m2ts / ts; not from Blu-ray ISO images / folders (libbluray), not from
+  fragmented MP4 or MKV with the EL in a second track.
+- Proof of concept: two models, three firmware builds tested. 4K 50/60p FEL is too heavy (GPU time).
 - 32-bit (armeabi-v7a) only, like the players' userspace.
 - The Dune auto frame rate does not switch back after stop until you return to the Dune home screen.
 - After a seek, 1–2 frames may be shown with the RPU mapping only (no EL residual), and the first frames
   after a seek may be a vsync late while the chain fills.
 - Subtitles and the OSD are VLC's as usual; Dolby Vision itself is shown by the player's DV core.
-- 3D MVC: the GUI (VLC's controls, subtitles) shows in the left view only; 3D Blu-ray folders / ISO / m2ts
-  (the dependent view in a separate PID) play in 2D; frame packing only on the two tested firmware builds
-  (elsewhere: 2D); 1080p and 720p MVC only.
+- 3D MVC: the GUI (VLC's controls, subtitles) shows in the left view only; Blu-ray ISO images / folders play
+  in 2D; frame packing only on the tested firmware builds (elsewhere: 2D); 1080p and 720p MVC only. After a
+  seek into an open GOP (Blu-ray discs), up to ~1 s may show the base view twice (2D) until the next key
+  picture. Some projectors drop the HDMI connection when switching from a 2160p desktop to frame packing,
+  which stops playback: use a 1080p desktop then.
 
 ## Changes
 
+- **v0.2.1-poc** (kernel modules `dvfel 2026.10.07.1` (unchanged), `mvc3d 2026.10.12.3`, libmvc3dplay
+  `2026.10.12` with the helper fix): profile 7 FEL from dual track MP4 and dual PID m2ts (incl. Ultra HD
+  Blu-ray streams); 3D MVC from m2ts and `.ssif`; `mvc3d` finds the HDMI 3D flags in the firmware's code (the
+  R24 2026-08-27 update played 3D in 2D with 0.2.0); the 3D helper no longer hangs after some seeks.
 - **v0.2.0-poc** (kernel modules `dvfel 2026.10.07.1` (unchanged), `mvc3d 2026.10.12.2`, libmvc3dplay
   `2026.10.12`): 3D MVC (Blu-ray 3D) in 3D with HDMI 1.4 frame packing, both views at full resolution
   (software decoding of both views, the stock hdmitx21 made to output frame packing), from 1080p and 2160p

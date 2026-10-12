@@ -32,7 +32,7 @@
 
 #define MVC3D_DEV		"/dev/mvc3d"
 /* module version (/sys/module/mvc3d/version) */
-#define MVC3D_VERSION		"2026.10.12.2"
+#define MVC3D_VERSION		"2026.10.12.3"
 
 #define MVC3D_MAX_BUFS		16
 #define MVC3D_FMT_UYVY		0
