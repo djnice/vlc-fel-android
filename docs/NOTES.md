@@ -110,3 +110,38 @@ kernel `5.4.210` GKI, Android 11 userdebug, SELinux permissive).
   difference.
 - Files pushed with adb to `/sdcard/Download` are invisible to apps until the media scanner sees them
   (Android 11 scoped storage); for tests put them into the app's own `Android/data/<package>/files/`.
+
+## 3D MVC (mvc3d, libmvc3dplay)
+
+- **32-bit userspace, arm64 kernel**: there is no `linker64`, so an aarch64 decoder cannot load into VLC. A
+  *static* aarch64 executable runs fine though (also as the app's uid, from its native library directory:
+  `libmvc3dhelper.so`). The software decoder (edge264-mvc, both views, ~1.8 cores for a 1080p24 3D Blu-ray)
+  lives there; libmvc3dplay in VLC feeds it over a socket. The S5 hardware MVC decoder breaks the dependent
+  view, so the base view comes from the hardware H.264 decoder (MediaCodec) and only carries the timing.
+- **Frame identification**: the H.264 frame reaching the video composer is a deinterlacer copy
+  (`VIDTYPE_DI_PW`); its `vf_ext` is the decoder vframe, whose `timestamp` is `N * 10^9` with N the number
+  of the input buffer (codec config buffers not counted) since the decoder started – **or since the last
+  flush**: the Amlogic codec2 decoder numbers from 0 again after every flush (seek). The pts fields are 0.
+- After a seek VLC prerolls from the key frame before the position: those pictures are decoded but never
+  shown; the helper must give their buffers back early or it cannot reach the first frame shown.
+- **Lead time**: 1 vsync is enough (the picture is ready a moment after the frame); 125 ms makes
+  SurfaceFlinger drop every 7th frame (the H.264 decoder cannot run that far ahead with its buffers).
+- **HDMI 1.4 frame packing on the stock hdmitx21** (no firmware change): `config` takes `3dfp` (flag,
+  vendor infoframe, 3D clock table) but the mode keeps the 2D timing. CoreELEC's linux-amlogic adds the frame
+  packed timing in `hdmitx21_get_fmtpara()` (95e29f15de); the encoder takes its timing from the VIC table
+  (`set_tv_encp_new()` → `hdmitx21_gettiming_from_vic()`). mvc3d adds both with return probes, for the mode
+  sets of the firmware's auto frame rate only (callers `hdmitx_validate_vmode` / `hdmitx_set_current_vmode`;
+  the HDR/vendor packet refreshes keep what the output has). The 3D flag byte of `struct hdmitx_dev`:
+  R24 `+0x2f08`, R22 `+0x2ee8` (from `config_store`'s `3dfp` branch); the module picks it by the kernel build
+  in `/proc/version`.
+- Setting a mode through `/sys/class/display/mode` (allowed only with `display/debug` 1) makes the
+  composer (MesonHwc) handle a hotplug: SurfaceFlinger recreates the display and VLC's playback stalls.
+  The firmware's auto frame rate must set the mode; mvc3d only changes what the hdmitx makes of it.
+- From a **2160p desktop** the auto frame rate picks 2160p24 (no frame packing exists for it): the hdmitx
+  gets `1080p24hz` instead (Android/DRM keep 2160p24, the frame buffer is 1080p anyway), and the GUI planes
+  (placed in 2160p coordinates by the composer) get their destination halved in `meson_plane_atomic_check`.
+  The firmware also has its own `auto_resolution` AFR setting (`dune.afrc.ar`), not needed.
+- Kernel CRCs of symbols no firmware module imports (`register_kretprobe`, `register_kprobe`,
+  `sprint_symbol`) come from genksyms over the kernel tree (checked: `printk` gives the firmware's CRC).
+- **Never read core kernel structures from the module** (`utsname()`: task/nsproxy layouts differ between
+  the R22 and R24 kernels – it panicked R22); `/proc/version` through `kernel_read()` is safe.

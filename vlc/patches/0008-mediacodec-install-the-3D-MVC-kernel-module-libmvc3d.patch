@@ -1,0 +1,64 @@
+From fa65848ab6c2af1724f1198255ae10cf22fae4ab Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 12 Oct 2026 13:14:22 +0200
+Subject: [PATCH] mediacodec: install the 3D MVC kernel module (libmvc3dplay)
+
+The first MVC stream that is to play in 3D (a 3D display, or 3D forced)
+installs the mvc3d kernel module bundled with libmvc3dplay when it is missing
+or older (mvc3d_module_install): root access is asked for with a question
+dialog when the firmware has it switched off (and switched off again
+afterwards); failures are reported once.
+
+Message-Id: <20261012-dvfel-mediacodec-mvc3d-module-install@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index d4ed85aab2..d5b82c1df0 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -185,6 +185,8 @@ static struct
+     void (*flush)(mvc3d *);
+     void (*restart)(mvc3d *);
+     int64_t (*present_lead_ns)(const mvc3d *); /* optional */
++    int (*module_install)(const char *, int (*)(void *, const char *, const char *),
++                          void *, char *, size_t); /* optional */
+ } mvc_api;
+ 
+ static void MvcLoadOnce(void)
+@@ -199,6 +201,7 @@ static void MvcLoadOnce(void)
+      && mvc_api.api_version() == MVC3D_API_VERSION)
+     {
+         MVC_SYM(present_lead_ns);
++        MVC_SYM(module_install);
+         mvc_api.loaded = true;
+     }
+ #undef MVC_SYM
+@@ -2055,6 +2058,21 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+     const int i_mode = var_InheritInteger(p_dec, CFG_PREFIX "mvc");
+     const unsigned i_width = p_dec->fmt_out.video.i_width;
+     const unsigned i_height = p_dec->fmt_out.video.i_height;
++    /* the mvc3d kernel module bundled with libmvc3dplay: installed when
++     * missing or older (asks for root access once), as for Dolby Vision */
++    if (mvc_api.module_install && (i_mode == MVC_MODE_3D || mvc_api.display_3d()))
++    {
++        static bool b_told;
++        char psz_msg[160];
++        int i_ret = mvc_api.module_install(NULL, DoviAsk, p_dec, psz_msg, sizeof(psz_msg));
++        if (i_ret != 0)
++            msg_Info(p_dec, "3D MVC kernel module: %s", psz_msg);
++        if (i_ret < -1 && !b_told)
++        {
++            b_told = true;
++            vlc_dialog_display_error(p_dec, "3D MVC", "%s", psz_msg);
++        }
++    }
+     if (!mvc_api.available())
+     {
+         msg_Info(p_dec, "3D MVC: no mvc3d kernel module, 2D (base view)");
+-- 
+2.55.0.windows.3
+

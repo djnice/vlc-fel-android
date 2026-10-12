@@ -1,0 +1,113 @@
+From c69a6770678db67c6fc800e2b7c11d96e9c7305f Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 7 Oct 2026 15:42:44 +0200
+Subject: [PATCH] picture tags: edge264_set_tag(), Edge264Frame.tag/tag_mvc
+
+---
+ edge264.h              |  4 ++++
+ src/edge264.c          | 11 +++++++++++
+ src/edge264_headers.c  |  2 ++
+ src/edge264_internal.h |  2 ++
+ 4 files changed, 19 insertions(+)
+
+diff --git a/edge264.h b/edge264.h
+index f7195f0..85e396d 100644
+--- a/edge264.h
++++ b/edge264.h
+@@ -63,6 +63,8 @@ typedef struct Edge264Frame {
+ 	int64_t DisplayPoc_mvc; // second view
+ 	int16_t frame_crop_offsets[4]; // {top,right,bottom,left}, useful to derive the original frame with 16x16 macroblocks
+ 	void *return_arg;
++	int64_t tag; // edge264_set_tag() value current when the picture started decoding (-1: none)
++	int64_t tag_mvc; // second view
+ } Edge264Frame;
+ 
+ const uint8_t *edge264_find_start_code(const uint8_t *buf, const uint8_t *end, int four_byte);
+@@ -72,6 +74,8 @@ void edge264_free(Edge264Decoder **pdec);
+ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *end, Edge264UnrefCb unref_cb, void *unref_arg);
+ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow);
+ void edge264_return_frame(Edge264Decoder *dec, void *return_arg);
++// tag for the pictures that start decoding from now on (e.g. the access unit number), returned in Edge264Frame.tag
++void edge264_set_tag(Edge264Decoder *dec, int64_t tag);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/edge264.c b/src/edge264.c
+index e6958b8..678d0a5 100644
+--- a/src/edge264.c
++++ b/src/edge264.c
+@@ -163,6 +163,7 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
+ 	dec->log_base_us = get_relative_time_us();
+ 	dec->currPic = dec->basePic = -1;
+ 	dec->PrevRefFrameNum[0] = dec->PrevRefFrameNum[1] = dec->prevFrameId = -1;
++	dec->tag = -1;
+ 	dec->taskPics_v = dec->get_frame_queue_v[0] = dec->get_frame_queue_v[1] = set8(-1);
+ 	dec->n_threads = n_threads;
+ 	dec->alloc_cb = alloc_cb && free_cb ? alloc_cb : internal_alloc;
+@@ -285,6 +286,13 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
+ 
+ 
+ 
++void edge264_set_tag(Edge264Decoder *dec, int64_t tag) {
++	if (dec != NULL)
++		dec->tag = tag;
++}
++
++
++
+ void edge264_flush(Edge264Decoder *dec) {
+ 	if (dec == NULL)
+ 		return;
+@@ -711,6 +719,8 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
+ 		out->samples[1] = dec->samples_buffers[pic0] + offC;
+ 		out->samples[2] = dec->samples_buffers[pic0] + offC + (dec->out.stride_C >> 1);
+ 		out->FrameId = dec->FrameIds[pic0];
++		out->tag = dec->Tags[pic0];
++		out->tag_mvc = -1;
+ 		out->Poc = dec->FieldOrderCnt[0][pic0];
+ 		out->Poc_mvc = 0;
+ 		out->DisplayPoc = edge264_unwrap_output_poc(dec, 0, out->Poc);
+@@ -724,6 +734,7 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
+ 			out->samples_mvc[1] = dec->samples_buffers[pic1] + offC;
+ 			out->samples_mvc[2] = dec->samples_buffers[pic1] + offC + (dec->out.stride_C >> 1);
+ 			out->FrameId_mvc = dec->FrameIds[pic1];
++			out->tag_mvc = dec->Tags[pic1];
+ 			out->Poc_mvc = dec->FieldOrderCnt[0][pic1];
+ 			out->DisplayPoc_mvc = edge264_unwrap_output_poc(dec, 1, out->Poc_mvc);
+ 			out->return_arg = (void *)((uintptr_t)1 << pic0 | (uintptr_t)1 << pic1);
+diff --git a/src/edge264_headers.c b/src/edge264_headers.c
+index 1c5dc65..df38bda 100644
+--- a/src/edge264_headers.c
++++ b/src/edge264_headers.c
+@@ -1551,6 +1551,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
+ 			dec->non_base_frames = dec->non_base_frames & ~(1 << i) | non_base_view << i;
+ 			dec->FrameNums[i] = dec->PrevRefFrameNum[non_base_view] = FrameNum;
+ 			dec->FrameIds[i] = ++dec->prevFrameId;
++			dec->Tags[i] = -1;
+ 			int PicOrderCnt = 0;
+ 			if (sps->pic_order_cnt_type == 2) {
+ 				PicOrderCnt = FrameNum * 2;
+@@ -1598,6 +1599,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
+ 		dec->non_base_frames = dec->non_base_frames & ~(1 << currPic) | non_base_view << currPic;
+ 		dec->frame_flip_bits ^= 1 << currPic;
+ 		dec->FrameIds[currPic] = ++dec->prevFrameId;
++		dec->Tags[currPic] = dec->tag;
+ 		dec->FrameNums[currPic] = dec->FrameNum;
+ 		dec->FieldOrderCnt[0][currPic] = dec->TopFieldOrderCnt;
+ 		dec->FieldOrderCnt[1][currPic] = dec->BottomFieldOrderCnt;
+diff --git a/src/edge264_internal.h b/src/edge264_internal.h
+index b69c606..48798d3 100644
+--- a/src/edge264_internal.h
++++ b/src/edge264_internal.h
+@@ -419,6 +419,8 @@ typedef struct Edge264Decoder {
+ 	uint32_t prev_long_term_frames; // state of long_term_frames for both views before current frame
+ 	int32_t FrameNums[32]; // signed to be used along FieldOrderCnt in initial reference ordering
+ 	int32_t FrameIds[32]; // unique identifiers for each frame, incremented in decoding order
++	int64_t Tags[32]; // edge264_set_tag() value per frame
++	int64_t tag;
+ 	int32_t DispOrder[32]; // monotonic display-order rank, assigned when a frame is bumped for output (see next_dispnum)
+ 	union { int8_t get_frame_queue[2][16]; i8x16 get_frame_queue_v[2]; }; // FIFO with insertion at 0 for both views, and empty slots having value -1
+ 	union { int8_t LongTermFrameIdx[32]; i8x16 LongTermFrameIdx_v[2]; };
+-- 
+2.43.0
+

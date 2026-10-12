@@ -12,6 +12,9 @@ a GPU-n komponálja (12 bites rekonstrukció, ditherrel), a kimenet Dolby Vision
 Külön alkalmazásként települ („VLC FEL”, org.videolan.vlc.fel), a hivatalos VLC mellett is futhat,
 saját beállításokkal.
 
+A 0.2.0 óta a 3D MVC (Blu-ray 3D) filmeket is 3D-ben játssza, mindkét nézet teljes felbontásban,
+HDMI 1.4 frame packinggel (1080p24), 3D-s TV-n / projektoron (lásd lent: 3D MVC).
+
 Előfutással működik: a VLC minden képet
 3 vsync-kel (24 Hz-en 125 ms) korábban ad ki, a kernelmodul pedig a kész képet a saját vsyncjéig
 visszatartja. Így a GPU-nak ~2,5 képkockányi ideje van ~1 helyett: a lejátszás közbeni GPU-kiugrások
@@ -29,6 +32,20 @@ FELTÉTELEK
   kernelszimbólumokat is kiírja).
 - Root-hozzáférés a modul telepítéséhez. Ha a lejátszón ki van kapcsolva, a VLC FEL megkérdezi,
   bekapcsolhatja-e a telepítés idejére („Install”); utána visszakapcsolja.
+
+3D MVC (BLU-RAY 3D)
+-------------------
+- MVC-s MKV / .mk3d fájlok (a függő nézet ugyanabban a sávban, pl. MakeMKV), 1080p vagy 720p.
+- Ha a kijelző EDID-je 3D-t jelez, a lejátszás 3D-ben indul: a VLC FEL mindkét nézetet szoftveresen
+  dekódolja, frame packing képet állít össze (1920x2205), a kimenet 1080p 24 Hz 3D (frame packing).
+  A firmware AFR-je vált, 1080p-s és 2160p-s asztalról is működik.
+- 2D-s kijelzőn a bázisnézet 2D-ben megy, mint eddig. Kézzel: Beállítások → Speciális → Egyéni
+  libVLC opciók: --mediacodec-mvc=1 (mindig 2D) vagy --mediacodec-mvc=2 (mindig 3D).
+- Az első 3D-s lejátszáskor a VLC FEL telepíti az mvc3d kernelmodult is (2026.10.12.2), a dvfel-hez
+  hasonlóan (config/boot/mvc3d.sh, ha kell, root-kérdéssel).
+- A GUI (VLC vezérlők, felirat) 3D-ben csak a bal szem képén látszik. Blu-ray mappa / ISO / m2ts
+  (a függő nézet külön PID-en) egyelőre 2D-ben megy.
+- Seek után 1-2 képkocka kimaradhat, amíg a szoftveres dekóder utoléri.
 
 TELEPÍTÉS
 ---------
@@ -54,6 +71,7 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.0-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.2) – 3D MVC (Blu-ray 3D) 3D-ben, HDMI frame packing.
 0.1.0-poc (kernelmodul 2026.10.07.1) – első kiadás.
 
 ELTÁVOLÍTÁS
@@ -62,6 +80,7 @@ ELTÁVOLÍTÁS
 - A kernelmodul boot-scriptjének törlése (ADB, root), ha más alkalmazás sem használja:
       adb root
       adb shell rm -r /data/data/com.dunehd.app/config/boot/dvfel.sh /data/data/com.dunehd.app/config/dvfel
+      adb shell rm -r /data/data/com.dunehd.app/config/boot/mvc3d.sh /data/data/com.dunehd.app/config/mvc3d
   majd újraindítás.
 
 FORRÁS
@@ -81,6 +100,9 @@ content at full quality: base and enhancement layers are both decoded in hardwar
 GPU (12-bit reconstruction with dither), output is Dolby Vision. It installs as a separate app
 ("VLC FEL", org.videolan.vlc.fel) next to the official VLC, with its own settings.
 
+Since 0.2.0 it also plays 3D MVC (Blu-ray 3D) in 3D, both views at full resolution, as HDMI 1.4 frame
+packing (1080p24), on 3D TVs / projectors (see 3D MVC below).
+
 It works with a lead time: VLC presents
 every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds the composed frame back to
 its vsync. The GPU gets ~2.5 frame periods instead of ~1: its time spikes during playback no longer
@@ -98,6 +120,20 @@ REQUIREMENTS
   the tested firmware).
 - Root access for the module installation. If it is switched off on the player, VLC FEL asks whether
   to switch it on for the installation ("Install"), and switches it off again afterwards.
+
+3D MVC (BLU-RAY 3D)
+-------------------
+- MVC MKV / .mk3d files (the dependent view in the same track, e.g. MakeMKV), 1080p or 720p.
+- When the display's EDID reports 3D, playback starts in 3D: VLC FEL decodes both views in software,
+  composes a frame packed picture (1920x2205), the output is 1080p 24 Hz 3D (frame packing). The
+  firmware's AFR switches; works from 1080p and from 2160p desktops.
+- On 2D displays the base view plays in 2D as before. By hand: Settings → Advanced → Custom libVLC
+  options: --mediacodec-mvc=1 (always 2D) or --mediacodec-mvc=2 (always 3D).
+- The first 3D playback also installs the mvc3d kernel module (2026.10.12.2), like dvfel
+  (config/boot/mvc3d.sh, with the root question if needed).
+- In 3D the GUI (VLC's controls, subtitles) shows in the left eye's view only. Blu-ray folders / ISO /
+  m2ts (the dependent view in a separate PID) play in 2D for now.
+- After a seek 1-2 frames may be skipped while the software decoder catches up.
 
 INSTALLATION
 ------------
@@ -122,6 +158,7 @@ NOTES
 
 CHANGES
 -------
+0.2.0-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.2) – 3D MVC (Blu-ray 3D) in 3D, HDMI frame packing.
 0.1.0-poc (kernel module 2026.10.07.1) – first release.
 
 UNINSTALL
@@ -130,6 +167,7 @@ UNINSTALL
 - If no other app uses it: remove the module boot script (ADB, root):
       adb root
       adb shell rm -r /data/data/com.dunehd.app/config/boot/dvfel.sh /data/data/com.dunehd.app/config/dvfel
+      adb shell rm -r /data/data/com.dunehd.app/config/boot/mvc3d.sh /data/data/com.dunehd.app/config/mvc3d
   and reboot.
 
 SOURCE

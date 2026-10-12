@@ -39,6 +39,13 @@ done
 # libdvfelplay.so next to libvlc.so in the APK (ndk-build cleans jni/libs)
 mkdir -p libvlcjni/libvlc/dvfel-libs/armeabi-v7a
 cp "$DVFELPLAY_SO" libvlcjni/libvlc/dvfel-libs/armeabi-v7a/
+# 3D MVC: libmvc3dplay.so and its helper (a static aarch64 program named
+# libmvc3dhelper.so so that it is extracted next to the libraries)
+MVC3D_DIR=${MVC3D_DIR:-/host/vlc/dvfel-libs/armeabi-v7a}
+for f in libmvc3dplay.so libmvc3dhelper.so; do
+  [ -f "$MVC3D_DIR/$f" ] && cp "$MVC3D_DIR/$f" libvlcjni/libvlc/dvfel-libs/armeabi-v7a/
+done
+ls -la libvlcjni/libvlc/dvfel-libs/armeabi-v7a/
 grep -q dvfel-libs libvlcjni/libvlc/build.gradle ||
   sed -i "s|jniLibs.srcDirs = \[ 'jni/libs' \]|jniLibs.srcDirs = [ 'jni/libs', 'dvfel-libs' ]|" libvlcjni/libvlc/build.gradle
 grep -n "jniLibs" libvlcjni/libvlc/build.gradle

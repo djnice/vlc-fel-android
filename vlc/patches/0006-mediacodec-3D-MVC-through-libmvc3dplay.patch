@@ -1,0 +1,256 @@
+From 8b0fd80a1e2b682872fe6085f2dd13886289ace6 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 7 Oct 2026 15:50:32 +0200
+Subject: [PATCH] mediacodec: 3D MVC through libmvc3dplay
+
+H.264 streams with MVC NAL units (subset SPS, slice extension) in their
+first access units: with libmvc3dplay and the mvc3d kernel module (Amlogic
+S5), every buffer queued to MediaCodec also goes to the library, which
+decodes both views in software and shows a frame packed picture in place of
+every frame the hardware decoder (base view) outputs. The decoder restarts
+when the MVC units show up only after the first access unit, so that both
+number the access units from the decoder's start.
+
+mediacodec-mvc: automatic (3D when the display reports 3D support), 2D (the
+base view), 3D.
+
+Message-Id: <20261007-dvfel-mediacodec-mvc3d@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 135 +++++++++++++++++++++++++++++++
+ 1 file changed, 135 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index fb2f7ec4af..35b664f9c0 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -158,6 +158,59 @@ static bool DoviLoad(void)
+     pthread_once(&once, DoviLoadOnce);
+     return dvfp_api.loaded;
+ }
++
++/*
++ * 3D MVC (Blu-ray 3D) through libmvc3dplay (optional, loaded at run time):
++ * the hardware H.264 decoder keeps decoding the base view; the library
++ * decodes both views in software and, with the mvc3d kernel module (Amlogic
++ * S5), shows a frame packed picture in place of every decoded frame. It gets
++ * every buffer queued to MediaCodec (see mvc3dplay.h, API version 1).
++ */
++typedef struct mvc3d mvc3d;
++#define MVC3D_API_VERSION 1
++#define MVC_PROBE_BLOCKS 8
++
++static struct
++{
++    bool loaded;
++    int (*api_version)(void);
++    const char *(*version)(void);
++    int (*available)(void);
++    int (*probe)(const uint8_t *, size_t);
++    int (*display_3d)(void);
++    mvc3d *(*open)(int, int);
++    void (*close)(mvc3d *);
++    void (*commit)(mvc3d *, const uint8_t *, size_t, int64_t);
++    void (*config)(mvc3d *, const uint8_t *, size_t);
++    void (*flush)(mvc3d *);
++    void (*restart)(mvc3d *);
++} mvc_api;
++
++static void MvcLoadOnce(void)
++{
++    void *lib = dlopen("libmvc3dplay.so", RTLD_NOW);
++    if (!lib)
++        return;
++#define MVC_SYM(name) (*(void **)&mvc_api.name = dlsym(lib, "mvc3d_" #name))
++    if (MVC_SYM(api_version) && MVC_SYM(version) && MVC_SYM(available)
++     && MVC_SYM(probe) && MVC_SYM(display_3d) && MVC_SYM(open) && MVC_SYM(close)
++     && MVC_SYM(commit) && MVC_SYM(config) && MVC_SYM(flush) && MVC_SYM(restart)
++     && mvc_api.api_version() == MVC3D_API_VERSION)
++        mvc_api.loaded = true;
++#undef MVC_SYM
++}
++
++static bool MvcLoad(void)
++{
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, MvcLoadOnce);
++    return mvc_api.loaded;
++}
++
++/* CFG_PREFIX "mvc" */
++#define MVC_MODE_AUTO 0
++#define MVC_MODE_2D 1
++#define MVC_MODE_3D 2
+ /**
+  * Callback called when a new block is processed from DecodeBlock.
+  * It returns -1 in case of error, 0 if block should be dropped, 1 otherwise.
+@@ -234,6 +287,9 @@ struct decoder_sys_t
+             int i_profile; /* the HEVC profile the decoder was chosen for */
+             dvfp *p_dvfp;
+             bool b_dovi; /* the Dolby Vision decoder is in use */
++            /* 3D MVC: decided by the first access units */
++            int i_mvc_probe; /* access units still to look at */
++            mvc3d *p_mvc;
+         } video;
+         struct {
+             date_t i_end_date;
+@@ -260,6 +316,7 @@ static int VideoMPEG2_OnNewBlock(decoder_t *, block_t **);
+ static int VideoVC1_OnNewBlock(decoder_t *, block_t **);
+ static void DoviProbe(decoder_t *, const block_t *);
+ static int DoviFilter(decoder_t *, block_t **);
++static void MvcProbe(decoder_t *, const block_t *);
+ static void Video_OnFlush(decoder_t *);
+ static int Video_ProcessOutput(decoder_t *, mc_api_out *, picture_t **,
+                                block_t **);
+@@ -298,6 +355,13 @@ static void RemoveInflightPictures(decoder_t *);
+ #define MEDIACODEC_DOVI_FEL_LONGTEXT \
+     "Compose the full enhancement layer of Dolby Vision profile 7 streams " \
+     "on the GPU (Amlogic S5 with the dvfel kernel module)."
++#define MEDIACODEC_MVC_TEXT "3D MVC (Blu-ray 3D)"
++#define MEDIACODEC_MVC_LONGTEXT \
++    "Show H.264 MVC streams in 3D, both views at full resolution (frame " \
++    "packing; Amlogic S5 with the mvc3d kernel module and libmvc3dplay): " \
++    "automatic (when the display supports 3D), 2D (the base view) or 3D."
++static const int pi_mvc_values[] = { MVC_MODE_AUTO, MVC_MODE_2D, MVC_MODE_3D };
++static const char *const ppsz_mvc_names[] = { N_("Automatic"), N_("2D"), N_("3D") };
+ 
+ #define CFG_PREFIX "mediacodec-"
+ 
+@@ -317,6 +381,9 @@ vlc_module_begin ()
+              MEDIACODEC_DOVI_TEXT, MEDIACODEC_DOVI_LONGTEXT, true)
+     add_bool(CFG_PREFIX "dovi-fel", true,
+              MEDIACODEC_DOVI_FEL_TEXT, MEDIACODEC_DOVI_FEL_LONGTEXT, true)
++    add_integer(CFG_PREFIX "mvc", MVC_MODE_AUTO,
++                MEDIACODEC_MVC_TEXT, MEDIACODEC_MVC_LONGTEXT, true)
++        change_integer_list(pi_mvc_values, ppsz_mvc_names)
+     set_callbacks(OpenDecoderNdk, CloseDecoder)
+     add_shortcut("mediacodec_ndk")
+     add_submodule ()
+@@ -850,6 +917,11 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+         p_sys->video.b_dovi_probe = p_dec->fmt_in.i_codec == VLC_CODEC_HEVC
+             && var_InheritBool(p_dec, CFG_PREFIX "dovi")
+             && var_InheritBool(p_dec, CFG_PREFIX "dr");
++        /* 3D MVC: only with direct rendering (the picture is replaced on its
++         * way to the display) */
++        p_sys->video.i_mvc_probe = p_dec->fmt_in.i_codec == VLC_CODEC_H264
++            && var_InheritInteger(p_dec, CFG_PREFIX "mvc") != MVC_MODE_2D
++            && var_InheritBool(p_dec, CFG_PREFIX "dr") ? MVC_PROBE_BLOCKS : 0;
+         p_sys->pf_on_new_block = Video_OnNewBlock;
+         p_sys->pf_on_flush = Video_OnFlush;
+         p_sys->pf_process_output = Video_ProcessOutput;
+@@ -1006,6 +1078,8 @@ static void CleanDecoder(decoder_t *p_dec)
+     {
+         if (p_sys->video.p_dvfp)
+             dvfp_api.close(p_sys->video.p_dvfp);
++        if (p_sys->video.p_mvc)
++            mvc_api.close(p_sys->video.p_mvc);
+ 
+         if (p_dec->fmt_in.i_codec == VLC_CODEC_H264
+          || p_dec->fmt_in.i_codec == VLC_CODEC_HEVC)
+@@ -1408,6 +1482,8 @@ static void DecodeFlushLocked(decoder_t *p_dec)
+     }
+     if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_dvfp)
+         dvfp_api.flush(p_sys->video.p_dvfp);
++    if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_mvc)
++        mvc_api.flush(p_sys->video.p_mvc);
+ 
+     vlc_cond_broadcast(&p_sys->cond);
+ 
+@@ -1600,6 +1676,8 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+                     /* the RPU and EL of the access unit belong to this pts */
+                     if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_dvfp)
+                         dvfp_api.commit(p_sys->video.p_dvfp, i_ts);
++                    if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_mvc)
++                        mvc_api.commit(p_sys->video.p_mvc, p_buf, i_size, i_ts);
+ 
+                     /* One input buffer is queued, signal OutThread that will
+                      * fetch output buffers */
+@@ -1609,6 +1687,8 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+                     assert(p_block == p_in_block),
+                     p_in_block = NULL;
+                 }
++                else if (b_config && p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_mvc)
++                    mvc_api.config(p_sys->video.p_mvc, p_buf, i_size);
+                 b_dequeue_timeout = false;
+                 if (b_drain)
+                     break;
+@@ -1752,6 +1832,9 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
+             {
+             case VLC_SUCCESS:
+                 msg_Warn(p_dec, "Restarted from DecodeBlock");
++                /* a new decoder: its input numbering starts again */
++                if (p_sys->video.p_mvc)
++                    mvc_api.restart(p_sys->video.p_mvc);
+                 break;
+             case VLC_ENOOBJ:
+                 break;
+@@ -1843,6 +1926,8 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+ 
+     if (p_sys->video.b_dovi_probe)
+         DoviProbe(p_dec, *pp_block);
++    if (p_sys->video.i_mvc_probe > 0)
++        MvcProbe(p_dec, *pp_block);
+     if (p_sys->video.p_dvfp)
+     {
+         int i_ret = DoviFilter(p_dec, pp_block);
+@@ -1936,6 +2021,56 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+     p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+ 
++/*
++ * First access units of an H.264 stream: 3D MVC (subset SPS or slice
++ * extension NAL units)? libmvc3dplay then gets every buffer queued from now
++ * on; when the MVC units show up only after something was queued, the
++ * decoder restarts, so that both count the access units from its start.
++ */
++static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    const bool b_first = p_sys->video.i_mvc_probe == MVC_PROBE_BLOCKS;
++
++    if (p_dec->fmt_out.i_codec != VLC_CODEC_ANDROID_OPAQUE || !MvcLoad())
++    {
++        p_sys->video.i_mvc_probe = 0;
++        return;
++    }
++    if (!mvc_api.probe(p_block->p_buffer, p_block->i_buffer))
++    {
++        if (--p_sys->video.i_mvc_probe == 0)
++            msg_Dbg(p_dec, "no 3D MVC");
++        return;
++    }
++    p_sys->video.i_mvc_probe = 0;
++
++    const int i_mode = var_InheritInteger(p_dec, CFG_PREFIX "mvc");
++    const unsigned i_width = p_dec->fmt_out.video.i_width;
++    const unsigned i_height = p_dec->fmt_out.video.i_height;
++    if (!mvc_api.available())
++    {
++        msg_Info(p_dec, "3D MVC: no mvc3d kernel module, 2D (base view)");
++        return;
++    }
++    if (i_mode == MVC_MODE_AUTO && !mvc_api.display_3d())
++    {
++        msg_Info(p_dec, "3D MVC: the display has no 3D, 2D (base view)");
++        return;
++    }
++    p_sys->video.p_mvc = mvc_api.open(i_width, i_height);
++    if (!p_sys->video.p_mvc)
++    {
++        msg_Warn(p_dec, "3D MVC %ux%u: libmvc3dplay failed, 2D (base view)",
++                 i_width, i_height);
++        return;
++    }
++    msg_Info(p_dec, "3D MVC %ux%u: frame packing, libmvc3dplay %s", i_width, i_height,
++             mvc_api.version());
++    if (!b_first || p_sys->b_input_dequeued)
++        p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
++}
++
+ /* the access unit as the Dolby Vision decoder gets it */
+ static int DoviFilter(decoder_t *p_dec, block_t **pp_block)
+ {
+-- 
+2.55.0.windows.3
+

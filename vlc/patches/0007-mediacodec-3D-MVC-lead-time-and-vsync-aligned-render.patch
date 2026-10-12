@@ -1,0 +1,78 @@
+From 489382111c95a8581bf47c4bae4adb0947f88e91 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 7 Oct 2026 15:59:30 +0200
+Subject: [PATCH] mediacodec: 3D MVC lead time and vsync aligned render times
+
+The mvc3d module gets each frame from the video composer when it is due and
+hands the frame packed picture to the display a moment later: a frame the
+composer releases near a vsync then shares the next vsync with the
+following one (the display takes the last of them, the other is dropped).
+As for Dolby Vision FEL, the pictures are rendered a lead time early
+(mvc3d_present_lead_ns, whole vsyncs) and the module holds them to their
+vsync; render times are snapped between the vsyncs (dvfp_snap_present_ns).
+
+Message-Id: <20261007-dvfel-mediacodec-mvc3d-lead@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 35b664f9c0..d4ed85aab2 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -184,6 +184,7 @@ static struct
+     void (*config)(mvc3d *, const uint8_t *, size_t);
+     void (*flush)(mvc3d *);
+     void (*restart)(mvc3d *);
++    int64_t (*present_lead_ns)(const mvc3d *); /* optional */
+ } mvc_api;
+ 
+ static void MvcLoadOnce(void)
+@@ -196,7 +197,10 @@ static void MvcLoadOnce(void)
+      && MVC_SYM(probe) && MVC_SYM(display_3d) && MVC_SYM(open) && MVC_SYM(close)
+      && MVC_SYM(commit) && MVC_SYM(config) && MVC_SYM(flush) && MVC_SYM(restart)
+      && mvc_api.api_version() == MVC3D_API_VERSION)
++    {
++        MVC_SYM(present_lead_ns);
+         mvc_api.loaded = true;
++    }
+ #undef MVC_SYM
+ }
+ 
+@@ -1129,7 +1133,7 @@ static void ReleasePictureTs(decoder_t *p_dec, unsigned i_index, vlc_tick_t i_ts
+     int64_t i_ns = i_ts * INT64_C(1000);
+     /* Dolby Vision decoder: render times between the display's vsyncs, so
+      * that clock jitter never puts two frames into one vsync (a drop) */
+-    if (p_sys->video.b_dovi && dvfp_api.snap_present_ns)
++    if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns)
+         i_ns = dvfp_api.snap_present_ns(i_ns + DOVI_RELEASE_AHEAD * INT64_C(1000));
+     p_sys->api.release_out_ts(&p_sys->api, i_index, i_ns);
+ }
+@@ -1219,8 +1223,11 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+          * module holds the composed frame back to its time */
+         if (p_sys->video.b_dovi && p_sys->video.p_dvfp && dvfp_api.present_lead_ns)
+             p_pic->date -= dvfp_api.present_lead_ns(p_sys->video.p_dvfp) / 1000;
++        /* 3D MVC: the same (the mvc3d module holds the frame packed picture) */
++        if (p_sys->video.p_mvc && mvc_api.present_lead_ns)
++            p_pic->date -= mvc_api.present_lead_ns(p_sys->video.p_mvc) / 1000;
+         /* released ahead (DOVI_RELEASE_AHEAD, added back in ReleasePictureTs) */
+-        if (p_sys->video.b_dovi && dvfp_api.snap_present_ns
++        if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns
+          && p_sys->api.b_direct_rendering && p_sys->api.release_out_ts)
+             p_pic->date -= DOVI_RELEASE_AHEAD;
+         p_pic->b_progressive = true;
+@@ -2067,6 +2074,9 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+     }
+     msg_Info(p_dec, "3D MVC %ux%u: frame packing, libmvc3dplay %s", i_width, i_height,
+              mvc_api.version());
++    /* render times between the display's vsyncs, as for Dolby Vision
++     * (dvfp_snap_present_ns of libdvfelplay, when it is there) */
++    DoviLoad();
+     if (!b_first || p_sys->b_input_dequeued)
+         p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+-- 
+2.55.0.windows.3
+
