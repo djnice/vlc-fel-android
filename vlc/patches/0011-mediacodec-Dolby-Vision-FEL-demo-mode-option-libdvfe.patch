@@ -1,0 +1,76 @@
+From 2b5f95d4b92df114eadbe52e21d7a4e2e083ddd7 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 13 Oct 2026 07:52:00 +0200
+Subject: [PATCH] mediacodec: Dolby Vision FEL demo mode option (libdvfelplay)
+
+--mediacodec-dovi-demo: split screen for profile 7 FEL, the left half with
+the FEL composition, the right half as the base layer converted to profile 8.1
+shows it, with the level 1 brightness measured with and without the
+enhancement layer at the top of each half (dvfp_set_demo, an optional symbol
+of libdvfelplay 2026.10.13.1).
+
+Message-Id: <20261013-dvfel-mediacodec-dovi-demo@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index dba55bef29..21a8d4f3b7 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -91,6 +91,7 @@ static struct
+     void (*flush)(dvfp *);
+     int64_t (*snap_present_ns)(int64_t); /* optional */
+     int64_t (*present_lead_ns)(const dvfp *); /* optional */
++    void (*set_demo)(dvfp *, int); /* optional */
+     int (*module_install)(const char *, int (*)(void *, const char *, const char *),
+                           void *, char *, size_t); /* optional */
+ } dvfp_api;
+@@ -118,6 +119,7 @@ static void DoviLoadOnce(void)
+     {
+         DVFP_SYM(snap_present_ns);
+         DVFP_SYM(present_lead_ns);
++        DVFP_SYM(set_demo);
+         DVFP_SYM(module_install);
+         dvfp_api.loaded = true;
+     }
+@@ -377,6 +379,13 @@ static void RemoveInflightPictures(decoder_t *);
+ #define MEDIACODEC_DOVI_FEL_LONGTEXT \
+     "Compose the full enhancement layer of Dolby Vision profile 7 streams " \
+     "on the GPU (Amlogic S5 with the dvfel kernel module)."
++#define MEDIACODEC_DOVI_DEMO_TEXT "Dolby Vision FEL demo mode"
++#define MEDIACODEC_DOVI_DEMO_LONGTEXT \
++    "Split screen for profile 7 FEL: the left half with the FEL composition, " \
++    "the right half as the base layer converted to profile 8.1 shows it; the " \
++    "top of each half shows the level 1 brightness (max and average, in nits) " \
++    "measured with and without the enhancement layer, their difference and " \
++    "the RPU's own level 1."
+ #define MEDIACODEC_MVC_TEXT "3D MVC (Blu-ray 3D)"
+ #define MEDIACODEC_MVC_LONGTEXT \
+     "Show H.264 MVC streams in 3D, both views at full resolution (frame " \
+@@ -403,6 +412,8 @@ vlc_module_begin ()
+              MEDIACODEC_DOVI_TEXT, MEDIACODEC_DOVI_LONGTEXT, true)
+     add_bool(CFG_PREFIX "dovi-fel", true,
+              MEDIACODEC_DOVI_FEL_TEXT, MEDIACODEC_DOVI_FEL_LONGTEXT, true)
++    add_bool(CFG_PREFIX "dovi-demo", false,
++             MEDIACODEC_DOVI_DEMO_TEXT, MEDIACODEC_DOVI_DEMO_LONGTEXT, true)
+     add_integer(CFG_PREFIX "mvc", MVC_MODE_AUTO,
+                 MEDIACODEC_MVC_TEXT, MEDIACODEC_MVC_LONGTEXT, true)
+         change_integer_list(pi_mvc_values, ppsz_mvc_names)
+@@ -2018,6 +2029,11 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+         {
+             p_dvfp = dvfp_api.open(i_width, i_height, DVFP_MODE_FEL);
+             psz_mode = ", FEL composition";
++            if (p_dvfp && dvfp_api.set_demo && var_InheritBool(p_dec, CFG_PREFIX "dovi-demo"))
++            {
++                dvfp_api.set_demo(p_dvfp, 1);
++                psz_mode = ", FEL composition, demo mode";
++            }
+         }
+         if (!p_dvfp)
+         {
+-- 
+2.55.0.windows.3
+

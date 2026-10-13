@@ -1,7 +1,8 @@
 #!/bin/bash
 # VLC FEL: VLC for Android (libvlcjni-3.x, VLC 3.0.x) with the dvfel patches, armeabi-v7a.
 # Runs in registry.videolan.org/vlc-debian-android-3.0:20260701183656 with
-#   /work: build volume; PATCHES: the dvfel patches (0*.patch), DVFELPLAY_SO: the
+#   /work: build volume; PATCHES: the dvfel patches (0*.patch), APATCHES: the app
+#   patches (android-patches/*.patch), DVFELPLAY_SO: the
 #   libdvfelplay.so to bundle (defaults: the maintainer's tree mounted at /host).
 # Output: /work/vlc-android/application/app/build/outputs/apk/dev/, signed with
 # the container's throwaway debug key: re-sign it (apksigner) with your own.
@@ -17,6 +18,19 @@ if [ ! -d vlc-android/.git ]; then
   (cd vlc-android && git checkout -q $VLC_ANDROID_HASH)
 fi
 cd vlc-android
+
+# VLC FEL's changes to the app (APATCHES: android-patches/*.patch, e.g. the
+# player menu's Dolby Vision demo switch), applied once
+APATCHES=${APATCHES:-/host/vlc/android-patches}
+for p in "$APATCHES"/*.patch; do
+  [ -f "$p" ] || continue
+  if git apply --check -R "$p" 2>/dev/null; then
+    echo "already applied: $(basename "$p")"
+  else
+    git apply "$p" && echo "applied: $(basename "$p")"
+  fi
+done
+
 if [ ! -d libvlcjni/.git ]; then
   git clone --single-branch -b libvlcjni-3.x https://code.videolan.org/videolan/libvlcjni.git
   (cd libvlcjni && git reset -q --hard $LIBVLCJNI_HASH)

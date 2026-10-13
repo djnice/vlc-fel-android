@@ -23,13 +23,33 @@ VLC demux ─ mediacodec module ─ libdvfelplay: RPU → profile 8.1 (no-op map
 Since v0.2.0 it also plays **3D MVC (Blu-ray 3D)** in 3D – both views at full resolution, HDMI 1.4 frame
 packing (1080p24) – on 3D displays and projectors, see [3D MVC](#3d-mvc-blu-ray-3d). Since v0.2.1 also from
 Blu-ray **m2ts / .ssif** files, and profile 7 FEL from **dual track / dual PID** files (MP4, m2ts, Ultra HD
-Blu-ray streams), see [Dual layer files](#dual-layer-files-dtdl).
+Blu-ray streams), see [Dual layer files](#dual-layer-files-dtdl). Since v0.2.2 a split screen **demo mode**
+compares the FEL composition with the base layer, with measured brightness, see
+[Demo mode](#demo-mode-fel-vs-base-layer).
 
 With a **lead time**: VLC presents every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds
 the composed frame back to its vsync. The GPU has ~2.5 frame periods instead of ~1, so its time spikes during
 playback (up to ~110 ms measured) no longer repeat or drop frames, and the picture is in sync with the audio
 (before: 84 ms late). Measured, 4K 24p P7 FEL, 2 minutes each: 0 repeated or dropped frames on a Dune HD
 Pro 8K Plus (R22, MMR chroma; without the lead time: ~25 a minute) and on a Dune HD Pro One 8K Plus (R24).
+
+## Demo mode (FEL vs. base layer)
+
+A split screen comparison for profile 7 FEL: the left half with the full FEL composition, the right half as
+the base layer converted to profile 8.1 shows it (what a player without FEL support shows). The top of each
+half shows the brightness measured on the active picture (letterbox bars left out: RPU level 5, or bars found
+in the picture) as a level 1 – maximum and average of max(R', G', B'), in nits:
+
+```
+FEL     MAX … AVG … NIT        BL      MAX … AVG … NIT
+RPU L1  MAX … AVG … NIT        FEL-BL  MAX +… AVG +… NIT
+AREA    3840X1600 L5
+```
+
+- **On / off during playback:** player menu (⋯) → *Dolby Vision demo: on / off* – shown while a FEL
+  composition runs, for the current playback; every file starts without it.
+- **Always on:** VLC option `--mediacodec-dovi-demo` (Settings → Advanced → Custom libVLC options).
+- `RPU L1` is the level 1 the file's RPU carries (some files carry none or zeros there).
 
 ## 3D MVC (Blu-ray 3D)
 
@@ -120,7 +140,8 @@ the first MVC file is to play in 3D.
 | `libdvfelplay/` | The player side as a C library (GPL-2.0+): access unit filter (P7 → P8.1, EL extraction), EL decoder, GPU composer (`felgpu`), BL/EL pairing, vsync-aligned render times, lead time, the bundled module and its installer. `include/dvfelplay.h` is the API. Builds with NDK r28c. |
 | `kernel/mvc3d/` | `mvc3d` kernel module (GPL-2.0+): vfm node between video_composer and video_render that replaces the frames by user space's frame packed pictures (`mvc3d_uapi.h`), lead time, and the HDMI frame packing probes for the stock hdmitx21 (R22 and R24). |
 | `libmvc3dplay/` | 3D MVC, player side (GPL-2.0+): the library in the player, `mvc3dhelper` (static aarch64: edge264-mvc decoding, frame packing), the bundled module and its installer, `edge264/` (edge264-mvc at `5757e71` + the picture tag patch). `include/mvc3dplay.h` is the API. |
-| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix). |
+| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix), 0011 the demo mode option. |
+| `vlc/android-patches/` | Patches for the vlc-android app (`fc5fa1f`): 0001 the player menu's *Dolby Vision demo* switch. |
 | `vlc/build-in-docker.sh` | The APK build (vlc-android `fc5fa1f`, libvlcjni-3.x, armeabi-v7a) in VideoLAN's docker image; package `org.videolan.vlc.fel`, name "VLC FEL". |
 | `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `sync.sh` (maintainer: copies the working sources here), `tests/` (cadence and pause/seek measurements over adb). |
 | `docs/NOTES.md` | Technical notes and pitfalls of this firmware, the lead time, VLC. |
@@ -135,6 +156,7 @@ the first MVC file is to play in 3D.
 3. 3D MVC: `tools/kbuild.sh kernel/mvc3d`, `libmvc3dplay/edge264/build.sh`, `libmvc3dplay/build.sh`
    (NDK r28c for the library, a static capable aarch64 gcc for the helper).
 4. VLC: `docker run -v vlcfel:/work -v $PWD:/src:ro -e PATCHES=/src/vlc/patches
+   -e APATCHES=/src/vlc/android-patches
    -e DVFELPLAY_SO=/src/libdvfelplay.so -e MVC3D_DIR=/src registry.videolan.org/vlc-debian-android-3.0:20260701183656
    bash /src/vlc/build-in-docker.sh` (copy `libdvfelplay.so`, `libmvc3dplay.so` and `libmvc3dhelper.so` to
    the repository root first; VLC's contribs are built from source the first time, which takes long), then
@@ -147,7 +169,7 @@ the first MVC file is to play in 3D.
   (Settings → Advanced → Custom libVLC options) turns FEL composition off.
 - Test switches (`adb shell setprop`, read by libdvfelplay): `debug.dvfp.lead_ms` (lead time, 0: off),
   `debug.dvfp.profile` (2: GPU frame times and the release lead to the log every 5 s), `debug.dvfp.dither`
-  (0 round, 1 dither, 2 half).
+  (0 round, 1 dither, 2 half), `debug.dvfp.demo` (1: demo mode, like the menu switch).
 - Kernel statistics: `adb shell cat /sys/kernel/debug/dvfel/stats` (root): display cadence, `vsync:`,
   `av: shown minus due vsync`; 3D MVC: `/sys/kernel/debug/mvc3d/stats` (jobs, frame packing state),
   `adb logcat -s mvc3dplay` (helper statistics every 10 s).
@@ -170,6 +192,9 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.2-poc** (libdvfelplay `2026.10.13.1`, kernel modules unchanged: `dvfel 2026.10.07.1`,
+  `mvc3d 2026.10.12.3`): FEL demo mode – split screen with the measured level 1 of both halves and the RPU's
+  level 1, switchable from the player menu during playback (or always on with `--mediacodec-dovi-demo`).
 - **v0.2.1-poc** (kernel modules `dvfel 2026.10.07.1` (unchanged), `mvc3d 2026.10.12.3`, libmvc3dplay
   `2026.10.12` with the helper fix): profile 7 FEL from dual track MP4 and dual PID m2ts (incl. Ultra HD
   Blu-ray streams); 3D MVC from m2ts and `.ssif`; `mvc3d` finds the HDMI 3D flags in the firmware's code (the

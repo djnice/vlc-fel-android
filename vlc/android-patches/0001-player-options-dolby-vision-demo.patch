@@ -1,0 +1,64 @@
+--- a/application/vlc-android/src/org/videolan/vlc/gui/helpers/PlayerOptionsDelegate.kt
++++ b/application/vlc-android/src/org/videolan/vlc/gui/helpers/PlayerOptionsDelegate.kt
+@@ -20,6 +20,7 @@
+ import androidx.recyclerview.widget.LinearLayoutManager
+ import androidx.recyclerview.widget.RecyclerView
+ import androidx.window.layout.FoldingFeature
++import java.io.File
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+@@ -80,6 +81,7 @@
+ private const val ID_SAFE_MODE_LOCK = 21L
+ private const val ID_SAFE_MODE_UNLOCK = 22L
+ private const val ID_SHARE = 23L
++private const val ID_DOVI_DEMO = 24L
+ @SuppressLint("ShowToast")
+ class PlayerOptionsDelegate(val activity: FragmentActivity, val service: PlaybackService, private val showABReapeat:Boolean = true)  {
+ 
+@@ -117,6 +119,11 @@
+                 options.add(PlayerOption(ID_REPEAT, R.drawable.ic_repeat, res.getString(R.string.repeat_title)))
+             if (service.canShuffle()) options.add(PlayerOption(ID_SHUFFLE, R.drawable.ic_player_shuffle, res.getString(R.string.shuffle_title)))
+             options.add(PlayerOption(ID_VIDEO_STATS, R.drawable.ic_video_stats, res.getString(R.string.video_information)))
++            // Dolby Vision FEL demo mode (libdvfelplay): while the FEL composition runs
++            doviDemoState()?.let { on ->
++                options.add(PlayerOption(ID_DOVI_DEMO, R.drawable.ic_video_stats,
++                        if (on) "Dolby Vision demo: on" else "Dolby Vision demo: off"))
++            }
+         } else {
+             if (service.videoTracksCount > 0) options.add(PlayerOption(ID_PLAY_AS_VIDEO, R.drawable.ic_playasaudio_off, res.getString(R.string.play_as_video)))
+         }
+@@ -200,6 +207,17 @@
+         this.bookmarkClickedListener = listener
+     }
+ 
++    /**
++     * Dolby Vision FEL demo mode of libdvfelplay: null when no FEL composition
++     * runs, else whether the demo mode is on (files/dvfp_fel holds "demo=1")
++     */
++    private fun doviDemoState(): Boolean? = try {
++        val f = File(activity.filesDir, "dvfp_fel")
++        if (f.exists()) f.readText().contains("demo=1") else null
++    } catch (e: Exception) {
++        null
++    }
++
+     fun onClick(option: PlayerOption) {
+         when (option.id) {
+             ID_SLEEP -> {
+@@ -237,6 +255,15 @@
+                 hide()
+                 service.playlistManager.toggleStats()
+             }
++            ID_DOVI_DEMO -> {
++                hide()
++                val on = doviDemoState() != true
++                try {
++                    File(activity.filesDir, "dvfp_demo").writeText(if (on) "1\n" else "0\n")
++                } catch (e: Exception) {
++                }
++                UiTools.snacker(activity, if (on) "Dolby Vision demo: on" else "Dolby Vision demo: off")
++            }
+             ID_SHOW_VIDEO_TIPS -> {
+                 hide()
+                 (activity as VideoPlayerActivity).tipsDelegate.init()

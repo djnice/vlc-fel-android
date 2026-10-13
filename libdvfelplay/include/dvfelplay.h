@@ -200,6 +200,24 @@ DVFP_EXPORT int64_t dvfp_snap_present_ns(int64_t desired_ns);
  */
 DVFP_EXPORT int64_t dvfp_present_lead_ns(const dvfp* h);
 
+/*
+ * demo mode (DVFP_MODE_FEL): split screen, the left half with the FEL
+ * composition, the right half as the base layer converted to profile 8.1
+ * shows it; the top of each half shows the level 1 brightness measured over
+ * the active picture (max and average of max(R', G', B'), in nits) with and
+ * without the enhancement layer, their difference, the RPU's own level 1 and
+ * the measured area. 0: off (default). Takes effect within a second.
+ * Optional symbol.
+ *
+ * A player's menu can switch it during playback through two files in the
+ * app's internal files dir (/data/data/<package>/files): dvfp_fel exists
+ * while the FEL composition runs (show the switch then; it holds "demo=0" or
+ * "demo=1", the current state); dvfp_demo holds "1"
+ * (on) or "0" (off) and, once there, overrides dvfp_set_demo for the current
+ * playback (the library removes it when a FEL composition starts).
+ */
+DVFP_EXPORT void dvfp_set_demo(dvfp* h, int on);
+
 #ifdef __cplusplus
 }
 #endif

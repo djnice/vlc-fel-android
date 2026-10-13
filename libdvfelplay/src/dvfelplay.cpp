@@ -78,7 +78,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.07.1"
+#define DVFP_VERSION "2026.10.13.1"
 
 namespace
 {
@@ -230,6 +230,31 @@ int PropInt(const char* name, int fallback)
   return end != v ? static_cast<int>(n) : fallback;
 }
 
+// a file in the app's internal files dir: the player's menu switches the demo
+// mode with dvfp_demo ("1" / "0"); dvfp_fel exists while the FEL composition
+// runs (the menu shows the switch then)
+std::string AppFile(const char* name)
+{
+  static const std::string dir = [] {
+    std::string pkg = ReadLine("/proc/self/cmdline");
+    pkg = pkg.substr(0, pkg.find('\0'));
+    pkg = pkg.substr(0, pkg.find(':'));
+    return "/data/data/" + pkg + "/files/";
+  }();
+  return dir + name;
+}
+
+// the menu's demo mode: 1 on, 0 off, -1 not set
+int DemoFile()
+{
+  FILE* f = fopen(AppFile("dvfp_demo").c_str(), "r");
+  if (!f)
+    return -1;
+  const int c = fgetc(f);
+  fclose(f);
+  return c == '1' ? 1 : c == '0' ? 0 : -1;
+}
+
 // test dumps: <external files dir of the app>/dvfp_dump
 std::string DumpDir()
 {
@@ -349,12 +374,84 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
     }
   }
 
+  // level 1 and the level 5 active area for the demo mode measurement; they
+  // change per frame, also when the mapping is reused from the previous RPU
+  if (meta)
+  {
+    int l1Max = -1, l1Avg = -1;
+    int l5[4] = {-1, -1, -1, -1};
+    const DoviVdrDmData* dm = dovi_rpu_get_vdr_dm_data(rpu);
+    if (dm && dm->dm_data.level1)
+    {
+      l1Max = dm->dm_data.level1->max_pq;
+      l1Avg = dm->dm_data.level1->avg_pq;
+    }
+    // all zero offsets are often written for letterboxed titles too: the
+    // bars are then found in the picture
+    if (dm && dm->dm_data.level5 &&
+        (dm->dm_data.level5->active_area_left_offset || dm->dm_data.level5->active_area_right_offset ||
+         dm->dm_data.level5->active_area_top_offset || dm->dm_data.level5->active_area_bottom_offset))
+    {
+      l5[0] = dm->dm_data.level5->active_area_left_offset;
+      l5[1] = dm->dm_data.level5->active_area_right_offset;
+      l5[2] = dm->dm_data.level5->active_area_top_offset;
+      l5[3] = dm->dm_data.level5->active_area_bottom_offset;
+    }
+    if (dm)
+      dovi_rpu_free_vdr_dm_data(dm);
+    if (meta == prev && (meta->l1_max_pq != l1Max || meta->l1_avg_pq != l1Avg ||
+                         std::memcmp(meta->l5, l5, sizeof(l5)) != 0))
+      meta = std::make_shared<felgpu_meta>(*prev);
+    meta->l1_max_pq = l1Max;
+    meta->l1_avg_pq = l1Avg;
+    std::memcpy(meta->l5, l5, sizeof(l5));
+  }
+
   if (map)
     dovi_rpu_free_data_mapping(map);
   if (hdr)
     dovi_rpu_free_header(hdr);
   dovi_rpu_free(rpu);
   return meta;
+}
+
+// SMPTE ST 2084, 12-bit PQ code -> cd/m^2
+float PqNits(int code)
+{
+  const double m1 = 0.1593017578125, m2 = 78.84375;
+  const double c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+  const double e = std::pow(std::max(code, 0) / 4095.0, 1.0 / m2);
+  return static_cast<float>(10000.0 * std::pow(std::max(e - c1, 0.0) / (c2 - c3 * e), 1.0 / m1));
+}
+
+std::string Nits(float v, bool sign = false)
+{
+  char s[24];
+  if (std::fabs(v) < 10.0f)
+    snprintf(s, sizeof(s), "%.1f", std::fabs(v));
+  else
+    snprintf(s, sizeof(s), "%ld", std::lround(std::fabs(v)));
+  return std::string(sign ? (v < 0.0f ? "-" : "+") : (v < 0.0f ? "-" : "")) + s;
+}
+
+// demo mode: the measured L1 of both pictures, the RPU's own and the measured
+// area at the top of each half, see felgpu_get_stats
+void SetDemoOverlay(felgpu* fel, const felgpu_stats& s, const felgpu_meta& m)
+{
+  const float* n = s.nits;
+  const char* src = s.source == FELGPU_AREA_L5 ? "L5" : s.source == FELGPU_AREA_DETECTED ? "AUTO" : "FULL";
+  char area[48];
+  snprintf(area, sizeof(area), "AREA %dX%d %s", s.x1 - s.x0, s.y1 - s.y0, src);
+  felgpu_set_overlay(fel, 0, ("FEL  MAX " + Nits(n[0]) + "  AVG " + Nits(n[1]) + " NIT").c_str());
+  felgpu_set_overlay(fel, 1, m.l1_max_pq < 0 ? "RPU L1  -"
+                                             : ("RPU L1  MAX " + Nits(PqNits(m.l1_max_pq)) + "  AVG " +
+                                                Nits(PqNits(m.l1_avg_pq)) + " NIT")
+                                                   .c_str());
+  felgpu_set_overlay(fel, 2, area);
+  felgpu_set_overlay(fel, 3, ("BL   MAX " + Nits(n[2]) + "  AVG " + Nits(n[3]) + " NIT").c_str());
+  felgpu_set_overlay(fel, 4, ("FEL-BL  MAX " + Nits(n[0] - n[2], true) + "  AVG " +
+                              Nits(n[1] - n[3], true) + " NIT")
+                                 .c_str());
 }
 
 // NAL unit payload without the emulation prevention bytes (00 00 03)
@@ -642,6 +739,7 @@ struct dvfp
   void Flush();
   void GetStats(dvfp_stats& s) const;
   int64_t LeadNs() const;
+  void SetDemo(int on) { m_demo = on ? 1 : 0; }
 
   int mode{DVFP_MODE_CONVERT};
 
@@ -679,6 +777,7 @@ private:
   bool m_started{false};
   std::atomic<bool> m_stop{false};
   std::atomic<int> m_leadUs{0}; // the kernel holds the frames back by this (DVFEL_IOC_SET_LEAD)
+  std::atomic<int> m_demo{0};   // dvfp_set_demo (debug.dvfp.demo 1 turns it on too)
 
   // the EL decoder, set up by Start
   NdkImageApi m_api{};
@@ -967,6 +1066,17 @@ bool dvfp::Start(int width, int height)
   }
   m_elThread = std::thread(&dvfp::ElThread, this);
   m_started = true;
+  // the menu's switch is for one playback: every file starts with the demo
+  // mode as dvfp_set_demo (default: off)
+  unlink(AppFile("dvfp_demo").c_str());
+  // (unless the GPU thread has written its state already)
+  const int sfd = open(AppFile("dvfp_fel").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (sfd >= 0)
+  {
+    const char state[] = "demo=0\n";
+    (void)!write(sfd, state, sizeof(state) - 1);
+    close(sfd);
+  }
   LOGI("FEL composition started for %dx%d", width, height);
   return true;
 }
@@ -1023,6 +1133,8 @@ void dvfp::Stop()
   if (!m_started && !m_gpuThread.joinable())
     return;
 
+  if (m_started)
+    unlink(AppFile("dvfp_fel").c_str());
   m_stop = true;
   m_elCond.notify_all();
   m_readyCond.notify_all();
@@ -1673,6 +1785,7 @@ void dvfp::GpuThread(std::promise<bool> ready)
     int dither = -1, pattern = -1, demo = -1, noGpu = 0, profile = -1;
     auto nextCheck = std::chrono::steady_clock::now();
     auto nextProfile = nextCheck;
+    auto nextOverlay = nextCheck;
     std::vector<float> profMs; // composed frames since the last profile line
     int dumpLeft = PropInt(PROP_DUMP, 0); // frames to dump (every 24th composed one)
     uint64_t dumpCount = 0;
@@ -1721,11 +1834,21 @@ void dvfp::GpuThread(std::promise<bool> ready)
           pattern = p;
           felgpu_set_pattern(fel, p);
         }
-        const int dm = PropInt(PROP_DEMO, 0) == 1 ? 1 : 0;
+        // the player's menu (dvfp_demo) over dvfp_set_demo and debug.dvfp.demo
+        const int menu = DemoFile();
+        const int dm = menu >= 0 ? menu : m_demo || PropInt(PROP_DEMO, 0) == 1 ? 1 : 0;
         if (dm != demo)
         {
           demo = dm;
           felgpu_set_demo(fel, dm);
+          for (int line = 0; line < 2 * FELGPU_OVERLAY_LINES; line++)
+            felgpu_set_overlay(fel, line, "");
+          // the state for the player's menu
+          if (FILE* f = fopen(AppFile("dvfp_fel").c_str(), "w"))
+          {
+            fprintf(f, "demo=%d\n", dm);
+            fclose(f);
+          }
           LOGI("demo mode %d", dm);
         }
         noGpu = PropInt(PROP_NOGPU, 0) == 1;
@@ -1792,9 +1915,18 @@ void dvfp::GpuThread(std::promise<bool> ready)
           current = el.meta;
         }
         felgpu_set_el_tex(fel, tel[el.buf]);
+        felgpu_set_active_area(fel, el.meta->l5[0] >= 0 ? el.meta->l5 : nullptr);
         felgpu_run(fel, tin[job.job.buf], target);
         glFinish();
         const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        // demo mode: the overlay text is drawn from the next frame, updated at
+        // 4 Hz to stay readable
+        felgpu_stats stats;
+        if (demo == 1 && felgpu_get_stats(fel, &stats) && std::chrono::steady_clock::now() >= nextOverlay)
+        {
+          nextOverlay = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+          SetDemoOverlay(fel, stats, *el.meta);
+        }
         {
           std::lock_guard<std::mutex> lock(m_lock);
           m_gpuMsSum += ms;
@@ -1844,6 +1976,7 @@ void dvfp::GpuThread(std::promise<bool> ready)
           mapping.use_el = 0;
           felgpu_set_meta(fel, &mapping);
           current = nullptr;
+          felgpu_set_active_area(fel, mapping.l5[0] >= 0 ? mapping.l5 : nullptr);
           felgpu_run(fel, tin[job.job.buf], target);
           glFinish();
           done.status = DVFEL_DONE_COMPOSED;
@@ -2051,6 +2184,12 @@ int64_t dvfp_snap_present_ns(int64_t desired_ns)
 int64_t dvfp_present_lead_ns(const dvfp* h)
 {
   return h ? h->LeadNs() : 0;
+}
+
+void dvfp_set_demo(dvfp* h, int on)
+{
+  if (h)
+    h->SetDemo(on);
 }
 
 } // extern "C"

@@ -18,6 +18,8 @@ HDMI 1.4 frame packinggel (1080p24), 3D-s TV-n / projektoron (lásd lent: 3D MVC
 A 0.2.1 óta a kétsávos (DTDL) Profile 7 FEL fájlokat is (az EL külön sávban / PID-en: MP4, m2ts,
 Ultra HD Blu-ray stream), és a 3D-t Blu-ray m2ts / .ssif fájlokból is.
 
+A 0.2.2 óta demo mód is van: osztott kép, a FEL és a BL összehasonlítása mért fényerővel (lásd lent).
+
 Előfutással működik: a VLC minden képet
 3 vsync-kel (24 Hz-en 125 ms) korábban ad ki, a kernelmodul pedig a kész képet a saját vsyncjéig
 visszatartja. Így a GPU-nak ~2,5 képkockányi ideje van ~1 helyett: a lejátszás közbeni GPU-kiugrások
@@ -36,6 +38,17 @@ FELTÉTELEK
   kernelszimbólumokat is kiírja).
 - Root-hozzáférés a modul telepítéséhez. Ha a lejátszón ki van kapcsolva, a VLC FEL megkérdezi,
   bekapcsolhatja-e a telepítés idejére („Install”); utána visszakapcsolja.
+
+DEMO MÓD (FEL vs. BL)
+---------------------
+- Osztott kép P7 FEL-hez: a bal fél a teljes FEL-kompozíció, a jobb fél a BL úgy, ahogy egy FEL-t nem
+  ismerő lejátszó mutatja (P8.1). Mindkét fél tetején a mért fényerő (L1: a max(R', G', B') maximuma és
+  átlaga nitben, a fekete sávok nélkül), bal oldalon az RPU saját L1-e és a mért terület, jobb oldalon a
+  BL és a különbség (FEL-BL).
+- Be/ki lejátszás közben: lejátszó menü (⋯) → „Dolby Vision demo: on / off” (csak FEL-kompozíció
+  közben látszik, az adott lejátszásra érvényes; minden fájl demó nélkül indul).
+- Mindig bekapcsolva: Beállítások → Speciális → Egyéni libVLC opciók: --mediacodec-dovi-demo
+- Az „RPU L1” a fájl RPU-jában tárolt érték; egyes fájlokban nincs vagy nulla.
 
 KÉTSÁVOS (DTDL) FEL
 -------------------
@@ -89,6 +102,8 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.2-poc (libdvfelplay 2026.10.13.1, modulok változatlanok) – FEL demo mód mért L1-gyel, a lejátszó
+          menüjéből kapcsolható.
 0.2.1-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.3) – kétsávos (DTDL) FEL: MP4 és m2ts (Ultra HD
           Blu-ray is); 3D m2ts-ből és .ssif-ből; az R24 2026-08-27-i frissítésén is 3D (0.2.0-val
           2D volt); a 3D nem akad el bizonyos ugrások után.
@@ -127,6 +142,8 @@ packing (1080p24), on 3D TVs / projectors (see 3D MVC below).
 Since 0.2.1 also dual track (DTDL) Profile 7 FEL files (the EL in its own track / PID: MP4, m2ts,
 Ultra HD Blu-ray streams), and 3D from Blu-ray m2ts / .ssif files.
 
+Since 0.2.2 a demo mode: split screen comparing FEL and the base layer, with measured brightness (below).
+
 It works with a lead time: VLC presents
 every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds the composed frame back to
 its vsync. The GPU gets ~2.5 frame periods instead of ~1: its time spikes during playback no longer
@@ -145,6 +162,17 @@ REQUIREMENTS
   the tested firmware).
 - Root access for the module installation. If it is switched off on the player, VLC FEL asks whether
   to switch it on for the installation ("Install"), and switches it off again afterwards.
+
+DEMO MODE (FEL vs. BASE LAYER)
+------------------------------
+- Split screen for P7 FEL: the left half with the full FEL composition, the right half the base layer
+  as a player without FEL support shows it (P8.1). The top of each half shows the measured brightness
+  (L1: max and average of max(R', G', B') in nits, letterbox bars left out); left the RPU's own L1 and
+  the measured area, right the base layer and the difference (FEL-BL).
+- On / off during playback: player menu (⋯) → "Dolby Vision demo: on / off" (shown while a FEL
+  composition runs, for the current playback; every file starts without it).
+- Always on: Settings → Advanced → Custom libVLC options: --mediacodec-dovi-demo
+- "RPU L1" is the value the file's RPU carries; some files carry none or zeros.
 
 DUAL TRACK (DTDL) FEL
 ---------------------
@@ -197,6 +225,8 @@ NOTES
 
 CHANGES
 -------
+0.2.2-poc (libdvfelplay 2026.10.13.1, modules unchanged) – FEL demo mode with measured L1, switchable
+          from the player menu.
 0.2.1-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.3) – dual track (DTDL) FEL: MP4 and m2ts (Ultra HD
           Blu-ray too); 3D from m2ts and .ssif; 3D on the R24 2026-08-27 update too (2D with 0.2.0);
           3D no longer stalls after some seeks.

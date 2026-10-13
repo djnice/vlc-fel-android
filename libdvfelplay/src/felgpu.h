@@ -39,6 +39,9 @@ struct felgpu_meta {
     double mmr[3][FELGPU_MAX_PIECES][3][7];            /* [order][term] */
     int nlq_offset[3];                 /* EL codewords */
     double nlq_slope[3], nlq_thresh[3], nlq_max[3];    /* normalized */
+    int l1_max_pq, l1_avg_pq;          /* RPU level 1, 12-bit PQ; -1 if absent (not used by felgpu) */
+    int l5[4];                         /* RPU level 5 active area offsets left, right, top,
+                                          bottom in pixels; -1 if absent or all zero */
 };
 
 struct felgpu;
@@ -73,6 +76,39 @@ void felgpu_set_dither(struct felgpu *f, int mode);
  * with a no-op mapping (CoreELEC without FEL composition)
  */
 void felgpu_set_demo(struct felgpu *f, int on);
+
+/*
+ * demo mode measurement: the L1 of the composed picture and of the base layer
+ * in the active area, from every 8th pixel - max and average of
+ * max(R', G', B') in PQ, as cd/m^2: nits[0] composed max, [1] composed avg,
+ * [2] BL max, [3] BL avg. The active area (x0, y0, x1, y1 in pixels) is the
+ * one set with felgpu_set_active_area, else the frame without the letterbox
+ * bars found in the picture.
+ */
+enum { FELGPU_AREA_FULL, FELGPU_AREA_L5, FELGPU_AREA_DETECTED };
+struct felgpu_stats {
+    float nits[4];
+    int x0, y0, x1, y1;
+    int source;                        /* FELGPU_AREA_* */
+};
+/* 0 if the last felgpu_run did not measure (demo off) */
+int felgpu_get_stats(struct felgpu *f, struct felgpu_stats *s);
+
+/*
+ * active area of the next frames for the measurement: offsets from the left,
+ * right, top and bottom edge in pixels (RPU level 5); NULL or negative
+ * offsets: detect letterbox bars in the picture
+ */
+void felgpu_set_active_area(struct felgpu *f, const int offsets[4]);
+
+/*
+ * demo mode text at the top of the picture: lines 0-2 on the left half,
+ * 3-5 on the right one; upper case letters, digits, space and . + - %
+ * (at most FELGPU_OVERLAY_LEN characters, "" hides the line)
+ */
+#define FELGPU_OVERLAY_LINES 3
+#define FELGPU_OVERLAY_LEN 40
+void felgpu_set_overlay(struct felgpu *f, int line, const char *text);
 
 /*
  * test pattern instead of the composition (1): 12-bit grey ramps in 4 bands,
