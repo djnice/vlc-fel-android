@@ -102,6 +102,9 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.4-poc (VLC javítás, a modulok és a libdvfelplay változatlanok) – 2160p-s kimeneten sem akad a
+          felirat: 30 fps-ig a Dolby Vision képek 140 ms-mal előbb mennek a kijelzőre (eddig 80), így a
+          feliratváltás 20–60 ms-os kirajzolása nem visz el képkockát. 1080p-n ezt már a 0.2.3 is tudta.
 0.2.3-poc (VLC javítás, a modulok és a libdvfelplay változatlanok) – bekapcsolt felirattal nem akad:
           a FEL eddig a legtöbb feliratváltáskor eldobott egy képkockát (4K filmen ~40/perc, most
           1 alatt). A felirat a kijelző méretében készül (nem 4K-ban), és a kép a felirat előtt,
@@ -229,6 +232,9 @@ NOTES
 
 CHANGES
 -------
+0.2.4-poc (VLC fix, modules and libdvfelplay unchanged) – no subtitle stutter with a 2160p output
+          either: up to 30 fps Dolby Vision pictures reach the display 140 ms ahead (was 80), so the
+          20–60 ms a subtitle change takes to render no longer costs a frame. 0.2.3 did so at 1080p.
 0.2.3-poc (VLC fix, modules and libdvfelplay unchanged) – no stutter with subtitles on: FEL
           dropped a frame at most subtitle changes (~40 per minute on a 4K film, now under 1). The
           subtitles are drawn at the display's size (not in 4K), and the picture reaches the display

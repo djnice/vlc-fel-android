@@ -140,7 +140,7 @@ the first MVC file is to play in 3D.
 | `libdvfelplay/` | The player side as a C library (GPL-2.0+): access unit filter (P7 → P8.1, EL extraction), EL decoder, GPU composer (`felgpu`), BL/EL pairing, vsync-aligned render times, lead time, the bundled module and its installer. `include/dvfelplay.h` is the API. Builds with NDK r28c. |
 | `kernel/mvc3d/` | `mvc3d` kernel module (GPL-2.0+): vfm node between video_composer and video_render that replaces the frames by user space's frame packed pictures (`mvc3d_uapi.h`), lead time, and the HDMI frame packing probes for the stock hdmitx21 (R22 and R24). |
 | `libmvc3dplay/` | 3D MVC, player side (GPL-2.0+): the library in the player, `mvc3dhelper` (static aarch64: edge264-mvc decoding, frame packing), the bundled module and its installer, `edge264/` (edge264-mvc at `5757e71` + the picture tag patch). `include/mvc3dplay.h` is the API. |
-| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix), 0011 the demo mode option, 0012 subtitles drawn at the display's size, 0013 pictures released at their time before the subtitles (no dropped frames at subtitle changes). |
+| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix), 0011 the demo mode option, 0012 subtitles drawn at the display's size, 0013 pictures released at their time before the subtitles (no dropped frames at subtitle changes), 0014 the live level 1 / level 5 of the RPUs for a player's information panel (a file in the app's files dir, only while asked for), 0015 Dolby Vision pictures released 140 ms ahead up to 30 fps. |
 | `vlc/android-patches/` | Patches for the vlc-android app (`fc5fa1f`): 0001 the player menu's *Dolby Vision demo* switch. |
 | `vlc/build-in-docker.sh` | The APK build (vlc-android `fc5fa1f`, libvlcjni-3.x, armeabi-v7a) in VideoLAN's docker image; package `org.videolan.vlc.fel`, name "VLC FEL". |
 | `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `sync.sh` (maintainer: copies the working sources here), `tests/` (cadence and pause/seek measurements over adb). |
@@ -192,6 +192,10 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.4-poc** (VLC patches 0014, 0015; libdvfelplay and kernel modules unchanged): no stutter with
+  subtitles on a **2160p output** either – up to 30 fps Dolby Vision pictures are handed to the display 140 ms
+  ahead (was 80 ms), so the 20–60 ms a subtitle change takes to render no longer costs a frame. With a 1080p
+  output 0.2.3 already did; with 2160p it still dropped a frame at many subtitle changes.
 - **v0.2.3-poc** (VLC patches 0012, 0013; libdvfelplay and kernel modules unchanged): no more stutter with
   subtitles on – FEL dropped a frame at most subtitle changes (measured ~40 per minute on a 4K film, now
   under 1). The subtitles are drawn at the display's size instead of the video's (3840x2160 → 1920x1080 on a

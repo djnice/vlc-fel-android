@@ -1,0 +1,355 @@
+From 842171d7e3a11ad5f72025be404f54f06efc574b Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 14 Oct 2026 14:22:19 +0200
+Subject: [PATCH] mediacodec: the live Dolby Vision levels 1 and 5 for the
+ player's information panel
+
+While <app files>/dvinfo_on exists (looked for once a second), the level 1
+(min / max / average PQ) and the level 5 (active area offsets) of the RPU of
+the access units going to the Dolby Vision decoder are written to
+<app files>/dvinfo ("min max avg [left right top bottom]") about 4 times a
+second, for any profile (5, 7, 8). The RPU walk is that of libdovi (as the
+FEL / MEL probe of libdvfelplay), to the CM v2.9 extension blocks.
+
+Message-Id: <20261014-dvfel-mediacodec-dovi-l1-info@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 281 +++++++++++++++++++++++++++++++
+ 1 file changed, 281 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 21a8d4f3b7..46cae213d0 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -49,6 +49,8 @@
+ #include "../../video_output/android/display.h"
+ 
+ #include <dlfcn.h>
++#include <stdio.h>
++#include <unistd.h>
+ #include <pthread.h>
+ 
+ #define BLOCK_FLAG_CSD (0x01 << BLOCK_FLAG_PRIVATE_SHIFT)
+@@ -311,6 +313,10 @@ struct decoder_sys_t
+             int i_profile; /* the HEVC profile the decoder was chosen for */
+             dvfp *p_dvfp;
+             bool b_dovi; /* the Dolby Vision decoder is in use */
++            /* the player's information panel: the live level 1 (DoviInfo) */
++            char *psz_dvinfo; /* <app files>/ */
++            vlc_tick_t i_dvinfo_check, i_dvinfo_write;
++            bool b_dvinfo_on;
+             /* 3D MVC: decided by the first access units */
+             int i_mvc_probe; /* access units still to look at */
+             mvc3d *p_mvc;
+@@ -340,6 +346,8 @@ static int VideoMPEG2_OnNewBlock(decoder_t *, block_t **);
+ static int VideoVC1_OnNewBlock(decoder_t *, block_t **);
+ static void DoviProbe(decoder_t *, const block_t *);
+ static int DoviFilter(decoder_t *, block_t **);
++static void DoviInfo(decoder_t *, const block_t *);
++static char *DoviInfoDir(void);
+ static void MvcProbe(decoder_t *, const block_t *);
+ static void Video_OnFlush(decoder_t *);
+ static int Video_ProcessOutput(decoder_t *, mc_api_out *, picture_t **,
+@@ -1111,6 +1119,7 @@ static void CleanDecoder(decoder_t *p_dec)
+     {
+         if (p_sys->video.p_dvfp)
+             dvfp_api.close(p_sys->video.p_dvfp);
++        free(p_sys->video.psz_dvinfo);
+         if (p_sys->video.p_mvc)
+             mvc_api.close(p_sys->video.p_mvc);
+ 
+@@ -1969,6 +1978,8 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+         DoviProbe(p_dec, *pp_block);
+     if (p_sys->video.i_mvc_probe > 0)
+         MvcProbe(p_dec, *pp_block);
++    if (p_sys->video.b_dovi && p_sys->video.psz_dvinfo)
++        DoviInfo(p_dec, *pp_block);
+     if (p_sys->video.p_dvfp)
+     {
+         int i_ret = DoviFilter(p_dec, pp_block);
+@@ -2064,6 +2075,7 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+              psz_mode, p_sys->api.psz_name, dvfp_api.version());
+     p_sys->video.p_dvfp = p_dvfp;
+     p_sys->video.b_dovi = true;
++    p_sys->video.psz_dvinfo = DoviInfoDir();
+     p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+ 
+@@ -2145,6 +2157,275 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+         p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+ 
++/*
++ * The player's information panel: the live Dolby Vision level 1 (min / max /
++ * average PQ of the RPU's DM data, 12 bits) and level 5 (active area offsets:
++ * left, right, top, bottom) of the access units going to the decoder, written
++ * to <app files>/dvinfo ("min max avg" and, with a level 5, "left right top
++ * bottom") about 4 times a second while <app files>/dvinfo_on exists (looked
++ * for once a second).
++ */
++struct dv_bits
++{
++    const uint8_t *p;
++    size_t i_bits, i_pos;
++    bool b_error;
++};
++
++static uint32_t DvRead(struct dv_bits *b, unsigned n)
++{
++    uint32_t v = 0;
++    if (n > 32 || b->i_pos + n > b->i_bits)
++    {
++        b->b_error = true;
++        b->i_pos = b->i_bits;
++        return 0;
++    }
++    for (unsigned i = 0; i < n; i++, b->i_pos++)
++        v = (v << 1) | ((b->p[b->i_pos >> 3] >> (7 - (b->i_pos & 7))) & 1);
++    return v;
++}
++
++static void DvSkip(struct dv_bits *b, size_t n)
++{
++    if (b->i_pos + n > b->i_bits)
++    {
++        b->b_error = true;
++        b->i_pos = b->i_bits;
++    }
++    else
++        b->i_pos += n;
++}
++
++static uint32_t DvUe(struct dv_bits *b)
++{
++    unsigned zeros = 0;
++    while (!b->b_error && DvRead(b, 1) == 0)
++        if (++zeros > 31)
++        {
++            b->b_error = true;
++            return 0;
++        }
++    return zeros ? (1u << zeros) - 1 + DvRead(b, zeros) : 0;
++}
++
++/* a coefficient of the mapping: integer part (exp-Golomb) + fraction, or a float */
++static void DvSkipCoef(struct dv_bits *b, unsigned i_coef_type, unsigned i_coef_len)
++{
++    if (i_coef_type == 0)
++        DvUe(b); /* se(v): same length as ue(v) */
++    DvSkip(b, i_coef_len);
++}
++
++/* levels 1 and 5 of the CM v2.9 extension blocks (pi_l5[0] < 0: no level 5) */
++static bool DvBlocks(struct dv_bits *b, int pi_l1[3], int pi_l5[4])
++{
++    bool b_l1 = false;
++    const unsigned i_num = DvUe(b);
++    b->i_pos = (b->i_pos + 7) & ~(size_t)7;
++    for (unsigned i = 0; i < i_num && !b->b_error; i++)
++    {
++        const size_t i_len = DvUe(b);
++        const unsigned i_level = DvRead(b, 8);
++        const size_t i_end = b->i_pos + i_len * 8;
++        if (i_end > b->i_bits)
++            break;
++        if (i_level == 1 && i_len >= 5)
++        {
++            for (int k = 0; k < 3; k++)
++                pi_l1[k] = DvRead(b, 12);
++            b_l1 = !b->b_error;
++        }
++        else if (i_level == 5 && i_len >= 7)
++            for (int k = 0; k < 4; k++)
++                pi_l5[k] = DvRead(b, 13);
++        b->i_pos = i_end;
++    }
++    return b_l1;
++}
++
++/* levels 1 and 5 of an unescaped RPU (from its 0x19 prefix), as libdovi parses it */
++static bool DoviRpuL1(const uint8_t *p, size_t n, int pi_l1[3], int pi_l5[4])
++{
++    while (n > 0 && p[n - 1] == 0) /* trailing zeros: not RPU data */
++        n--;
++    struct dv_bits b = { p, n * 8, 0, false };
++    if (DvRead(&b, 8) != 25 || DvRead(&b, 6) != 2)
++        return false;
++    const unsigned i_format = DvRead(&b, 11);
++    DvRead(&b, 8); /* vdr_rpu_profile, vdr_rpu_level */
++    unsigned i_coef_type = 0, i_coef_len = 0, i_bl_depth = 8, i_el_depth = 8, i_reserved3 = 0;
++    bool b_disable_residual = true;
++    if (DvRead(&b, 1)) /* vdr_seq_info_present */
++    {
++        DvRead(&b, 1);
++        i_coef_type = DvRead(&b, 2);
++        const unsigned i_denom = i_coef_type == 0 ? DvUe(&b) : 0;
++        DvRead(&b, 3);
++        if ((i_format & 0x700) == 0)
++        {
++            i_bl_depth = DvUe(&b) + 8;
++            i_el_depth = (DvUe(&b) & 0xff) + 8;
++            DvUe(&b);
++            DvRead(&b, 1);
++            i_reserved3 = DvRead(&b, 3);
++            DvRead(&b, 1);
++            b_disable_residual = DvRead(&b, 1);
++        }
++        if (i_coef_type > 1)
++            return false;
++        i_coef_len = i_coef_type == 0 ? i_denom : 32;
++    }
++    const bool b_dm = DvRead(&b, 1);
++    const bool b_prev = DvRead(&b, 1);
++    if (b_prev)
++        DvUe(&b);
++    else
++    {
++        /* rpu_data_mapping, walked to the DM data */
++        DvUe(&b); DvUe(&b); DvUe(&b);
++        unsigned pi_pieces[3];
++        for (int c = 0; c < 3; c++)
++        {
++            const unsigned i_pivots = DvUe(&b) + 2;
++            DvSkip(&b, (size_t)i_pivots * i_bl_depth);
++            pi_pieces[c] = i_pivots - 1;
++        }
++        const bool b_nlq = (i_format & 0x700) == 0 && !b_disable_residual;
++        if (b_nlq)
++        {
++            if (DvRead(&b, 3) != 0)
++                return false;
++            DvSkip(&b, 2 * i_bl_depth);
++        }
++        DvUe(&b); DvUe(&b);
++        for (int c = 0; c < 3 && !b.b_error; c++)
++            for (unsigned i = 0; i < pi_pieces[c] && !b.b_error; i++)
++            {
++                const unsigned i_idc = DvUe(&b);
++                if (i_idc == 0) /* polynomial */
++                {
++                    const unsigned i_order = DvUe(&b);
++                    if (i_order > 1 || (i_order == 0 && DvRead(&b, 1)))
++                        return false;
++                    for (unsigned k = 0; k < i_order + 2; k++)
++                        DvSkipCoef(&b, i_coef_type, i_coef_len);
++                }
++                else if (i_idc == 1) /* MMR */
++                {
++                    const unsigned i_mmr = DvRead(&b, 2);
++                    if (i_mmr > 2)
++                        return false;
++                    for (unsigned k = 0; k < 1 + (i_mmr + 1) * 7; k++)
++                        DvSkipCoef(&b, i_coef_type, i_coef_len);
++                }
++                else
++                    return false;
++            }
++        if (b_nlq)
++            for (int c = 0; c < 3; c++)
++            {
++                DvSkip(&b, i_el_depth); /* nlq_offset */
++                for (int k = 0; k < 3; k++) /* vdr_in_max, deadzone slope, threshold */
++                {
++                    if (i_coef_type == 0)
++                        DvUe(&b);
++                    DvSkip(&b, i_coef_len);
++                }
++            }
++    }
++    if (!b_dm || b.b_error)
++        return false;
++    DvUe(&b); DvUe(&b); DvUe(&b);
++    if (i_reserved3 != 1) /* uncompressed DM data */
++        DvSkip(&b, 9 * 16 + 3 * 32 + 9 * 16 + 3 * 16 + 32 + 5 + 2 + 2 + 2 + 12 + 12 + 10);
++    return !b.b_error && DvBlocks(&b, pi_l1, pi_l5);
++}
++
++/* <app files>/ (the package name from /proc/self/cmdline, as libdvfelplay does) */
++static char *DoviInfoDir(void)
++{
++    char psz_pkg[128] = "";
++    FILE *f = fopen("/proc/self/cmdline", "r");
++    if (!f)
++        return NULL;
++    size_t n = fread(psz_pkg, 1, sizeof(psz_pkg) - 1, f);
++    fclose(f);
++    psz_pkg[n] = 0;
++    char *psz_colon = strchr(psz_pkg, ':'); /* a service process */
++    if (psz_colon)
++        *psz_colon = 0;
++    char *psz;
++    if (psz_pkg[0] == 0 || asprintf(&psz, "/data/data/%s/files/", psz_pkg) < 0)
++        return NULL;
++    return psz;
++}
++
++static void DoviInfo(decoder_t *p_dec, const block_t *p_block)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    const char *psz_dir = p_sys->video.psz_dvinfo;
++    char psz_path[300];
++    const vlc_tick_t now = mdate();
++
++    if (now - p_sys->video.i_dvinfo_check >= CLOCK_FREQ)
++    {
++        snprintf(psz_path, sizeof(psz_path), "%sdvinfo_on", psz_dir);
++        p_sys->video.b_dvinfo_on = access(psz_path, F_OK) == 0;
++        p_sys->video.i_dvinfo_check = now;
++    }
++    if (!p_sys->video.b_dvinfo_on || now - p_sys->video.i_dvinfo_write < CLOCK_FREQ / 4)
++        return;
++
++    /* the RPU: NAL unit type 62 of the Annex B access unit */
++    const uint8_t *p = p_block->p_buffer;
++    const size_t n = p_block->i_buffer;
++    for (size_t i = 0; i + 5 < n; i++)
++    {
++        if (p[i] != 0 || p[i + 1] != 0 || p[i + 2] != 1 || ((p[i + 3] >> 1) & 0x3f) != 62)
++            continue;
++        size_t i_start = i + 5, i_end = i_start;
++        while (i_end + 2 < n && !(p[i_end] == 0 && p[i_end + 1] == 0 && (p[i_end + 2] == 1 || p[i_end + 2] == 0)))
++            i_end++;
++        if (i_end + 2 >= n)
++            i_end = n;
++        if (i_end - i_start > 16384)
++            return;
++        uint8_t rpu[16384];
++        size_t k = 0;
++        unsigned zeros = 0;
++        for (size_t j = i_start; j < i_end; j++)
++        {
++            if (zeros >= 2 && p[j] == 3) /* emulation prevention */
++            {
++                zeros = 0;
++                continue;
++            }
++            rpu[k++] = p[j];
++            zeros = p[j] == 0 ? zeros + 1 : 0;
++        }
++        int pi_l1[3], pi_l5[4] = { -1, -1, -1, -1 };
++        if (!DoviRpuL1(rpu, k, pi_l1, pi_l5))
++            return;
++        char psz_tmp[310];
++        snprintf(psz_path, sizeof(psz_path), "%sdvinfo", psz_dir);
++        snprintf(psz_tmp, sizeof(psz_tmp), "%s.tmp", psz_path);
++        FILE *f = fopen(psz_tmp, "w");
++        if (f)
++        {
++            if (pi_l5[0] >= 0)
++                fprintf(f, "%d %d %d %d %d %d %d\n", pi_l1[0], pi_l1[1], pi_l1[2],
++                        pi_l5[0], pi_l5[1], pi_l5[2], pi_l5[3]);
++            else
++                fprintf(f, "%d %d %d\n", pi_l1[0], pi_l1[1], pi_l1[2]);
++            fclose(f);
++            rename(psz_tmp, psz_path);
++        }
++        p_sys->video.i_dvinfo_write = now;
++        return;
++    }
++}
++
+ /* the access unit as the Dolby Vision decoder gets it */
+ static int DoviFilter(decoder_t *p_dec, block_t **pp_block)
+ {
+-- 
+2.55.0.windows.3
+

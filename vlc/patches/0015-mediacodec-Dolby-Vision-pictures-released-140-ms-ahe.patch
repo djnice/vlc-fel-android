@@ -1,0 +1,77 @@
+From 1ba8c176517f89376add18f3c32e22bb460f18d6 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 14 Oct 2026 14:52:23 +0200
+Subject: [PATCH] mediacodec: Dolby Vision pictures released 140 ms ahead up to
+ 30 fps
+
+A subtitle change takes the vout 20-60 ms (freetype), the picture after it
+is prepared that late; with a 2160p output the display needs its picture
+earlier than with 1080p, and 80 ms ahead dropped a picture after many
+subtitle changes there (4K 24p FEL). Up to 30 fps Dolby Vision pictures are
+now released 140 ms ahead; at 50 / 60 fps it stays 80 ms (4-5 pictures held
+already), and 3D MVC keeps 80 ms (not measured with more).
+
+Message-Id: <20261014-dvfel-mediacodec-release-ahead-slow@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 27 ++++++++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 46cae213d0..905505c7fc 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -105,8 +105,29 @@ static struct
+  * on when it was queued (repeats and drops when that is near its latch).
+  * Dolby Vision pictures are therefore dated this much earlier and released
+  * for their real time: always ahead of it.
++ *
++ * Dolby Vision up to 30 fps (4K FEL) more: a subtitle change takes the vout
++ * 20-60 ms (freetype), the picture after it is prepared that late, and with a
++ * 2160p output the display needs its picture earlier than with 1080p (drops
++ * with 80 ms there). At 50 / 60 fps 80 ms are 4-5 pictures held already; 3D
++ * MVC (not measured with more) keeps 80 ms.
+  */
+ #define DOVI_RELEASE_AHEAD VLC_TICK_FROM_MS(80)
++#define DOVI_RELEASE_AHEAD_SLOW VLC_TICK_FROM_MS(140)
++
++static vlc_tick_t DoviReleaseAhead(const decoder_t *p_dec, bool b_dovi)
++{
++    if (!b_dovi)
++        return DOVI_RELEASE_AHEAD;
++    const video_format_t *fmt = &p_dec->fmt_out.video;
++    if (fmt->i_frame_rate == 0 || fmt->i_frame_rate_base == 0)
++        fmt = &p_dec->fmt_in.video;
++    if (fmt->i_frame_rate == 0 || fmt->i_frame_rate_base == 0)
++        return DOVI_RELEASE_AHEAD;
++    /* up to 30 fps (29.97 included) */
++    return (uint64_t)fmt->i_frame_rate <= (uint64_t)fmt->i_frame_rate_base * 31
++        ? DOVI_RELEASE_AHEAD_SLOW : DOVI_RELEASE_AHEAD;
++}
+ 
+ static void DoviLoadOnce(void)
+ {
+@@ -1172,7 +1193,7 @@ static void ReleasePictureTs(decoder_t *p_dec, unsigned i_index, vlc_tick_t i_ts
+     /* Dolby Vision decoder: render times between the display's vsyncs, so
+      * that clock jitter never puts two frames into one vsync (a drop) */
+     if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns)
+-        i_ns = dvfp_api.snap_present_ns(i_ns + DOVI_RELEASE_AHEAD * INT64_C(1000));
++        i_ns = dvfp_api.snap_present_ns(i_ns + DoviReleaseAhead(p_dec, p_sys->video.b_dovi) * INT64_C(1000));
+     p_sys->api.release_out_ts(&p_sys->api, i_index, i_ns);
+ }
+ 
+@@ -1264,10 +1285,10 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+         /* 3D MVC: the same (the mvc3d module holds the frame packed picture) */
+         if (p_sys->video.p_mvc && mvc_api.present_lead_ns)
+             p_pic->date -= mvc_api.present_lead_ns(p_sys->video.p_mvc) / 1000;
+-        /* released ahead (DOVI_RELEASE_AHEAD, added back in ReleasePictureTs) */
++        /* released ahead (DoviReleaseAhead, added back in ReleasePictureTs) */
+         if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns
+          && p_sys->api.b_direct_rendering && p_sys->api.release_out_ts)
+-            p_pic->date -= DOVI_RELEASE_AHEAD;
++            p_pic->date -= DoviReleaseAhead(p_dec, p_sys->video.b_dovi);
+         p_pic->b_progressive = true;
+ 
+         if (p_sys->api.b_direct_rendering)
+-- 
+2.55.0.windows.3
+
