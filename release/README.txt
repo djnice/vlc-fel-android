@@ -102,6 +102,10 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.3-poc (VLC javítás, a modulok és a libdvfelplay változatlanok) – bekapcsolt felirattal nem akad:
+          a FEL eddig a legtöbb feliratváltáskor eldobott egy képkockát (4K filmen ~40/perc, most
+          1 alatt). A felirat a kijelző méretében készül (nem 4K-ban), és a kép a felirat előtt,
+          időben kerül a kijelzőre.
 0.2.2-poc (libdvfelplay 2026.10.13.1, modulok változatlanok) – FEL demo mód mért L1-gyel, a lejátszó
           menüjéből kapcsolható.
 0.2.1-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.3) – kétsávos (DTDL) FEL: MP4 és m2ts (Ultra HD
@@ -225,6 +229,10 @@ NOTES
 
 CHANGES
 -------
+0.2.3-poc (VLC fix, modules and libdvfelplay unchanged) – no stutter with subtitles on: FEL
+          dropped a frame at most subtitle changes (~40 per minute on a 4K film, now under 1). The
+          subtitles are drawn at the display's size (not in 4K), and the picture reaches the display
+          at its time, before the subtitle.
 0.2.2-poc (libdvfelplay 2026.10.13.1, modules unchanged) – FEL demo mode with measured L1, switchable
           from the player menu.
 0.2.1-poc (dvfel 2026.10.07.1, mvc3d 2026.10.12.3) – dual track (DTDL) FEL: MP4 and m2ts (Ultra HD

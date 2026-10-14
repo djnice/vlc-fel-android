@@ -1,0 +1,58 @@
+From 8e59ae5442c0ac51c79886fa5f89af5df1a3e15f Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 14 Oct 2026 11:49:22 +0200
+Subject: [PATCH] android: subtitles at the display's size, not the video's
+
+A 4K video on a 1080p display made the subtitles surface 3840x2160 RGBA:
+SurfaceFlinger scaled it down on the GPU (client composition) at every
+refresh, and the Dolby Vision FEL composition, on the same GPU, missed
+vsyncs while subtitles were shown; the subtitles were also rendered and
+blended by the CPU at 4 times the pixels. The vout core renders the direct
+subpictures at the placed size of the video, the Android display makes its
+subtitles surface that size (the video's size only until the display's is
+known).
+
+Message-Id: <20261014-dvfel-android-subtitles-display-size@djnice>
+---
+ modules/video_output/android/display.c | 8 ++++++--
+ src/video_output/video_output.c        | 5 ++++-
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/modules/video_output/android/display.c b/modules/video_output/android/display.c
+index 25cef43abd..98628f8794 100644
+--- a/modules/video_output/android/display.c
++++ b/modules/video_output/android/display.c
+@@ -271,8 +271,12 @@ static void FixSubtitleFormat(vout_display_sys_t *sys)
+         i_height = i_display_height;
+     }
+ 
+-    // Use the biggest size available
+-    if (i_width * i_height < i_video_width * i_video_height) {
++    // The display's size: a 4K video on a 1080p display made a 3840x2160
++    // RGBA subtitles surface, scaled down by the GPU at every refresh (the
++    // Dolby Vision FEL composition runs on the same GPU and missed vsyncs)
++    // and blended by the CPU at 4 times the pixels. The video's size only
++    // while the display's is not known yet.
++    if (i_width <= 0 || i_height <= 0) {
+         i_width = i_video_width;
+         i_height = i_video_height;
+     }
+diff --git a/src/video_output/video_output.c b/src/video_output/video_output.c
+index cd06e8023f..7ac44cd570 100644
+--- a/src/video_output/video_output.c
++++ b/src/video_output/video_output.c
+@@ -1019,7 +1019,10 @@ static int ThreadDisplayRenderPicture(vout_thread_t *vout, bool is_forced)
+         vout_display_PlacePicture(&place, &vd->source, vd->cfg, false);
+ 
+         fmt_spu = vd->source;
+-        if (fmt_spu.i_width * fmt_spu.i_height < place.width * place.height) {
++        /* at the size the video is shown at, also when that is smaller than
++         * the video (a 4K video on a 1080p display): the display (Android)
++         * makes its subtitles surface that size */
++        if (place.width > 0 && place.height > 0) {
+             fmt_spu.i_sar_num = vd->cfg->display.sar.num;
+             fmt_spu.i_sar_den = vd->cfg->display.sar.den;
+             fmt_spu.i_width          =
+-- 
+2.55.0.windows.3
+

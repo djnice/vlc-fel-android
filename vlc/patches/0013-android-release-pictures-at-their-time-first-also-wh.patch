@@ -1,0 +1,72 @@
+From d1f5044f5c5878d1fc38296bd4a55dafc550f074 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 14 Oct 2026 12:16:21 +0200
+Subject: [PATCH] android: release pictures at their time first, also when
+ prepared late
+
+Prepare released the picture after the subtitles (locking their surface
+may wait for a buffer, blending takes time), and not at all when its date
+had passed (the subtitle rendered before it took the time: freetype,
+20-60 ms); then Display released it without a time, shown at once. A Dolby
+Vision picture of mediacodec is dated ahead of its display time (the FEL
+composition's lead time and the release ahead), so it reached the display
+that much early and took the vsync of the frame before it: a dropped frame
+at about every subtitle change. The picture is now released first, and at
+its time also when that has just passed (for other pictures a past time is
+the same as at once).
+
+Message-Id: <20261014-dvfel-android-release-late-prepared@djnice>
+---
+ modules/video_output/android/display.c | 29 +++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/modules/video_output/android/display.c b/modules/video_output/android/display.c
+index 98628f8794..10d182d72c 100644
+--- a/modules/video_output/android/display.c
++++ b/modules/video_output/android/display.c
+@@ -1078,6 +1078,23 @@ static void Prepare(vout_display_t *vd, picture_t *picture,
+     vout_display_sys_t *sys = vd->sys;
+     VLC_UNUSED(picture);
+ 
++    if (sys->p_window->b_opaque
++     && AndroidOpaquePicture_CanReleaseAtTime(picture->p_sys))
++    {
++        vlc_tick_t now = mdate();
++        /* Before the subtitles (locking their surface may wait for a
++         * buffer, blending takes time), and also when the date has just
++         * passed (the subtitle rendered before took the time): released
++         * without a time, from Display, a picture is shown at once, and a
++         * Dolby Vision picture of mediacodec is dated ahead of its display
++         * time (lead time), it would reach the display that much early and
++         * take the vsync of the frame before it (a drop). */
++        if (picture->date - now <= INT64_C(1000000))
++            AndroidOpaquePicture_ReleaseAtTime(picture->p_sys, picture->date);
++        else /* The picture will be displayed from the Display callback */
++            msg_Warn(vd, "picture way too early to release at time");
++    }
++
+     if (subpicture && sys->p_sub_window) {
+         if (sys->b_sub_invalid) {
+             sys->b_sub_invalid = false;
+@@ -1117,18 +1134,6 @@ static void Prepare(vout_display_t *vd, picture_t *picture,
+             sys->b_has_subpictures = false;
+         }
+     }
+-    if (sys->p_window->b_opaque
+-     && AndroidOpaquePicture_CanReleaseAtTime(picture->p_sys))
+-    {
+-        vlc_tick_t now = mdate();
+-        if (picture->date > now)
+-        {
+-            if (picture->date - now <= INT64_C(1000000))
+-                AndroidOpaquePicture_ReleaseAtTime(picture->p_sys, picture->date);
+-            else /* The picture will be displayed from the Display callback */
+-                msg_Warn(vd, "picture way too early to release at time");
+-        }
+-    }
+ }
+ 
+ static void Display(vout_display_t *vd, picture_t *picture,
+-- 
+2.55.0.windows.3
+
