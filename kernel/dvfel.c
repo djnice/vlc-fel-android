@@ -65,6 +65,8 @@
 #define EL_STALE	16	/* access units */
 #define MAX_SLOTS	12
 #define QUEUE_LEN	16
+/* upstream frames held at once: passthrough + slots + jobs + held + in stage A */
+#define UP_OWN_MAX	(QUEUE_LEN + MAX_SLOTS + DVFEL_MAX_BUFS + 4)
 #define MAX_W		3840
 #define MAX_H		2160
 
@@ -321,6 +323,17 @@ struct dvfel_dev {
 	 * the decoder waits for their release fences (1 s each) until it fails
 	 */
 	struct vframe_s *up_held;
+	/*
+	 * the upstream frames dvfel holds: taken with vf_get and not given
+	 * back yet. Each goes back once (up_put); a frame not recorded here
+	 * is never passed to vf_put: a provider handed a frame it no longer
+	 * holds (or one of ours) dereferences freed or foreign memory. A reset
+	 * abandons them, like the frames themselves (dvfel_reset_locked).
+	 */
+	struct vframe_s *up_own[UP_OWN_MAX];
+	int up_nown;
+	u64 up_refused, up_dup_gets, up_own_full;
+	u64 slot_lost;		/* a reserved slot was not SLOT_BUSY any more */
 	int dump_left;		/* debug & 4: input frames still to log */
 	u32 in_seq;		/* frames taken since the upstream (re)started */
 	u32 get_vsync;		/* vc_pace: vsync of the last take, takes in it */
@@ -504,10 +517,34 @@ static bool slots_shown_locked(struct dvfel_dev *d)
 	return false;
 }
 
-static void dvfel_free_bufs(struct dvfel_dev *d)
+/* some slot other than @own is reserved by stage A or B (d->lock held) */
+static bool slots_busy_locked(struct dvfel_dev *d, struct dvfel_slot *own)
 {
 	int i;
 
+	for (i = 0; i < d->nslots; i++)
+		if (d->slots[i].state == SLOT_BUSY && &d->slots[i] != own)
+			return true;
+	return false;
+}
+
+/*
+ * A SLOT_BUSY slot stays reserved: its owner (stage A or a job of stage B)
+ * still fills it and makes it SLOT_OUT. Freeing it here let stage A take it
+ * again while a job of it was in flight: the job then published the slot
+ * with the next reservation's state (detached false, orig its snap), and
+ * the display's put of it handed the snap upstream.
+ */
+static void dvfel_free_bufs(struct dvfel_dev *d)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&d->lock, flags);
+	for (i = 0; i < d->nslots; i++)
+		if (d->slots[i].state != SLOT_BUSY)
+			d->slots[i].state = SLOT_FREE;
+	spin_unlock_irqrestore(&d->lock, flags);
 	for (i = 0; i < d->nslots; i++) {
 		struct dvfel_slot *s = &d->slots[i];
 
@@ -528,7 +565,6 @@ static void dvfel_free_bufs(struct dvfel_dev *d)
 		s->head_mm = s->body_mm = NULL;
 		s->table_handle = s->table_phys = 0;
 		s->head_phys = s->body_phys = 0;
-		s->state = SLOT_FREE;
 	}
 	if (d->lin_phys)
 		codec_mm_free_for_dma(DRV_NAME, d->lin_phys);
@@ -899,6 +935,16 @@ static struct dvfel_slot *slot_free(struct dvfel_dev *d)
 	return NULL;
 }
 
+/* the reservation of @s is still ours before it goes out (d->lock held) */
+static void slot_check_locked(struct dvfel_dev *d, struct dvfel_slot *s, const char *who)
+{
+	if (s->state == SLOT_BUSY)
+		return;
+	d->slot_lost++;
+	pr_err_ratelimited(DRV_NAME ": %s: slot %d lost its reservation (state %d)\n",
+			   who, (int)(s - d->slots), s->state);
+}
+
 static struct dvfel_pass *pass_free(struct dvfel_dev *d)
 {
 	int i;
@@ -951,6 +997,8 @@ static void dvfel_reset_locked(struct dvfel_dev *d)
 			s->state = s->taken ? SLOT_HELD : SLOT_FREE;
 	}
 	memset(d->pass, 0, sizeof(d->pass));
+	/* the provider takes the frames back itself (or is gone): never put them */
+	d->up_nown = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1277,6 +1325,64 @@ static void *meta_copy(u8 **dst, const void *src, size_t size)
  * driver reads at display time in the slot, then give @vf back. The copy
  * stands in for the original from here on (orig of the slot/job).
  */
+/* record a frame just taken from upstream (d->lock held) */
+static void up_own_add_locked(struct dvfel_dev *d, struct vframe_s *vf)
+{
+	int i;
+
+	for (i = 0; i < d->up_nown; i++) {
+		if (d->up_own[i] == vf) {
+			/* handed out again before we gave it back: one put goes back */
+			d->up_dup_gets++;
+			pr_err_ratelimited(DRV_NAME ": upstream frame %px taken again while held\n", vf);
+			return;
+		}
+	}
+	if (d->up_nown == UP_OWN_MAX) {
+		/* not recorded: it is not given back (a leak, not a crash) */
+		d->up_own_full++;
+		pr_err_ratelimited(DRV_NAME ": upstream frame record full, %px not recorded\n", vf);
+		return;
+	}
+	d->up_own[d->up_nown++] = vf;
+}
+
+/* forget @vf if dvfel holds it; false: it does not (d->lock held) */
+static bool up_own_take_locked(struct dvfel_dev *d, struct vframe_s *vf)
+{
+	int i;
+
+	for (i = 0; i < d->up_nown; i++) {
+		if (d->up_own[i] == vf) {
+			d->up_own[i] = d->up_own[--d->up_nown];
+			return true;
+		}
+	}
+	d->up_refused++;
+	return false;
+}
+
+static void up_refused_log(struct vframe_s *vf, const char *why)
+{
+	pr_err_ratelimited(DRV_NAME ": %s: %px is not an upstream frame dvfel holds, not given back\n",
+			   why, vf);
+}
+
+/* gives an upstream frame back, once (not under d->lock) */
+static void up_put(struct dvfel_dev *d, struct vframe_s *vf, const char *why)
+{
+	unsigned long flags;
+	bool held;
+
+	spin_lock_irqsave(&d->lock, flags);
+	held = up_own_take_locked(d, vf);
+	spin_unlock_irqrestore(&d->lock, flags);
+	if (held)
+		vf_put(vf, DRV_NAME);
+	else
+		up_refused_log(vf, why);
+}
+
 /* gives the held upstream frame back (process context, not under d->lock) */
 static void up_release_held(struct dvfel_dev *d)
 {
@@ -1288,7 +1394,7 @@ static void up_release_held(struct dvfel_dev *d)
 	d->up_held = NULL;
 	spin_unlock_irqrestore(&d->lock, flags);
 	if (vf)
-		vf_put(vf, DRV_NAME);
+		up_put(d, vf, "held frame");
 }
 
 static void detach_orig(struct dvfel_dev *d, struct dvfel_slot *s, struct vframe_s *vf)
@@ -1343,7 +1449,7 @@ static void detach_orig(struct dvfel_dev *d, struct dvfel_slot *s, struct vframe
 	d->up_held = vf;
 	spin_unlock_irqrestore(&d->lock, flags);
 	if (prev)
-		vf_put(prev, DRV_NAME);
+		up_put(d, prev, "previous held frame");
 }
 
 /* process context; the map may change only while nothing plays through it */
@@ -1451,7 +1557,8 @@ static void zombies_release(struct dvfel_dev *d)
 	d->nzombies = 0;
 }
 
-static bool ensure_bufs(struct dvfel_dev *d, u32 w, u32 h)
+/* @own: the slot the caller reserved (its buffers are reallocated too) */
+static bool ensure_bufs(struct dvfel_dev *d, struct dvfel_slot *own, u32 w, u32 h)
 {
 	bool ok;
 
@@ -1461,8 +1568,10 @@ static bool ensure_bufs(struct dvfel_dev *d, u32 w, u32 h)
 		unsigned long flags;
 		bool idle;
 
+		/* stage B may be finishing a job (popped already) into its slot */
 		spin_lock_irqsave(&d->lock, flags);
-		idle = !d->outq_cnt && !d->pend_cnt && !slots_shown_locked(d);
+		idle = !d->outq_cnt && !d->pend_cnt && !slots_shown_locked(d) &&
+		       !slots_busy_locked(d, own);
 		spin_unlock_irqrestore(&d->lock, flags);
 		if (idle)
 			dvfel_free_bufs(d);
@@ -1870,7 +1979,7 @@ static int dvfel_thread_a(void *data)
 		for (;;) {
 			struct dvfel_slot *s = NULL;
 			struct dvfel_pass *p;
-			struct vframe_s *vf, *el;
+			struct vframe_s *vf, *el, *up_vf;
 			unsigned long flags;
 			bool gpu = false, ok = false, capture = false, el_ok = false, took_el;
 			bool rpu_ok = false, hold = false;
@@ -1924,6 +2033,15 @@ static int dvfel_thread_a(void *data)
 				spin_unlock_irqrestore(&d->lock, flags);
 				break;
 			}
+			up_vf = vf;
+			spin_lock_irqsave(&d->lock, flags);
+			/*
+			 * gen is from before vf_get: after a reset since, vf may be
+			 * of either stream and is dropped below, so not recorded
+			 */
+			if (gen == d->gen)
+				up_own_add_locked(d, vf);
+			spin_unlock_irqrestore(&d->lock, flags);
 			d->frames_in++;
 			d->gets_this_vsync++;
 			if (d->vc_upstream) {
@@ -1961,7 +2079,7 @@ static int dvfel_thread_a(void *data)
 			el = NULL;
 			took_el = false;
 
-			if (s && frame_supported(vf) && ensure_bufs(d, w, h)) {
+			if (s && frame_supported(vf) && ensure_bufs(d, s, w, h)) {
 				capture = atomic_xchg(&d->capture_req, 0) ||
 					  (capture_pts && vf->pts_us64 == capture_pts);
 				if (gpu && d->client_w == w && d->client_h == h) {
@@ -2042,7 +2160,12 @@ static int dvfel_thread_a(void *data)
 
 			spin_lock_irqsave(&d->lock, flags);
 			if (gen != d->gen) {
-				/* reset/unreg while processing: drop the frame */
+				/*
+				 * reset/unreg while processing: drop the frame, also
+				 * when early release made it the held one
+				 */
+				if (d->up_held == up_vf)
+					d->up_held = NULL;
 				if (s)
 					s->state = SLOT_FREE;
 				if (j >= 0)
@@ -2050,6 +2173,8 @@ static int dvfel_thread_a(void *data)
 				spin_unlock_irqrestore(&d->lock, flags);
 				continue;
 			}
+			if (ok)
+				slot_check_locked(d, s, "stage A");
 			if (ok && gpu) {
 				struct dvfel_kjob *jb = &d->jobs[j];
 
@@ -2182,6 +2307,7 @@ static void finish_job(struct dvfel_dev *d, struct dvfel_pend *pe)
 	if (pe->gen != d->gen) {
 		s->state = SLOT_FREE;
 	} else if (ok) {
+		slot_check_locked(d, s, "stage B");
 		s->orig = orig;
 		s->gen = pe->gen;
 		s->state = SLOT_OUT;
@@ -2193,7 +2319,7 @@ static void finish_job(struct dvfel_dev *d, struct dvfel_pend *pe)
 		s->state = SLOT_FREE;
 		if (!s->detached) {
 			spin_unlock_irqrestore(&d->lock, flags);
-			vf_put(orig, DRV_NAME);
+			up_put(d, orig, "job fallback");
 			spin_lock_irqsave(&d->lock, flags);
 		}
 	}
@@ -2325,7 +2451,7 @@ static struct vframe_s *dvfel_get(void *op_arg)
 static void dvfel_put(struct vframe_s *vf, void *op_arg)
 {
 	struct dvfel_dev *d = op_arg;
-	struct vframe_s *upstream = NULL;
+	struct vframe_s *upstream = NULL, *refused = NULL;
 	struct dvfel_slot *s;
 	unsigned long flags;
 	int i;
@@ -2354,9 +2480,17 @@ static void dvfel_put(struct vframe_s *vf, void *op_arg)
 			}
 		}
 	}
+	if (!d->prov_reg) {
+		upstream = NULL;
+	} else if (upstream && !up_own_take_locked(d, upstream)) {
+		refused = upstream;
+		upstream = NULL;
+	}
 	spin_unlock_irqrestore(&d->lock, flags);
 
-	if (upstream && d->prov_reg) {
+	if (refused)
+		up_refused_log(refused, s ? "display put of a slot" : "display put of a passthrough frame");
+	if (upstream) {
 		/* the display marked our copy (video composer: release fences) */
 		if (upstream != vf)
 			upstream->rendered = vf->rendered;
@@ -3079,6 +3213,8 @@ static int stats_show(struct seq_file *m, void *v)
 		   d->us_el_sum / (d->us_el_cnt ? d->us_el_cnt : 1), d->us_el_max,
 		   d->us_el_wait_max);
 	seq_printf(m, "queued %d, pending %d\n", d->outq_cnt, d->pend_cnt);
+	seq_printf(m, "upstream frames held %d, refused puts %llu, taken twice %llu, unrecorded %llu, slots lost %llu\n",
+		   d->up_nown, d->up_refused, d->up_dup_gets, d->up_own_full, d->slot_lost);
 	{
 		/* F free, B busy, O out (t: taken by the display), H held; jobs by state */
 		static const char st[] = "FBOH";
@@ -3132,6 +3268,7 @@ static ssize_t stats_reset_write(struct file *f, const char __user *buf,
 
 	d->frames_in = d->frames_proc = d->frames_pass = d->vicp_err = 0;
 	d->slot_waits = d->held_breaks = 0;
+	d->up_refused = d->up_dup_gets = d->up_own_full = d->slot_lost = 0;
 	memset(d->disp_gap, 0, sizeof(d->disp_gap));
 	memset(d->in_gap, 0, sizeof(d->in_gap));
 	memset(d->av_hist, 0, sizeof(d->av_hist));
@@ -3239,7 +3376,7 @@ static ssize_t selftest_write(struct file *f, const char __user *buf,
 		return -EINVAL;
 	if (d->prov_reg)
 		return -EBUSY;
-	if (!ensure_bufs(d, w, h))
+	if (!ensure_bufs(d, NULL, w, h))
 		return -ENOMEM;
 	tmpl = kzalloc(sizeof(*tmpl), GFP_KERNEL);
 	if (!tmpl)
