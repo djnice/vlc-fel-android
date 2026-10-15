@@ -31,7 +31,7 @@
 #include <linux/types.h>
 
 /* module version (/sys/module/dvfel/version); compositors may require a minimum */
-#define DVFEL_VERSION		"2026.10.07.1"
+#define DVFEL_VERSION		"2026.10.15.1"
 
 #define DVFEL_MAX_BUFS		4
 /* bytes needed per buffer (includes a write-MIF margin) */

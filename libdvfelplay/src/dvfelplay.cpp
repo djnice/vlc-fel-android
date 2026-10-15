@@ -78,7 +78,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.15.1"
+#define DVFP_VERSION "2026.10.15.3"
 
 namespace
 {
@@ -752,6 +752,7 @@ private:
     std::vector<uint8_t> data; // Annex-B
     std::shared_ptr<felgpu_meta> meta; // the RPU travels with the EL picture
     bool flush;
+    bool gap{false}; // the access unit of pts carried no EL
   };
   struct ElFrame
   {
@@ -795,6 +796,13 @@ private:
   uint32_t m_pendingCrc{0};
   std::shared_ptr<felgpu_meta> m_lastMeta;
   int m_convertErrors{0};
+  // the last RPU (original, as sent to the decoder, its CRC): pictures
+  // without one get it again
+  std::vector<uint8_t> m_lastRpuIn;
+  std::vector<uint8_t> m_lastRpuOut;
+  bool m_lastCrcValid{false};
+  uint32_t m_lastCrc{0};
+  bool m_elSeen{false}; // an access unit with EL was committed
 
   mutable std::mutex m_lock;
   std::condition_variable m_elCond;    // EL input queue
@@ -811,6 +819,9 @@ private:
   // frames shown before the first decodable EL picture after a start or seek
   // (skipped leading pictures) get no EL: no waiting for them
   int64_t m_noElBefore{INT64_MIN};
+  // frames whose EL is missing or not decodable (an access unit without EL,
+  // the pictures after it until the next EL IRAP): no waiting for them
+  std::set<int64_t> m_noElPts;
   int m_noPairLogged{0}; // since start or the last flush
   int m_noCrcLogged{0};
 
@@ -825,6 +836,8 @@ private:
   std::atomic<uint64_t> m_mappedOnly{0};  // without EL, composed with the mapping only
   std::atomic<uint64_t> m_noCrc{0};
   std::atomic<uint64_t> m_stale{0}; // decoded before a flush, shown after it
+  uint64_t m_rpuRepeated{0};        // access units without an RPU (filter)
+  std::atomic<uint64_t> m_elGaps{0}; // access units without EL in a stream with EL
   // hardware EL decoder: pictures in and out, pts of the last output
   std::atomic<uint64_t> m_elInputs{0};
   std::atomic<uint64_t> m_elOutputs{0};
@@ -844,11 +857,25 @@ int dvfp::Filter(const uint8_t* in, size_t size, const uint8_t** out, size_t* ou
   // what an earlier access unit left uncommitted belongs to no packet
   Drop();
   m_out.clear();
-  m_out.reserve(size + 64);
+  m_out.reserve(size + 64 + m_lastRpuOut.size());
   bool ok = true;
+  bool vcl = false, hasRpu = false;
+  // where the end of sequence / end of bitstream NAL units at the end begin
+  size_t tail = SIZE_MAX;
 
   ForEachNal(in, size, [&](const uint8_t* nal, size_t n) {
     const int type = n >= 2 ? NalType(nal) : -1;
+    if (type == 36 || type == 37)
+    {
+      if (tail == SIZE_MAX)
+        tail = m_out.size();
+    }
+    else if (type != 63)
+    {
+      tail = SIZE_MAX;
+    }
+    if (type >= 0 && type < 32)
+      vcl = true;
     if (type == 63)
     {
       // a NAL 63 carries an EL NAL unit behind its own 2-byte header; it never
@@ -895,6 +922,11 @@ int dvfp::Filter(const uint8_t* in, size_t size, const uint8_t** out, size_t* ou
       m_out.insert(m_out.end(), START_CODE, START_CODE + 4);
       m_out.insert(m_out.end(), sent, sent + sentSize);
       m_pendingCrcValid = RpuTailCrc(sent, sentSize, m_pendingCrc);
+      hasRpu = true;
+      m_lastRpuIn = m_pendingRpu;
+      m_lastRpuOut.assign(sent, sent + sentSize);
+      m_lastCrcValid = m_pendingCrcValid;
+      m_lastCrc = m_pendingCrc;
       if (converted)
         dovi_data_free(converted);
       return;
@@ -902,6 +934,23 @@ int dvfp::Filter(const uint8_t* in, size_t size, const uint8_t** out, size_t* ou
     m_out.insert(m_out.end(), START_CODE, START_CODE + 4);
     m_out.insert(m_out.end(), nal, nal + n);
   });
+
+  // a picture without an RPU (seen in files muxed from a dual layer source
+  // whose EL had another picture order: about half the access units without
+  // RPU and EL) would go to the display as the base layer as it is, a flash
+  // between the composed frames; it gets the last RPU instead, after its
+  // slices, as the decoder of a Dolby Vision display keeps the last metadata
+  if (vcl && !hasRpu && !m_lastRpuOut.empty())
+  {
+    const size_t at = tail == SIZE_MAX ? m_out.size() : tail;
+    m_out.insert(m_out.begin() + at, m_lastRpuOut.begin(), m_lastRpuOut.end());
+    m_out.insert(m_out.begin() + at, START_CODE, START_CODE + 4);
+    m_pendingRpu = m_lastRpuIn;
+    m_pendingCrcValid = m_lastCrcValid;
+    m_pendingCrc = m_lastCrc;
+    if (m_rpuRepeated++ < 5)
+      LOGI("access unit without an RPU: the last one repeated");
+  }
 
   *out = m_out.data();
   *outSize = m_out.size();
@@ -957,6 +1006,15 @@ void dvfp::Commit(int64_t pts)
       m_pendingEl.insert(m_pendingEl.end(), m_pendingRpu.begin(), m_pendingRpu.end());
     }
     m_elQueue.push_back({pts, std::move(m_pendingEl), meta, false});
+    m_elSeen = true;
+    m_elCond.notify_all();
+  }
+  else if ((m_elSeen || !m_pendingEl.empty()) && m_elQueue.size() < 2 * MAX_EL_QUEUE)
+  {
+    // an access unit without EL (or no room for it): the EL pictures after it
+    // may reference its picture, the EL decoder waits for its next IRAP
+    m_elQueue.push_back({pts, {}, nullptr, false, true});
+    m_elGaps++;
     m_elCond.notify_all();
   }
   m_pendingEl.clear();
@@ -982,6 +1040,7 @@ void dvfp::Flush()
   }
   m_crcByPts.clear();
   m_metaByPts.clear();
+  m_noElPts.clear();
   m_lastJobPts = INT64_MIN;
   m_noPairLogged = 0;
   m_noCrcLogged = 0;
@@ -1171,11 +1230,13 @@ void dvfp::Stop()
     const auto slow = std::count_if(t.begin(), t.end(), [](float ms) { return ms > 41.7f; });
     LOGI("stopped, %llu frames composed (gpu avg %.1f ms, median %.1f, p95 %.1f, max %.1f, %ld over "
          "41.7 ms), %llu shown without EL (%llu without waiting, %llu with the mapping only), %llu "
-         "EL frames decoded, %llu frames without a matching RPU CRC, %llu from before a flush",
+         "EL frames decoded, %llu frames without a matching RPU CRC, %llu from before a flush; "
+         "%llu access units without an RPU (the last repeated), %llu without EL",
          (unsigned long long)n, n ? m_gpuMsSum / n : 0.0, pct(0.5), pct(0.95), pct(1.0), (long)slow,
          (unsigned long long)m_passthrough.load(), (unsigned long long)m_noElSkipped.load(),
          (unsigned long long)m_mappedOnly.load(), (unsigned long long)m_elDecoded.load(),
-         (unsigned long long)m_noCrc.load(), (unsigned long long)m_stale.load());
+         (unsigned long long)m_noCrc.load(), (unsigned long long)m_stale.load(),
+         (unsigned long long)m_rpuRepeated, (unsigned long long)m_elGaps.load());
   }
 
   std::lock_guard<std::mutex> lock(m_lock);
@@ -1186,6 +1247,7 @@ void dvfp::Stop()
   m_crcByPts.clear();
   m_metaByPts.clear();
   m_staleMeta.clear();
+  m_noElPts.clear();
   // the EL pool, used by both threads
   for (int i = 0; i < EL_POOL; i++)
   {
@@ -1245,6 +1307,10 @@ void dvfp::ElThread()
   bool reordered = false;
   int64_t lastLabel = INT64_MIN;
   bool needIrap = true, skipRasl = false;
+  // needIrap because of an access unit without EL (not a start or flush): the
+  // frames before the IRAP whose EL pictures were decoded keep them
+  bool gapWait = false;
+  int gapsLogged = 0;
   // the EL's last parameter sets (VPS / SPS / PPS, Annex B, by type): an EL
   // track may carry them at its start only, and the decoder forgets them at a
   // flush - after a seek it then decoded nothing (every frame fell back to
@@ -1449,6 +1515,7 @@ void dvfp::ElThread()
     skipped = 0;
     lastLabel = INT64_MIN;
     needIrap = true;
+    gapWait = false;
     skipRasl = false;
     resendParams = true;
     std::lock_guard<std::mutex> lock(m_lock);
@@ -1477,12 +1544,14 @@ void dvfp::ElThread()
         return m_lastJobPts == INT64_MIN || m_elFrames.empty() ||
                m_elFrames.rbegin()->first < m_lastJobPts + EL_LEAD_US;
       };
-      m_elCond.wait_for(lock, std::chrono::milliseconds(5), [&] {
-        return m_stop || (!m_elQueue.empty() && (m_elQueue.front().flush || paced()));
-      });
+      // flushes and gaps (no picture) are never held back
+      auto ready = [&] {
+        return !m_elQueue.empty() && (m_elQueue.front().flush || m_elQueue.front().gap || paced());
+      };
+      m_elCond.wait_for(lock, std::chrono::milliseconds(5), [&] { return m_stop || ready(); });
       if (m_stop)
         break;
-      if (!m_elQueue.empty() && (m_elQueue.front().flush || paced()))
+      if (ready())
       {
         in = std::move(m_elQueue.front());
         m_elQueue.pop_front();
@@ -1515,6 +1584,25 @@ void dvfp::ElThread()
     if (in.flush)
     {
       flushDecoder();
+      continue;
+    }
+    if (in.gap)
+    {
+      // the EL pictures after it until the next IRAP may reference the
+      // missing one: decoded, they would be broken (and the Amlogic decoder
+      // then stalls), the frames get the mapping only
+      if (!needIrap)
+      {
+        needIrap = true;
+        gapWait = true;
+        if (gapsLogged++ < 5)
+          LOGI("access unit %lld us without EL: the EL waits for its next IRAP", (long long)in.pts);
+      }
+      std::lock_guard<std::mutex> lock(m_lock);
+      m_noElPts.insert(in.pts);
+      while (m_noElPts.size() > MAX_META)
+        m_noElPts.erase(m_noElPts.begin());
+      m_readyCond.notify_all();
       continue;
     }
 
@@ -1559,13 +1647,14 @@ void dvfp::ElThread()
       }
       resendParams = false;
       skipRasl = type <= 18 || (type == 21 && needIrap);
-      if (needIrap)
+      if (needIrap && !gapWait)
       {
         // frames shown before it (skipped leading pictures) get no EL
         std::lock_guard<std::mutex> lock(m_lock);
         m_noElBefore = in.pts;
       }
       needIrap = false;
+      gapWait = false;
     }
     else if (needIrap || (skipRasl && (type == 8 || type == 9)))
     {
@@ -1574,12 +1663,23 @@ void dvfp::ElThread()
     if (endOfSeq)
       needIrap = true;
 
-    slots.insert(in.pts);
     if (!decode)
     {
-      skipped++;
+      // after a start or flush the skipped pictures are the earliest pending
+      // ones; after a gap the pictures decoded before it still come out
+      if (!gapWait)
+      {
+        slots.insert(in.pts);
+        skipped++;
+      }
+      std::lock_guard<std::mutex> lock(m_lock);
+      m_noElPts.insert(in.pts);
+      while (m_noElPts.size() > MAX_META)
+        m_noElPts.erase(m_noElPts.begin());
+      m_readyCond.notify_all();
       continue;
     }
+    slots.insert(in.pts);
     metas[in.pts] = std::move(in.meta);
     while (metas.size() > 4 * EL_POOL) // never output, e.g. broken pictures
       metas.erase(metas.begin());
@@ -1651,12 +1751,15 @@ bool dvfp::WaitForFrame(int64_t pts, ElFrame& el)
     ReleaseElFrame(m_elFrames.begin()->second);
     m_elFrames.erase(m_elFrames.begin());
   }
+  m_noElPts.erase(m_noElPts.begin(), m_noElPts.lower_bound(pts - PTS_TOLERANCE_US));
   m_elCond.notify_all();
 
   // no EL will come: shown before the first decodable EL picture (after a
-  // start or seek), or the EL (in display order) is past this frame already
+  // start or seek), its EL missing or not decodable, or the EL (in display
+  // order) is past this frame already
   auto never = [&] {
     return (m_noElBefore != INT64_MIN && pts + PTS_TOLERANCE_US < m_noElBefore) ||
+           m_noElPts.count(pts) != 0 ||
            (!m_elFrames.empty() && m_elFrames.rbegin()->first > pts + PTS_TOLERANCE_US &&
             FindPts(m_elFrames, pts) == m_elFrames.end());
   };

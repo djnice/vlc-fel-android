@@ -72,8 +72,14 @@ if ! cmp -s "$KO" "$INST"; then
   echo "module installed to $INST"
 fi
 
+FC=/sys/module/amvdec_h265_fb_v4l/parameters/decode_timeout_back_fast_check
 cat > "$D/boot/dvfel.sh.tmp" <<EOS
 #!/system/bin/sh
+# Amlogic H.265 decoder: no back-end fast check. When it times out (8-12 ms
+# without progress) and the back-end IRQ arrives anyway, vh265_back_irq_cb+0x114
+# reads NULL+0xf8 and the kernel panics. The regular 200 ms back-end timeout
+# still applies.
+[ -f $FC ] && echo 0 > $FC
 # Dolby Vision FEL composition kernel module (dvfel)
 insmod $INST || exit 1
 # ueventd creates the device node asynchronously
@@ -87,6 +93,7 @@ else
   mv "$D/boot/dvfel.sh.tmp" "$D/boot/dvfel.sh" && echo "boot script installed"
 fi
 chmod 755 "$D/boot/dvfel.sh"
+[ -f $FC ] && echo 0 > $FC && echo "H.265 back-end fast check off"
 i=0
 while [ ! -e /dev/dvfel ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 chmod 666 /dev/dvfel || exit 7

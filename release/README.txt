@@ -81,7 +81,7 @@ KÉTSÁVOS (DTDL) FEL
 TELEPÍTÉS
 ---------
 1. Az APK telepítése (pendrive + fájlkezelő, „Downloader” app, vagy: adb install VLC-FEL-*.apk).
-2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.07.1) a
+2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.15.1) a
    firmware boot-könyvtárába (<app>/config/boot/dvfel.sh), és be is tölti; ha kell, előtte
    rákérdez a root-hozzáférésre. Ezután minden bekapcsoláskor magától betöltődik.
    Régebbi modulra a telepítő sosem cserél.
@@ -102,6 +102,12 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.6-poc (dvfel 2026.10.15.1, libdvfelplay 2026.10.15.3) – nincs kernelpánik gyors leállítás /
+          indítás / tekerés után: egy lejátszás indulásakor a dvfel a saját képmásolatát adhatta vissza
+          a video composernek; most minden képet pontosan egyszer ad vissza. A boot-szkript kikapcsolja
+          az Amlogic H.265 dekóder back-end „fast check”-jét is, amely szintén kernelpánikot okozhatott.
+          Nem villog az olyan egysávos fájl, amelynek a képeinél részben hiányzik az EL és az RPU
+          (kétrétegű forrásból, eltérő EL-képsorrenddel muxolva). Frissítéskor a modult is lecseréli.
 0.2.5-poc (libdvfelplay 2026.10.15.1, VLC javítás, a modulok változatlanok) – tekerés után nem akad
           a film végéig: néha a FEL EL-dekódere egy tekerésnél beragadt, ettől kezdve minden kép késve,
           csak az alapréteggel ment, és a következő tekerés sem segített. A beragadt EL-dekódert 1,5 s
@@ -217,7 +223,7 @@ DUAL TRACK (DTDL) FEL
 INSTALLATION
 ------------
 1. Install the APK (USB stick + file manager, the "Downloader" app, or adb install VLC-FEL-*.apk).
-2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.07.1) into
+2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.15.1) into
    the firmware's boot hook directory (<app>/config/boot/dvfel.sh) and loads it, asking for root
    access first if needed. It then loads at every boot.
    The installer never replaces a newer module with an older one.
@@ -237,6 +243,12 @@ NOTES
 
 CHANGES
 -------
+0.2.6-poc (dvfel 2026.10.15.1, libdvfelplay 2026.10.15.3) – no kernel panic after quick stop / start /
+          seek: at a playback start dvfel could hand the video composer its own copy of a frame; it now
+          gives back every frame exactly once. The boot script also turns off the Amlogic H.265
+          decoder's back-end fast check, which could panic the kernel too. No flicker with single track
+          files whose pictures partly lack the EL and the RPU (muxed from a dual layer source with
+          another EL picture order). The update replaces the module too.
 0.2.5-poc (libdvfelplay 2026.10.15.1, VLC fix, modules unchanged) – no stutter for the rest of the
           film after a seek: once in a while the FEL's EL decoder got stuck at a seek, from then on every
           frame was late and base layer only, and the next seek did not help. A stuck EL decoder is now

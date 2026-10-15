@@ -146,8 +146,10 @@ DVFP_EXPORT int dvfp_mode(const dvfp* h);
 /*
  * filters one Annex-B access unit. *out (owned by the handle, valid until the
  * next call of any dvfp function on it) is what goes to the decoder. An RPU
- * that cannot be converted goes unchanged (logged). Returns 0, < 0 on invalid
- * arguments (*out is then the input).
+ * that cannot be converted goes unchanged (logged). A picture without an RPU
+ * in a stream that had one gets the last RPU again (the Dolby Vision decoder
+ * and the composition then keep the mapping instead of showing the base layer
+ * as it is). Returns 0, < 0 on invalid arguments (*out is then the input).
  */
 DVFP_EXPORT int dvfp_filter(dvfp* h, const uint8_t* in, size_t size, const uint8_t** out,
                             size_t* out_size);

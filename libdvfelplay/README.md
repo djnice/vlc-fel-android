@@ -50,6 +50,10 @@ Switches (`adb shell setprop`): `debug.dvfp.test.fel` (0: conversion only), `deb
 times, 2: frame times and the player's release lead, every 5 s), `debug.dvfp.lead_ms` (lead time override, 0:
 off), `debug.dvfp.dump` (frames for `tools/felbench`).
 
+`test/au_check.sh dvfptest.apk test.au [seek s]` plays the file to its end and fails on frames shown without
+their RPU, a stalled EL decoder or late frames (e.g. Dune HD's `MP4_P7_FEL_STDL.mp4`, whose access units from
+frame 105 on are about half without EL and RPU).
+
 
 ## License
 

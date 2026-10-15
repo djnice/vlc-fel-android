@@ -143,7 +143,7 @@ the first MVC file is to play in 3D.
 | `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix), 0011 the demo mode option, 0012 subtitles drawn at the display's size, 0013 pictures released at their time before the subtitles (no dropped frames at subtitle changes), 0014 the live level 1 / level 5 of the RPUs for a player's information panel (a file in the app's files dir, only while asked for), 0015 Dolby Vision pictures released 140 ms ahead up to 30 fps, 0016 those levels in time with the picture on the screen, 0017 a disabled track plays when no track of its kind is enabled (Matroska FlagEnabled 0, MP4 tkhd). |
 | `vlc/android-patches/` | Patches for the vlc-android app (`fc5fa1f`): 0001 the player menu's *Dolby Vision demo* switch. |
 | `vlc/build-in-docker.sh` | The APK build (vlc-android `fc5fa1f`, libvlcjni-3.x, armeabi-v7a) in VideoLAN's docker image; package `org.videolan.vlc.fel`, name "VLC FEL". |
-| `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `sync.sh` (maintainer: copies the working sources here), `tests/` (cadence and pause/seek measurements over adb). |
+| `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `sync.sh` (maintainer: copies the working sources here), `tests/` (cadence and pause/seek measurements, the stop / start / seek stress test `stopstart.sh`, over adb). |
 | `docs/NOTES.md` | Technical notes and pitfalls of this firmware, the lead time, VLC. |
 
 ## Building (outline)
@@ -192,6 +192,16 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.6-poc** (kernel module `dvfel 2026.10.15.1`, libdvfelplay `2026.10.15.3`; VLC patches unchanged): no
+  more **kernel panics** after quick stop / start / seek actions. When the display buffers were reallocated at a
+  playback start, dvfel could reserve a slot twice and hand the video composer its own copy of a frame; it now
+  keeps its reserved slots and gives back each upstream frame exactly once (anything else is refused and logged).
+  The boot script also turns off the Amlogic H.265 decoder's back-end fast check
+  (`decode_timeout_back_fast_check`), whose race with the back-end interrupt panicked the kernel
+  (`vh265_back_irq_cb`); the regular 200 ms back-end timeout still applies. **No flicker** with single track
+  files whose access units partly lack the EL and the RPU (muxed from a dual layer source with another EL
+  picture order): such a picture gets the last RPU again, and the EL decoder waits for its next key picture
+  instead of stalling. Test: `tools/tests/stopstart.sh`.
 - **v0.2.5-poc** (libdvfelplay `2026.10.15.1`, VLC patches 0016, 0017; kernel modules unchanged): no more
   stutter for the rest of the film after a seek – once in a while the FEL's enhancement layer decoder got stuck
   at a seek (pictures in it, nothing out); every frame then fell back to the base layer, late, and the next seek
