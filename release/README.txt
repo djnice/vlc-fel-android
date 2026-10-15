@@ -102,6 +102,11 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.5-poc (libdvfelplay 2026.10.15.1, VLC javítás, a modulok változatlanok) – tekerés után nem akad
+          a film végéig: néha a FEL EL-dekódere egy tekerésnél beragadt, ettől kezdve minden kép késve,
+          csak az alapréteggel ment, és a következő tekerés sem segített. A beragadt EL-dekódert 1,5 s
+          után kiüríti, és a következő kulcsképtől újraindul. A libVLC a letiltottként jelölt sávot is
+          kiválasztja, ha a fajtájából nincs engedélyezett (MKV FlagEnabled 0, MP4 tkhd).
 0.2.4-poc (VLC javítás, a modulok és a libdvfelplay változatlanok) – 2160p-s kimeneten sem akad a
           felirat: 30 fps-ig a Dolby Vision képek 140 ms-mal előbb mennek a kijelzőre (eddig 80), így a
           feliratváltás 20–60 ms-os kirajzolása nem visz el képkockát. 1080p-n ezt már a 0.2.3 is tudta.
@@ -232,6 +237,11 @@ NOTES
 
 CHANGES
 -------
+0.2.5-poc (libdvfelplay 2026.10.15.1, VLC fix, modules unchanged) – no stutter for the rest of the
+          film after a seek: once in a while the FEL's EL decoder got stuck at a seek, from then on every
+          frame was late and base layer only, and the next seek did not help. A stuck EL decoder is now
+          emptied after 1.5 s and starts again at its next key picture. libVLC selects a track marked
+          disabled when none of its kind is enabled (MKV FlagEnabled 0, MP4 tkhd).
 0.2.4-poc (VLC fix, modules and libdvfelplay unchanged) – no subtitle stutter with a 2160p output
           either: up to 30 fps Dolby Vision pictures reach the display 140 ms ahead (was 80), so the
           20–60 ms a subtitle change takes to render no longer costs a frame. 0.2.3 did so at 1080p.

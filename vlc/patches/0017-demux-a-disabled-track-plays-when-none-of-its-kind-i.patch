@@ -1,0 +1,111 @@
+From 1c340ac01ce7f51591f0ba8893e349e660fa6879 Mon Sep 17 00:00:00 2001
+Message-Id: <1c340ac01ce7f51591f0ba8893e349e660fa6879.1792051884.git.djnice@freemail.hu>
+From: djnice <djnice@freemail.hu>
+Date: Thu, 15 Oct 2026 10:02:27 +0200
+Subject: [PATCH] demux: a disabled track plays when none of its kind is
+ enabled
+
+Some files carry the only video (or audio) track with its enabled flag off
+(Matroska FlagEnabled 0, MP4 tkhd without track_enabled). VLC made such a
+track not selectable (MP4: not defaultable): no picture (or no sound) until
+it was picked by hand, while other players ignore the flag. Now, when no
+track of that kind is enabled, the disabled ones count as enabled.
+---
+ modules/demux/mkv/matroska_segment.cpp | 26 +++++++++++++++++++
+ modules/demux/mp4/mp4.c                | 36 ++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/modules/demux/mkv/matroska_segment.cpp b/modules/demux/mkv/matroska_segment.cpp
+index 5905e92295..a1d32a7021 100644
+--- a/modules/demux/mkv/matroska_segment.cpp
++++ b/modules/demux/mkv/matroska_segment.cpp
+@@ -933,6 +933,32 @@ void matroska_segment_c::ComputeTrackPriority()
+ {
+     bool b_has_default_video = false;
+     bool b_has_default_audio = false;
++
++    /* A video / audio category with no enabled track (FlagEnabled 0 on its
++     * only track, written so by some muxing tools): its tracks count as
++     * enabled. Other players ignore the flag; here such a file played without
++     * a picture (or a sound) until the track was picked by hand. */
++    bool b_enabled_video = false;
++    bool b_enabled_audio = false;
++    for( tracks_map_t::const_iterator it = tracks.begin(); it != tracks.end(); ++it )
++    {
++        const mkv_track_t &track = *it->second;
++        if( track.b_enabled && track.fmt.i_cat == VIDEO_ES ) b_enabled_video = true;
++        if( track.b_enabled && track.fmt.i_cat == AUDIO_ES ) b_enabled_audio = true;
++    }
++    for( tracks_map_t::iterator it = tracks.begin(); it != tracks.end(); ++it )
++    {
++        mkv_track_t &track = *it->second;
++        if( !track.b_enabled &&
++            ( ( track.fmt.i_cat == VIDEO_ES && !b_enabled_video ) ||
++              ( track.fmt.i_cat == AUDIO_ES && !b_enabled_audio ) ) )
++        {
++            msg_Warn( &sys.demuxer, "track %u disabled, but none of its kind is enabled: enabled",
++                      static_cast<unsigned>( it->first ) );
++            track.b_enabled = true;
++        }
++    }
++
+     /* check for default */
+     for( tracks_map_t::const_iterator it = tracks.begin(); it != tracks.end();
+          ++it )
+diff --git a/modules/demux/mp4/mp4.c b/modules/demux/mp4/mp4.c
+index af4ebdeff3..094d7e9acb 100644
+--- a/modules/demux/mp4/mp4.c
++++ b/modules/demux/mp4/mp4.c
+@@ -3645,6 +3645,29 @@ static void MP4_TrackRestart( demux_t *p_demux, mp4_track_t *p_track,
+  * Parse track information and create all needed data to run a track
+  * If it succeed b_ok is set to 1 else to 0
+  ****************************************************************************/
++/* Another track of the same handler type (vide / soun) as p_box_trak has its
++ * tkhd enabled flag */
++static bool MP4_KindHasEnabledTrack( demux_t *p_demux, const MP4_Box_t *p_box_trak )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    const MP4_Box_t *p_hdlr = MP4_BoxGet( (MP4_Box_t *) p_box_trak, "mdia/hdlr" );
++    if( !p_hdlr || !BOXDATA(p_hdlr) )
++        return true;
++    for( unsigned i = 0; i < p_sys->i_tracks; i++ )
++    {
++        MP4_Box_t *p_trak = MP4_BoxGetVa( p_sys->p_root, "/moov/trak[%u]", i );
++        if( !p_trak || p_trak == p_box_trak )
++            continue;
++        const MP4_Box_t *p_tkhd = MP4_BoxGet( p_trak, "tkhd" );
++        const MP4_Box_t *p_other = MP4_BoxGet( p_trak, "mdia/hdlr" );
++        if( p_tkhd && BOXDATA(p_tkhd) && ( BOXDATA(p_tkhd)->i_flags & MP4_TRACK_ENABLED ) &&
++            p_other && p_other->data.p_hdlr &&
++            p_other->data.p_hdlr->i_handler_type == BOXDATA(p_hdlr)->i_handler_type )
++            return true;
++    }
++    return false;
++}
++
+ static void MP4_TrackSetup( demux_t *p_demux, mp4_track_t *p_track,
+                              MP4_Box_t *p_box_trak,
+                              bool b_create_es, bool b_force_enable )
+@@ -3903,6 +3926,19 @@ static void MP4_TrackSetup( demux_t *p_demux, mp4_track_t *p_track,
+         p_track->fmt.i_priority = ES_PRIORITY_NOT_DEFAULTABLE;
+     }
+ 
++    /* A disabled video / audio track when no other track of its kind is
++     * enabled (some muxers leave the video's tkhd flag unset): selected like
++     * an enabled one, as other players do; else no picture (or sound) until
++     * it is picked by hand */
++    if( !p_track->b_enable && !p_track->b_chapters_source &&
++        ( p_track->fmt.i_cat == VIDEO_ES || p_track->fmt.i_cat == AUDIO_ES ) &&
++        !MP4_KindHasEnabledTrack( p_demux, p_box_trak ) )
++    {
++        msg_Warn( p_demux, "Enabling track[Id 0x%x] (disabled, none of its kind enabled)",
++                  p_track->i_track_ID );
++        p_track->b_enable = true;
++    }
++
+     if( !p_track->b_enable || p_track->b_chapters_source )
+         p_track->fmt.i_priority = ES_PRIORITY_NOT_DEFAULTABLE;
+ 
+-- 
+2.55.0.windows.3
+

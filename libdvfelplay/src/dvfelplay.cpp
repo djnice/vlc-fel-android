@@ -78,7 +78,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.13.1"
+#define DVFP_VERSION "2026.10.15.1"
 
 namespace
 {
@@ -108,6 +108,8 @@ constexpr int HW_EL_IMAGE_WAIT_MS = 40;
 // a picture still in the EL decoder this far (us) behind its latest output
 // will not come out any more (dropped by the decoder as broken)
 constexpr int64_t EL_LOST_US = 1000000;
+// no input buffer and no output for this long: the EL decoder is stuck, it is flushed
+constexpr int EL_STALL_MS = 1500;
 
 // test switches (adb shell setprop ...), read once a second while composing
 constexpr const char* PROP_DITHER = "debug.dvfp.dither";   // 0 round, 1 dither (default), 2 half
@@ -1243,6 +1245,14 @@ void dvfp::ElThread()
   bool reordered = false;
   int64_t lastLabel = INT64_MIN;
   bool needIrap = true, skipRasl = false;
+  // the EL's last parameter sets (VPS / SPS / PPS, Annex B, by type): an EL
+  // track may carry them at its start only, and the decoder forgets them at a
+  // flush - after a seek it then decoded nothing (every frame fell back to
+  // the base layer, late). They go in front of the first IRAP after a flush
+  // that does not carry its own.
+  std::map<int, std::vector<uint8_t>> params;
+  bool resendParams = false;
+  int paramsResent = 0;
   uint64_t importErrors = 0, importUs = 0, imports = 0;
   uint64_t staleImages = 0, lateImages = 0;
   int truncated = 0;
@@ -1423,6 +1433,34 @@ void dvfp::ElThread()
     return true;
   };
 
+  // empties the decoder (a seek, or a stalled decoder): the EL starts again at
+  // its next IRAP, the frames before it are shown without EL at once
+  auto flushDecoder = [&] {
+    AMediaCodec_flush(codec);
+    m_elOutputs = m_elInputs.load(); // the pictures in the decoder are gone
+    inFlight.clear();
+    m_elInFlight = 0;
+    // pictures released to the reader before the flush
+    AImage* image = nullptr;
+    while (AImageReader_acquireNextImage(reader, &image) == AMEDIA_OK)
+      AImage_delete(image);
+    slots.clear();
+    metas.clear();
+    skipped = 0;
+    lastLabel = INT64_MIN;
+    needIrap = true;
+    skipRasl = false;
+    resendParams = true;
+    std::lock_guard<std::mutex> lock(m_lock);
+    for (auto& f : m_elFrames)
+      ReleaseElFrame(f.second);
+    m_elFrames.clear();
+    m_noElBefore = INT64_MAX; // until the first IRAP of the EL
+  };
+  int stalls = 0;
+  uint64_t idleOuts = 0;
+  auto idleFrom = std::chrono::steady_clock::now();
+
   while (!m_stop)
   {
     ElPacket in;
@@ -1454,41 +1492,72 @@ void dvfp::ElThread()
     if (!have)
     {
       drain(0);
+      // the pool counts the pictures in the decoder: a decoder that keeps a
+      // pool's worth and gives nothing out would block the feeding for good
+      const uint64_t outs = m_elOutputs.load();
+      const auto now = std::chrono::steady_clock::now();
+      if (outs != idleOuts || m_elInFlight < EL_POOL)
+      {
+        idleOuts = outs;
+        idleFrom = now;
+      }
+      else if (now - idleFrom > std::chrono::milliseconds(EL_STALL_MS))
+      {
+        if (stalls++ < 10)
+          LOGW("EL decoder stalled (%d pictures in it, the pool full, no output for %d ms): flushed",
+               m_elInFlight.load(), EL_STALL_MS);
+        flushDecoder();
+        idleFrom = now;
+      }
       continue;
     }
 
     if (in.flush)
     {
-      AMediaCodec_flush(codec);
-      m_elOutputs = m_elInputs.load(); // the pictures in the decoder are gone
-      inFlight.clear();
-      m_elInFlight = 0;
-      // pictures released to the reader before the flush
-      AImage* image = nullptr;
-      while (AImageReader_acquireNextImage(reader, &image) == AMEDIA_OK)
-        AImage_delete(image);
-      slots.clear();
-      metas.clear();
-      skipped = 0;
-      lastLabel = INT64_MIN;
-      needIrap = true;
-      skipRasl = false;
-      std::lock_guard<std::mutex> lock(m_lock);
-      for (auto& f : m_elFrames)
-        ReleaseElFrame(f.second);
-      m_elFrames.clear();
-      m_noElBefore = INT64_MAX; // until the first IRAP of the EL
+      flushDecoder();
       continue;
     }
 
     int type;
     bool endOfSeq;
     ScanNals(in.data, type, endOfSeq);
+    // the access unit's parameter sets (base layer id only) replace the kept ones of their type
+    bool hasSps = false;
+    {
+      std::map<int, std::vector<uint8_t>> found;
+      ForEachNal(in.data.data(), in.data.size(), [&](const uint8_t* nal, size_t n) {
+        if (n < 2)
+          return;
+        const int t = NalType(nal);
+        const int layer = ((nal[0] & 1) << 5) | (nal[1] >> 3);
+        if (layer != 0 || t < 32 || t > 34)
+          return;
+        if (t == 33)
+          hasSps = true;
+        static const uint8_t startCode[4] = {0, 0, 0, 1};
+        auto& v = found[t];
+        v.insert(v.end(), startCode, startCode + 4);
+        v.insert(v.end(), nal, nal + n);
+      });
+      for (auto& f : found)
+        params[f.first] = std::move(f.second);
+    }
     if (type < 0)
       continue;
     bool decode = true;
     if (type >= 16 && type <= 23) // IRAP: BLA 16-18, IDR 19-20, CRA 21
     {
+      if (resendParams && !hasSps && params.count(33))
+      {
+        std::vector<uint8_t> ps;
+        for (auto& p : params)
+          ps.insert(ps.end(), p.second.begin(), p.second.end());
+        in.data.insert(in.data.begin(), ps.begin(), ps.end());
+        if (paramsResent++ < 5)
+          LOGI("EL parameter sets (%zu bytes) resent before the IRAP at %lld us after a flush", ps.size(),
+               (long long)in.pts);
+      }
+      resendParams = false;
       skipRasl = type <= 18 || (type == 21 && needIrap);
       if (needIrap)
       {
@@ -1515,8 +1584,15 @@ void dvfp::ElThread()
     while (metas.size() > 4 * EL_POOL) // never output, e.g. broken pictures
       metas.erase(metas.begin());
 
-    // an input buffer; decoded pictures are taken out meanwhile
+    // an input buffer; decoded pictures are taken out meanwhile. A decoder
+    // that neither takes input nor gives output (seen once after a seek: 12
+    // pictures in it, nothing out, for the rest of the film - this loop never
+    // got to the next seek's flush either) is flushed after EL_STALL_MS, and
+    // a flush queued meanwhile (a seek) is not kept waiting.
     ssize_t idx;
+    const auto waitFrom = std::chrono::steady_clock::now();
+    const uint64_t outsBefore = m_elOutputs.load();
+    bool flushed = false;
     while ((idx = AMediaCodec_dequeueInputBuffer(codec, 0)) < 0 && !m_stop)
     {
       if (!drain(5000))
@@ -1524,9 +1600,27 @@ void dvfp::ElThread()
         std::unique_lock<std::mutex> lock(m_lock);
         m_elCond.wait_for(lock, std::chrono::milliseconds(5));
       }
+      bool seek;
+      {
+        std::lock_guard<std::mutex> lock(m_lock);
+        seek = !m_elQueue.empty() && m_elQueue.front().flush;
+      }
+      const bool stalled = m_elOutputs.load() == outsBefore &&
+                           std::chrono::steady_clock::now() - waitFrom > std::chrono::milliseconds(EL_STALL_MS);
+      if (seek || stalled)
+      {
+        if (stalled && stalls++ < 10)
+          LOGW("EL decoder stalled (%d pictures in it, no output for %d ms): flushed", m_elInFlight.load(),
+               EL_STALL_MS);
+        flushDecoder();
+        flushed = true;
+        break;
+      }
     }
-    if (idx < 0)
+    if (m_stop)
       break;
+    if (flushed || idx < 0)
+      continue; // this picture is dropped: the EL starts again at its next IRAP
     size_t cap = 0;
     uint8_t* p = AMediaCodec_getInputBuffer(codec, idx, &cap);
     const size_t size = std::min(cap, in.data.size());

@@ -1,0 +1,209 @@
+From faa47aca892bfb4acfd5df1090e7638f7af6ff8f Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 14 Oct 2026 16:08:52 +0200
+Subject: [PATCH] mediacodec: the information panel's RPU levels in time with
+ the picture
+
+The levels were those of the access units going into the decoder, ahead of
+the picture on the screen by the decoder's delay, the release ahead and the
+FEL lead time (about half a second). They are now kept by the access unit's
+pts, and written with the display time of their picture (CLOCK_MONOTONIC
+ns, the release time plus the FEL lead time) when it is released to the
+display: "display_ns min max avg [left right top bottom]" per line, the
+app shows the line whose time came.
+
+Message-Id: <20261014-dvfel-mediacodec-dovi-info-sync@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 96 +++++++++++++++++++++++++++-----
+ 1 file changed, 81 insertions(+), 15 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 905505c7fc..25c2cc1e69 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -28,6 +28,7 @@
+ #endif
+ 
+ #include <stdint.h>
++#include <inttypes.h>
+ #include <assert.h>
+ 
+ #include <vlc_common.h>
+@@ -67,6 +68,13 @@
+  * are those of the library's API version 1.
+  */
+ typedef struct dvfp dvfp;
++
++/* the information panel's RPU levels: by the access unit's pts, and on their
++ * way to the display (CLOCK_MONOTONIC ns of the picture's display) */
++#define DVINFO_RING 64
++#define DVINFO_SHOW 24
++struct dvinfo_lv { vlc_tick_t i_pts; int l1[3], l5[4]; };
++struct dvinfo_show { int64_t i_ns; int l1[3], l5[4]; };
+ struct dvfp_rpu_info
+ {
+     int has_rpu;
+@@ -338,6 +346,12 @@ struct decoder_sys_t
+             char *psz_dvinfo; /* <app files>/ */
+             vlc_tick_t i_dvinfo_check, i_dvinfo_write;
+             bool b_dvinfo_on;
++            vlc_mutex_t dvinfo_lock;
++            struct dvinfo_lv dvinfo_ring[DVINFO_RING]; /* written by the input */
++            unsigned i_dvinfo_ring;
++            vlc_tick_t dvinfo_out_pts[DVINFO_RING]; /* by output buffer index */
++            struct dvinfo_show dvinfo_show[DVINFO_SHOW]; /* by display time */
++            unsigned i_dvinfo_show;
+             /* 3D MVC: decided by the first access units */
+             int i_mvc_probe; /* access units still to look at */
+             mvc3d *p_mvc;
+@@ -368,6 +382,7 @@ static int VideoVC1_OnNewBlock(decoder_t *, block_t **);
+ static void DoviProbe(decoder_t *, const block_t *);
+ static int DoviFilter(decoder_t *, block_t **);
+ static void DoviInfo(decoder_t *, const block_t *);
++static void DoviInfoShown(decoder_t *, unsigned, int64_t);
+ static char *DoviInfoDir(void);
+ static void MvcProbe(decoder_t *, const block_t *);
+ static void Video_OnFlush(decoder_t *);
+@@ -1140,6 +1155,8 @@ static void CleanDecoder(decoder_t *p_dec)
+     {
+         if (p_sys->video.p_dvfp)
+             dvfp_api.close(p_sys->video.p_dvfp);
++        if (p_sys->video.psz_dvinfo)
++            vlc_mutex_destroy(&p_sys->video.dvinfo_lock);
+         free(p_sys->video.psz_dvinfo);
+         if (p_sys->video.p_mvc)
+             mvc_api.close(p_sys->video.p_mvc);
+@@ -1195,6 +1212,10 @@ static void ReleasePictureTs(decoder_t *p_dec, unsigned i_index, vlc_tick_t i_ts
+     if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns)
+         i_ns = dvfp_api.snap_present_ns(i_ns + DoviReleaseAhead(p_dec, p_sys->video.b_dovi) * INT64_C(1000));
+     p_sys->api.release_out_ts(&p_sys->api, i_index, i_ns);
++    /* the information panel: the picture is shown at i_ns, FEL a lead time later */
++    if (p_sys->video.b_dovi && p_sys->video.psz_dvinfo && p_sys->video.b_dvinfo_on)
++        DoviInfoShown(p_dec, i_index, i_ns + (p_sys->video.p_dvfp && dvfp_api.present_lead_ns
++                                              ? dvfp_api.present_lead_ns(p_sys->video.p_dvfp) : 0));
+ }
+ 
+ static void InvalidateAllPictures(decoder_t *p_dec)
+@@ -1294,6 +1315,8 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+         if (p_sys->api.b_direct_rendering)
+         {
+             p_pic->p_sys->hw.i_index = p_out->buf.i_index;
++            if (p_sys->video.b_dovi && p_sys->video.psz_dvinfo)
++                p_sys->video.dvinfo_out_pts[p_out->buf.i_index % DVINFO_RING] = p_out->buf.i_ts;
+             InsertInflightPicture(p_dec, p_pic->p_sys);
+         } else {
+             unsigned int chroma_div;
+@@ -2097,6 +2120,8 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+     p_sys->video.p_dvfp = p_dvfp;
+     p_sys->video.b_dovi = true;
+     p_sys->video.psz_dvinfo = DoviInfoDir();
++    if (p_sys->video.psz_dvinfo)
++        vlc_mutex_init(&p_sys->video.dvinfo_lock);
+     p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+ 
+@@ -2181,10 +2206,10 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+ /*
+  * The player's information panel: the live Dolby Vision level 1 (min / max /
+  * average PQ of the RPU's DM data, 12 bits) and level 5 (active area offsets:
+- * left, right, top, bottom) of the access units going to the decoder, written
+- * to <app files>/dvinfo ("min max avg" and, with a level 5, "left right top
+- * bottom") about 4 times a second while <app files>/dvinfo_on exists (looked
+- * for once a second).
++ * left, right, top, bottom) of the pictures, with the time each one is
++ * displayed: kept by the access unit's pts on the way in, written to
++ * <app files>/dvinfo when the picture is released to the display, while
++ * <app files>/dvinfo_on exists (looked for once a second).
+  */
+ struct dv_bits
+ {
+@@ -2395,7 +2420,7 @@ static void DoviInfo(decoder_t *p_dec, const block_t *p_block)
+         p_sys->video.b_dvinfo_on = access(psz_path, F_OK) == 0;
+         p_sys->video.i_dvinfo_check = now;
+     }
+-    if (!p_sys->video.b_dvinfo_on || now - p_sys->video.i_dvinfo_write < CLOCK_FREQ / 4)
++    if (!p_sys->video.b_dvinfo_on)
+         return;
+ 
+     /* the RPU: NAL unit type 62 of the Annex B access unit */
+@@ -2425,26 +2450,67 @@ static void DoviInfo(decoder_t *p_dec, const block_t *p_block)
+             rpu[k++] = p[j];
+             zeros = p[j] == 0 ? zeros + 1 : 0;
+         }
+-        int pi_l1[3], pi_l5[4] = { -1, -1, -1, -1 };
+-        if (!DoviRpuL1(rpu, k, pi_l1, pi_l5))
++        struct dvinfo_lv lv = { .l5 = { -1, -1, -1, -1 } };
++        if (!DoviRpuL1(rpu, k, lv.l1, lv.l5))
+             return;
+-        char psz_tmp[310];
+-        snprintf(psz_path, sizeof(psz_path), "%sdvinfo", psz_dir);
++        /* the pts the decoder gets (as queued: pts, else dts) */
++        lv.i_pts = p_block->i_pts != VLC_TICK_INVALID ? p_block->i_pts : p_block->i_dts;
++        vlc_mutex_lock(&p_sys->video.dvinfo_lock);
++        p_sys->video.dvinfo_ring[p_sys->video.i_dvinfo_ring++ % DVINFO_RING] = lv;
++        vlc_mutex_unlock(&p_sys->video.dvinfo_lock);
++        return;
++    }
++}
++
++/*
++ * A picture released to the display at i_ns (CLOCK_MONOTONIC): its levels
++ * (by the pts of its output buffer) into the display-time list, and the list
++ * to <app files>/dvinfo ("display_ns min max avg [left right top bottom]" per
++ * line) at most 10 times a second; the app shows the line whose time came.
++ */
++static void DoviInfoShown(decoder_t *p_dec, unsigned i_index, int64_t i_ns)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    const vlc_tick_t i_pts = p_sys->video.dvinfo_out_pts[i_index % DVINFO_RING];
++    const vlc_tick_t now = mdate();
++
++    vlc_mutex_lock(&p_sys->video.dvinfo_lock);
++    for (unsigned i = 0; i < DVINFO_RING; i++)
++    {
++        const struct dvinfo_lv *lv = &p_sys->video.dvinfo_ring[i];
++        if (lv->i_pts != i_pts || i_pts == VLC_TICK_INVALID)
++            continue;
++        struct dvinfo_show *sh = &p_sys->video.dvinfo_show[p_sys->video.i_dvinfo_show++ % DVINFO_SHOW];
++        sh->i_ns = i_ns;
++        memcpy(sh->l1, lv->l1, sizeof(sh->l1));
++        memcpy(sh->l5, lv->l5, sizeof(sh->l5));
++        break;
++    }
++    if (now - p_sys->video.i_dvinfo_write >= CLOCK_FREQ / 10)
++    {
++        char psz_path[300], psz_tmp[310];
++        snprintf(psz_path, sizeof(psz_path), "%sdvinfo", p_sys->video.psz_dvinfo);
+         snprintf(psz_tmp, sizeof(psz_tmp), "%s.tmp", psz_path);
+         FILE *f = fopen(psz_tmp, "w");
+         if (f)
+         {
+-            if (pi_l5[0] >= 0)
+-                fprintf(f, "%d %d %d %d %d %d %d\n", pi_l1[0], pi_l1[1], pi_l1[2],
+-                        pi_l5[0], pi_l5[1], pi_l5[2], pi_l5[3]);
+-            else
+-                fprintf(f, "%d %d %d\n", pi_l1[0], pi_l1[1], pi_l1[2]);
++            /* oldest first */
++            const unsigned n = p_sys->video.i_dvinfo_show;
++            for (unsigned k = n > DVINFO_SHOW ? n - DVINFO_SHOW : 0; k < n; k++)
++            {
++                const struct dvinfo_show *sh = &p_sys->video.dvinfo_show[k % DVINFO_SHOW];
++                if (sh->l5[0] >= 0)
++                    fprintf(f, "%" PRId64 " %d %d %d %d %d %d %d\n", sh->i_ns, sh->l1[0], sh->l1[1], sh->l1[2],
++                            sh->l5[0], sh->l5[1], sh->l5[2], sh->l5[3]);
++                else
++                    fprintf(f, "%" PRId64 " %d %d %d\n", sh->i_ns, sh->l1[0], sh->l1[1], sh->l1[2]);
++            }
+             fclose(f);
+             rename(psz_tmp, psz_path);
+         }
+         p_sys->video.i_dvinfo_write = now;
+-        return;
+     }
++    vlc_mutex_unlock(&p_sys->video.dvinfo_lock);
+ }
+ 
+ /* the access unit as the Dolby Vision decoder gets it */
+-- 
+2.55.0.windows.3
+
