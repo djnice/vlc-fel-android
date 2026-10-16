@@ -192,6 +192,10 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.7-poc** (libdvfelplay `2026.10.16.1`; modules and VLC patches unchanged): no **stutter in the FEL demo
+  mode**. Its level 1 measurement was read back from the GPU synchronously every frame, which stalled the
+  composition mid-frame; a heavy 4K 24p film went over its frame time in 30–39 of 100 frames. Now every 6th
+  frame is measured and read back without waiting (the readout changes 4 times a second anyway).
 - **v0.2.6-poc** (kernel module `dvfel 2026.10.15.1`, libdvfelplay `2026.10.15.3`; VLC patches unchanged): no
   more **kernel panics** after quick stop / start / seek actions. When the display buffers were reallocated at a
   playback start, dvfel could reserve a slot twice and hand the video composer its own copy of a frame; it now

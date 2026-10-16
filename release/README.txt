@@ -102,6 +102,10 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.7-poc (libdvfelplay 2026.10.16.1, a modulok és a VLC-javítások változatlanok) – nem akad a FEL
+          demó mód: a demó L1-mérését minden képkockánál várakozással olvasta vissza a GPU-ról, ettől egy
+          nehéz 4K 24p filmnél 100 képből 30–39 lekéste a vsync-et. Most minden 6. képet mér, és
+          várakozás nélkül olvassa vissza (a kijelzés úgyis másodpercenként 4-szer frissül).
 0.2.6-poc (dvfel 2026.10.15.1, libdvfelplay 2026.10.15.3) – nincs kernelpánik gyors leállítás /
           indítás / tekerés után: egy lejátszás indulásakor a dvfel a saját képmásolatát adhatta vissza
           a video composernek; most minden képet pontosan egyszer ad vissza. A boot-szkript kikapcsolja
@@ -243,6 +247,10 @@ NOTES
 
 CHANGES
 -------
+0.2.7-poc (libdvfelplay 2026.10.16.1, modules and VLC patches unchanged) – no stutter in the FEL
+          demo mode: its level 1 measurement was read back from the GPU with a wait every frame, so on
+          a heavy 4K 24p film 30–39 of 100 frames missed their vsync. Now every 6th frame is measured
+          and read back without waiting (the readout changes 4 times a second anyway).
 0.2.6-poc (dvfel 2026.10.15.1, libdvfelplay 2026.10.15.3) – no kernel panic after quick stop / start /
           seek: at a playback start dvfel could hand the video composer its own copy of a frame; it now
           gives back every frame exactly once. The boot script also turns off the Amlogic H.265

@@ -50,6 +50,10 @@ struct felgpu {
     int stats_valid;
     struct felgpu_stats stat;
     GLuint *red_buf;
+    GLuint pbo;                     /* the reduction's readback (GL_PIXEL_PACK_BUFFER) */
+    GLsync fence;                   /* the readback in flight, 0: none */
+    unsigned measure_n;             /* frames since the demo mode's start */
+    int m_gx0, m_gx1;               /* the sample columns of the measurement in flight */
     int l5[4], use_l5;              /* active area from the RPU */
     int bars, bars_pend, bars_n;    /* letterbox bars found in the picture, in sample rows */
     int txt[2 * FELGPU_OVERLAY_LINES * FELGPU_OVERLAY_LEN], txt_len[2 * FELGPU_OVERLAY_LINES];
@@ -177,6 +181,14 @@ static const char *fs_el_unpack_c =
 
 /* demo mode: the L1 measurement samples every STATS_STEP-th pixel */
 #define STATS_STEP 8
+/*
+ * the L1 readout is drawn 4 times a second: every MEASURE_EVERY-th frame is
+ * measured, its result read back without waiting (a pixel pack buffer and a
+ * fence, taken a few frames later). A glReadPixels into memory each frame
+ * waited for the GPU in the middle of the frame (+15 ms a frame on a heavy
+ * film, a 4K24 FEL composition over its 41.7 ms).
+ */
+#define MEASURE_EVERY 6
 /* samples per fragment of the first reduction, the CPU sums the rest */
 #define REDUCE_W 16
 /* overlay text luma, 10-bit limited range (about 200 cd/m^2) */
@@ -727,6 +739,10 @@ struct felgpu *felgpu_create(int w, int h, int taps)
     f->fbo_red = make_fbo(f->red);
     /* the readback, then the brightest sample of each row */
     f->red_buf = calloc((size_t)f->rw * f->sh * 4 + f->sh, sizeof(GLuint));
+    glGenBuffers(1, &f->pbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, f->pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)f->rw * f->sh * 4 * sizeof(GLuint), NULL, GL_STREAM_READ);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     f->bars_pend = f->sh;
     for (size_t g = 0; g < sizeof(font_rows) / sizeof(font_rows[0]) && g < 32; g++) {
         GLuint rows = 0, rows2 = 0;
@@ -769,6 +785,9 @@ void felgpu_destroy(struct felgpu *f)
     glDeleteProgram(f->p_luma);
     glDeleteProgram(f->p_stats);
     glDeleteProgram(f->p_reduce);
+    if (f->fence)
+        glDeleteSync(f->fence);
+    glDeleteBuffers(1, &f->pbo);
     free(f->red_buf);
     free(f);
 }
@@ -918,8 +937,8 @@ static void sample_range(int n, int samples, int lo, int hi, int *g0, int *g1)
 
 /* letterbox bars: rows whose brightest sample stays below this 12-bit PQ code (about 0.03 cd/m^2) */
 #define BAR_PQ 150
-/* frames a larger bar has to be seen before it is taken (a dark scene may extend the bars) */
-#define BAR_FRAMES 48
+/* frames a larger bar has to be seen before it is taken (a dark scene may extend the bars), in measurements */
+#define BAR_FRAMES (48 / MEASURE_EVERY)
 
 /*
  * letterbox bars in sample rows from the brightest BL sample of each row: the
@@ -952,30 +971,10 @@ static void find_bars(struct felgpu *f, const GLuint *row_max)
     }
 }
 
-/* demo mode: L1 of the composed picture and of the base layer (see felgpu_get_stats) */
-static void measure(struct felgpu *f, GLuint bl_tex)
+/* demo mode: the L1 of a measurement read back (f->red_buf), see felgpu_get_stats */
+static void measure_result(struct felgpu *f)
 {
-    int gx0, gx1, gy0, gy1;
-    sample_range(f->w, f->sw, f->use_l5 ? f->l5[0] : 0, f->use_l5 ? f->l5[1] : 0, &gx0, &gx1);
-
-    GLuint p = f->p_stats;
-    glUseProgram(p);
-    glUniform2i(glGetUniformLocation(p, "act_x"), gx0, gx1);
-    glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
-    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
-    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);
-    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_y);
-    bind_tex(p, "bl", 0, bl_tex);
-    bind_tex(p, "ely", 1, f->el_yv);
-    bind_tex(p, "chroma", 2, f->chroma);
-    bind_tex(p, "lut", 3, f->lut);
-    draw(f->fbo_stats, f->sw, f->sh);
-
-    p = f->p_reduce;
-    glUseProgram(p);
-    bind_tex(p, "s", 0, f->stats);
-    draw(f->fbo_red, f->rw, f->sh);
-    glReadPixels(0, 0, f->rw, f->sh, GL_RGBA_INTEGER, GL_UNSIGNED_INT, f->red_buf);
+    int gx0 = f->m_gx0, gx1 = f->m_gx1, gy0, gy1;
 
     /*
      * per row: the brightest base layer sample, for the bars (the bars of the
@@ -989,6 +988,7 @@ static void measure(struct felgpu *f, GLuint bl_tex)
                 m = f->red_buf[(y * f->rw + x) * 4 + 1];
         row_max[y] = m;
     }
+
     if (f->use_l5) {
         sample_range(f->h, f->sh, f->l5[2], f->l5[3], &gy0, &gy1);
     } else {
@@ -1025,6 +1025,62 @@ static void measure(struct felgpu *f, GLuint bl_tex)
     f->stat.source = f->use_l5 ? FELGPU_AREA_L5
                    : gy0 > 0 ? FELGPU_AREA_DETECTED : FELGPU_AREA_FULL;
     f->stats_valid = 1;
+}
+
+/* the measurement in flight, when the GPU has finished it (never waits) */
+static void measure_collect(struct felgpu *f)
+{
+    if (!f->fence)
+        return;
+    const GLenum r = glClientWaitSync(f->fence, 0, 0);
+    if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED)
+        return;
+    glDeleteSync(f->fence);
+    f->fence = 0;
+    const size_t n = (size_t)f->rw * f->sh * 4 * sizeof(GLuint);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, f->pbo);
+    const void *m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)n, GL_MAP_READ_BIT);
+    if (m) {
+        memcpy(f->red_buf, m, n);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    if (m)
+        measure_result(f);
+}
+
+/* demo mode: L1 of the composed picture and of the base layer, every MEASURE_EVERY-th frame */
+static void measure(struct felgpu *f, GLuint bl_tex)
+{
+    measure_collect(f);
+    if (f->fence || f->measure_n++ % MEASURE_EVERY)
+        return;
+    int gx0, gx1;
+    sample_range(f->w, f->sw, f->use_l5 ? f->l5[0] : 0, f->use_l5 ? f->l5[1] : 0, &gx0, &gx1);
+    f->m_gx0 = gx0;
+    f->m_gx1 = gx1;
+
+    GLuint p = f->p_stats;
+    glUseProgram(p);
+    glUniform2i(glGetUniformLocation(p, "act_x"), gx0, gx1);
+    glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
+    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
+    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);
+    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_y);
+    bind_tex(p, "bl", 0, bl_tex);
+    bind_tex(p, "ely", 1, f->el_yv);
+    bind_tex(p, "chroma", 2, f->chroma);
+    bind_tex(p, "lut", 3, f->lut);
+    draw(f->fbo_stats, f->sw, f->sh);
+
+    p = f->p_reduce;
+    glUseProgram(p);
+    bind_tex(p, "s", 0, f->stats);
+    draw(f->fbo_red, f->rw, f->sh);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, f->pbo);
+    glReadPixels(0, 0, f->rw, f->sh, GL_RGBA_INTEGER, GL_UNSIGNED_INT, 0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    f->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 }
 
 void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
@@ -1072,7 +1128,6 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
     draw(f->fbo_chroma, f->w / 2, f->h / 2);
     prof_mark(f, 2);
 
-    f->stats_valid = 0;
     if (f->demo && !f->pattern)
         measure(f, bl_tex);
 
@@ -1135,6 +1190,10 @@ void felgpu_set_dither(struct felgpu *f, int mode)
 
 void felgpu_set_demo(struct felgpu *f, int on)
 {
+    if (on != f->demo) {
+        f->stats_valid = 0;
+        f->measure_n = 0;
+    }
     f->demo = on;
 }
 
