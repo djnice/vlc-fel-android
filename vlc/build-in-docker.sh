@@ -36,6 +36,18 @@ if [ ! -d libvlcjni/.git ]; then
   (cd libvlcjni && git reset -q --hard $LIBVLCJNI_HASH)
 fi
 
+# changes to libvlcjni's Java side (JPATCHES: jni-patches/*.patch, e.g. the
+# TrueHD pass-through detection of an Amlogic HDMI sink), applied once
+JPATCHES=${JPATCHES:-/host/vlc/jni-patches}
+for p in "$JPATCHES"/*.patch; do
+  [ -f "$p" ] || continue
+  if (cd libvlcjni && git apply --check -R "$p" 2>/dev/null); then
+    echo "already applied: $(basename "$p")"
+  else
+    (cd libvlcjni && git apply "$p") && echo "applied: $(basename "$p")"
+  fi
+done
+
 # the dvfel patches (out-patches/000N-*), applied by get-vlc.sh after the
 # libvlcjni patches as 002N-*; an already cloned vlc gets the missing ones
 n=20

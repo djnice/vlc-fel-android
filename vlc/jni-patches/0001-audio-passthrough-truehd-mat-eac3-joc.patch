@@ -1,0 +1,89 @@
+diff --git a/libvlc/src/org/videolan/libvlc/MediaPlayer.java b/libvlc/src/org/videolan/libvlc/MediaPlayer.java
+index aa1519a..edd77e1 100644
+--- a/libvlc/src/org/videolan/libvlc/MediaPlayer.java
++++ b/libvlc/src/org/videolan/libvlc/MediaPlayer.java
+@@ -500,17 +500,75 @@ public class MediaPlayer extends VLCObject<MediaPlayer.Event> {
+         }
+     }
+ 
++    /* The encodings VLC's audiotrack output knows: E-AC-3 with Atmos (JOC) is
++     * E-AC-3, Dolby MAT (TrueHD on HDMI) is TrueHD */
++    private static int canonicalEncoding(int encoding) {
++        switch (encoding) {
++            case 18 /* AudioFormat.ENCODING_E_AC3_JOC */:
++                return AudioFormat.ENCODING_E_AC3;
++            case 19 /* AudioFormat.ENCODING_DOLBY_MAT */:
++                return 14 /* AudioFormat.ENCODING_DOLBY_TRUEHD */;
++            default:
++                return encoding;
++        }
++    }
++
+     private long getEncodingFlags(int encodings[]) {
+         if (encodings == null)
+             return 0;
+         long encodingFlags = 0;
+         for (int encoding : encodings) {
++            encoding = canonicalEncoding(encoding);
+             if (isEncoded(encoding))
+                 encodingFlags |= 1 << encoding;
+         }
+         return encodingFlags;
+     }
+ 
++    /* Amlogic: the HDMI sink's audio formats from its EDID. The audio HAL does
++     * not list TrueHD for the HDMI output (only IEC61937), the EDID's "MAT"
++     * (Dolby MAT, the TrueHD carrier) tells it. */
++    private static final String AMLOGIC_HDMI_AUD_CAP = "/sys/class/amhdmitx/amhdmitx0/aud_cap";
++
++    private static long getAmlogicHdmiTrueHDFlag() {
++        final File file = new File(AMLOGIC_HDMI_AUD_CAP);
++        if (!file.canRead())
++            return 0;
++        java.io.BufferedReader reader = null;
++        try {
++            reader = new java.io.BufferedReader(new java.io.FileReader(file));
++            String line;
++            while ((line = reader.readLine()) != null) {
++                if (line.startsWith("MAT,"))
++                    return 1L << 14 /* AudioFormat.ENCODING_DOLBY_TRUEHD */;
++            }
++        } catch (IOException ignored) {
++        } finally {
++            if (reader != null) {
++                try {
++                    reader.close();
++                } catch (IOException ignored) {
++                }
++            }
++        }
++        return 0;
++    }
++
++    @RequiresApi(Build.VERSION_CODES.M)
++    private long getDeviceEncodingFlags(AudioDeviceInfo info) {
++        final int[] encodings = info.getEncodings();
++        long encodingFlags = getEncodingFlags(encodings);
++        if (info.getType() == AudioDeviceInfo.TYPE_HDMI && encodings != null) {
++            for (int encoding : encodings) {
++                if (encoding == 13 /* AudioFormat.ENCODING_IEC61937 */) {
++                    encodingFlags |= getAmlogicHdmiTrueHDFlag();
++                    break;
++                }
++            }
++        }
++        return encodingFlags;
++    }
++
+     @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+     private BroadcastReceiver createAudioPlugReceiver() {
+         return new BroadcastReceiver() {
+@@ -568,7 +626,7 @@ public class MediaPlayer extends VLCObject<MediaPlayer.Event> {
+                 for (AudioDeviceInfo info : addedDevices) {
+                     if (!info.isSink())
+                         continue;
+-                    long encodingFlags = getEncodingFlags(info.getEncodings());
++                    long encodingFlags = getDeviceEncodingFlags(info);
+                     if (encodingFlags != 0)
+                         mEncodedDevices.put(info.getId(), encodingFlags);
+                 }

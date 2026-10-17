@@ -20,6 +20,9 @@ Ultra HD Blu-ray stream), és a 3D-t Blu-ray m2ts / .ssif fájlokból is.
 
 A 0.2.2 óta demo mód is van: osztott kép, a FEL és a BL összehasonlítása mért fényerővel (lásd lent).
 
+A 0.2.8 óta a hangot bitstreamként (passthrough) is kiadhatja az erősítőnek: Dolby TrueHD (Atmos),
+DTS-HD MA / DTS:X, E-AC-3 (Atmos), AC-3, DTS (lásd lent: HANG BITSTREAMKÉNT).
+
 Előfutással működik: a VLC minden képet
 3 vsync-kel (24 Hz-en 125 ms) korábban ad ki, a kernelmodul pedig a kész képet a saját vsyncjéig
 visszatartja. Így a GPU-nak ~2,5 képkockányi ideje van ~1 helyett: a lejátszás közbeni GPU-kiugrások
@@ -78,6 +81,27 @@ KÉTSÁVOS (DTDL) FEL
 - Egyes projektorok 2160p-s asztalról frame packingre váltáskor bontják a HDMI-kapcsolatot, ettől
   megáll a lejátszás: ilyenkor 1080p-s asztalt használj.
 
+HANG BITSTREAMKÉNT (PASSTHROUGH)
+--------------------------------
+- Bekapcsolás: Beállítások → Hang → „Digitális hangkimenet (áteresztés)” (angol felületen: „Digital
+  audio output (passthrough)”). Alapból ki: ekkor a VLC dekódol, a hang PCM-ként megy.
+- Bekapcsolva a VLC FEL a hangot dekódolás nélkül, IEC 61937-be csomagolva adja a HDMI-re, az
+  erősítő dekódol. Azokat a formátumokat küldi így, amelyeket a HDMI-kimenet és a csatlakozott eszköz
+  (EDID) is fogad; a többi (pl. AAC) PCM marad. Root nem kell hozzá.
+- Dolby TrueHD (Atmos): MAT, 8 csatorna, 192 kHz (HBR). A TrueHD-t az Amlogic HDMI-kimenet EDID-
+  adatából („MAT”) ismeri fel, mert az Android a HDMI-eszköz kódolásai közt nem listázza.
+- DTS-HD MA / DTS:X: 8 csatorna, 192 kHz (HBR); a gyári VLC 3 csak a DTS core-t adta át. Egy DTS-sáv
+  az elején egy pillanatra 48 kHz-es core-ként indul, utána vált HD-ra.
+- E-AC-3 (Atmos: JOC): 192 kHz; AC-3 és DTS: 48 kHz.
+- A hang bitstreamként is szinkronban van a képpel (a gyári VLC 3 passthrough-ban a pufferelés
+  mértékével előbb adta ki a hangot). Ha mégis eltolódást látsz, a lejátszó hangkésleltetésével
+  állítható.
+- Sávváltáskor ~1,5 s csend, amíg a kimenet újraindul (PCM-nél is így van); az erősítő ilyenkor
+  újraszinkronizál.
+- Tesztelve Dune HD Pro 8K Plus-on (R22): TrueHD, DTS-HD MA, E-AC-3, AC-3, DTS; a kimenet formátuma
+  (pl. TrueHD: MAT, 8 csatorna, 192 kHz) a box HDMI-meghajtójában ellenőrizve, sávváltás és tekerés
+  rendben. Kérjük jelezd, mit mutat az erősítőd kijelzője.
+
 TELEPÍTÉS
 ---------
 1. Az APK telepítése (pendrive + fájlkezelő, „Downloader” app, vagy: adb install VLC-FEL-*.apk).
@@ -102,6 +126,11 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.8-poc (VLC-javítások, a modulok és a libdvfelplay változatlanok) – hang bitstreamként (HDMI
+          passthrough): TrueHD (MAT) és DTS-HD MA 8 csatornás 192 kHz-es HBR-en (eddig a TrueHD-t nem
+          ismerte fel, a DTS-HD-ból csak a core ment át), E-AC-3, AC-3, DTS; a hang passthrough-ban is
+          szinkronban a képpel; sávváltás után nem esik vissza PCM-re (az épp elengedett kimenetet az
+          Android ~1 s-ig nem adja ki újra, most újrapróbálja).
 0.2.7-poc (libdvfelplay 2026.10.16.1, a modulok és a VLC-javítások változatlanok) – nem akad a FEL
           demó mód: a demó L1-mérését minden képkockánál várakozással olvasta vissza a GPU-ról, ettől egy
           nehéz 4K 24p filmnél 100 képből 30–39 lekéste a vsync-et. Most minden 6. képet mér, és
@@ -166,6 +195,9 @@ Ultra HD Blu-ray streams), and 3D from Blu-ray m2ts / .ssif files.
 
 Since 0.2.2 a demo mode: split screen comparing FEL and the base layer, with measured brightness (below).
 
+Since 0.2.8 it can send the audio to the AV receiver as a bitstream (passthrough): Dolby TrueHD (Atmos),
+DTS-HD MA / DTS:X, E-AC-3 (Atmos), AC-3, DTS (see AUDIO BITSTREAM below).
+
 It works with a lead time: VLC presents
 every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds the composed frame back to
 its vsync. The GPU gets ~2.5 frame periods instead of ~1: its time spikes during playback no longer
@@ -224,6 +256,26 @@ DUAL TRACK (DTDL) FEL
 - Some projectors drop the HDMI connection when switching from a 2160p desktop to frame packing,
   which stops playback: use a 1080p desktop then.
 
+AUDIO BITSTREAM (PASSTHROUGH)
+-----------------------------
+- To switch it on: Settings → Audio → "Digital audio output (passthrough)". Off by default: VLC then
+  decodes and the audio goes out as PCM.
+- When on, VLC FEL sends the audio undecoded, packed as IEC 61937, over HDMI, and the AV receiver
+  decodes it. It does so for the formats both the HDMI output and the connected device (EDID) accept;
+  the rest (e.g. AAC) stays PCM. No root needed.
+- Dolby TrueHD (Atmos): MAT, 8 channels, 192 kHz (HBR). TrueHD is detected from the Amlogic HDMI
+  output's EDID data ("MAT"), as Android does not list it among the HDMI device's encodings.
+- DTS-HD MA / DTS:X: 8 channels, 192 kHz (HBR); stock VLC 3 only passed the DTS core. A DTS track
+  starts as a 48 kHz core for a moment, then switches to HD.
+- E-AC-3 (Atmos: JOC): 192 kHz; AC-3 and DTS: 48 kHz.
+- The audio is in sync with the picture as a bitstream too (stock VLC 3 played pass-through audio
+  ahead by the amount it buffered). If you still see an offset, use the player's audio delay.
+- A track change gives ~1.5 s of silence while the output restarts (with PCM too); the AV receiver
+  resyncs then.
+- Tested on a Dune HD Pro 8K Plus (R22): TrueHD, DTS-HD MA, E-AC-3, AC-3, DTS; the output format
+  (e.g. TrueHD: MAT, 8 channels, 192 kHz) checked in the box's HDMI driver, track changes and seeks
+  fine. Please report what your AV receiver's display shows.
+
 INSTALLATION
 ------------
 1. Install the APK (USB stick + file manager, the "Downloader" app, or adb install VLC-FEL-*.apk).
@@ -247,6 +299,11 @@ NOTES
 
 CHANGES
 -------
+0.2.8-poc (VLC fixes, modules and libdvfelplay unchanged) – audio as a bitstream (HDMI passthrough):
+          TrueHD (MAT) and DTS-HD MA on 8 channel 192 kHz HBR (TrueHD was not detected before, of
+          DTS-HD only the core went through), E-AC-3, AC-3, DTS; pass-through audio in sync with the
+          picture; no fallback to PCM after a track change (Android keeps an output just released for
+          ~1 s, it is now retried).
 0.2.7-poc (libdvfelplay 2026.10.16.1, modules and VLC patches unchanged) – no stutter in the FEL
           demo mode: its level 1 measurement was read back from the GPU with a wait every frame, so on
           a heavy 4K 24p film 30–39 of 100 frames missed their vsync. Now every 6th frame is measured

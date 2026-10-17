@@ -1,0 +1,488 @@
+From e729465a4995907d00ac2ebbd1e50021d1f88699 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sat, 17 Oct 2026 08:56:46 +0200
+Subject: [PATCH] audiotrack, tospdif: HDMI pass-through of DTS-HD MA and
+ TrueHD, in sync
+
+The IEC 61937 pass-through (ENCODING_IEC61937, the "encoded" device) is
+what the Dune HD players' own libVLC does for every format, with the
+8 channel 192 kHz (HDMI high bitrate audio) carrier for the HD ones.
+
+- DTS-HD (MA, DTS:X) on the 8 channel 192 kHz carrier, its repetition
+  period counted in IEC 60958 frames (4 per 8 channel frame: subtype 4,
+  32768 byte bursts per 512 samples). With 2 channels at 192 kHz the MA
+  substreams of most films did not fit and the DTS core played. Without
+  an 8 channel IEC 61937 output: the DTS core.
+- TrueHD: each frame placed in the MAT frame where its input timing puts
+  it (FFmpeg 4.4's spdifenc), a frame may span a MAT code or two MAT
+  frames. The former 2560 byte slots dropped the whole MAT frame (20 ms)
+  when a frame did not fit.
+- The IEC 61937 output reports its delay (TimeGet) as the PCM one does:
+  without it the bursts played as soon as they were written, ahead of
+  the picture by the caching (--no-audiotrack-passthrough-delay: as
+  before).
+- <app files>/audioout tells the player what is played ("bitstream
+  truehd 192000 8", "pcm 48000 6", "off") for its information panel.
+
+Message-Id: <20261017-dvfel-audiotrack-passthrough-hbr@djnice>
+---
+ modules/audio_filter/converter/tospdif.c | 220 ++++++++++++++++-------
+ modules/audio_output/audiotrack.c        | 100 ++++++++++-
+ 2 files changed, 258 insertions(+), 62 deletions(-)
+
+diff --git a/modules/audio_filter/converter/tospdif.c b/modules/audio_filter/converter/tospdif.c
+index 0c725d99e7..1d145c3370 100644
+--- a/modules/audio_filter/converter/tospdif.c
++++ b/modules/audio_filter/converter/tospdif.c
+@@ -64,7 +64,11 @@ struct filter_sys_t
+         } eac3;
+         struct
+         {
+-            unsigned int i_frame_count;
++            block_t *p_next; /* the next MAT frame, begun by the last input */
++            size_t i_next_offset;
++            unsigned i_samples_per_frame; /* from the last major sync */
++            uint16_t i_prev_time; /* input timing of the previous frame */
++            size_t i_prev_size; /* the previous frame and its MAT codes */
+         } truehd;
+         struct
+         {
+@@ -305,83 +309,171 @@ static int write_buffer_eac3( filter_t *p_filter, block_t *p_in_buf )
+     return SPDIF_SUCCESS;
+ }
+ 
+-/* Adapted from libavformat/spdifenc.c:
+- * It seems Dolby TrueHD frames have to be encapsulated in MAT frames before
+- * they can be encapsulated in IEC 61937.
+- * Here we encapsulate 24 TrueHD frames in a single MAT frame, padding them
+- * to achieve constant rate.
+- * The actual format of a MAT frame is unknown, but the below seems to work.
+- * However, it seems it is not actually necessary for the 24 TrueHD frames to
+- * be in an exact alignment with the MAT frame
++/* Adapted from libavformat/spdifenc.c (FFmpeg 4.4):
++ * Dolby TrueHD frames are carried in MAT frames (61424 bytes, one per
++ * IEC 61937 burst of 61440 bytes, 24 TrueHD frames of 1/1200 s). Each frame
++ * is placed where its input timing puts it (2560 bytes per 1/1200 s), the
++ * MAT codes at their fixed positions in between: a frame may span a code or
++ * two MAT frames. The former code put 24 frames in 2560 byte slots whatever
++ * their timing, and dropped the whole MAT frame (20 ms) when one did not fit.
+  */
+-static int write_buffer_truehd( filter_t *p_filter, block_t *p_in_buf )
++#define MAT_PKT_OFFSET 61440 /* a burst */
++#define MAT_FRAME_SIZE 61424 /* its payload */
++
++static const uint8_t p_mat_start_code[20] = {
++    0x07, 0x9E, 0x00, 0x03, 0x84, 0x01, 0x01, 0x01, 0x80, 0x00,
++    0x56, 0xA5, 0x3B, 0xF4, 0x81, 0x83, 0x49, 0x80, 0x77, 0xE0
++};
++static const uint8_t p_mat_middle_code[12] = {
++    0xC3, 0xC1, 0x42, 0x49, 0x3B, 0xFA,
++    0x82, 0x83, 0x49, 0x80, 0x77, 0xE0
++};
++static const uint8_t p_mat_end_code[16] = {
++    0xC3, 0xC2, 0xC0, 0xC4, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x97, 0x11
++};
++static const struct
+ {
+-#define TRUEHD_FRAME_OFFSET     2560
++    size_t i_pos; /* in the payload */
++    size_t i_len;
++    const uint8_t *p_code;
++} p_mat_codes[] = {
++    { 0, sizeof(p_mat_start_code), p_mat_start_code },
++    { 30708, sizeof(p_mat_middle_code), p_mat_middle_code },
++    { MAT_FRAME_SIZE - sizeof(p_mat_end_code), sizeof(p_mat_end_code),
++      p_mat_end_code },
++};
++#define MAT_CODES ( sizeof(p_mat_codes) / sizeof(p_mat_codes[0]) )
+ 
++static int write_buffer_truehd( filter_t *p_filter, block_t *p_in_buf )
++{
+     filter_sys_t *p_sys = p_filter->p_sys;
++    const uint8_t *p_data = p_in_buf->p_buffer;
++    size_t i_data = p_in_buf->i_buffer;
+ 
+-    if( !p_sys->p_out_buf
+-     && write_init( p_filter, p_in_buf, 61440, 61440 / 16 ) )
++    if( i_data < 10 || ( i_data & 1 ) )
+         return SPDIF_ERROR;
+ 
+-    int i_padding = 0;
+-    if( p_sys->truehd.i_frame_count == 0 )
++    if( GetDWBE( &p_data[4] ) >> 8 == 0xf8726f ) /* major sync */
+     {
+-        static const char p_mat_start_code[20] = {
+-            0x07, 0x9E, 0x00, 0x03, 0x84, 0x01, 0x01, 0x01, 0x80, 0x00,
+-            0x56, 0xA5, 0x3B, 0xF4, 0x81, 0x83, 0x49, 0x80, 0x77, 0xE0
+-        };
+-        write_data( p_filter, p_mat_start_code, 20, true );
+-        /* We need to include the S/PDIF header in the first MAT frame */
+-        i_padding = TRUEHD_FRAME_OFFSET - p_in_buf->i_buffer - 20
+-                  - SPDIF_HEADER_SIZE;
++        unsigned i_ratebits;
++        if( p_data[7] == 0xba ) /* TrueHD */
++            i_ratebits = p_data[8] >> 4;
++        else if( p_data[7] == 0xbb ) /* MLP */
++            i_ratebits = p_data[9] >> 4;
++        else
++            return SPDIF_ERROR;
++        p_sys->truehd.i_samples_per_frame = 40 << ( i_ratebits & 3 );
+     }
+-    else if( p_sys->truehd.i_frame_count == 11 )
++    if( p_sys->truehd.i_samples_per_frame == 0 )
++        return SPDIF_MORE_DATA; /* dropped until a major sync */
++
++    /* the padding before this frame: its distance from the previous one by
++     * their input timings, minus the previous one */
++    const uint16_t i_time = GetWBE( &p_data[2] );
++    size_t i_padding = 0;
++    if( p_sys->truehd.i_prev_size > 0 )
+     {
+-        /* The middle mat code need to be at the ((2560 * 12) - 4) offset */
+-        i_padding = TRUEHD_FRAME_OFFSET - p_in_buf->i_buffer - 4;
++        const uint16_t i_delta = i_time - p_sys->truehd.i_prev_time;
++        const size_t i_delta_bytes =
++            i_delta * 2560 / p_sys->truehd.i_samples_per_frame;
++        if( i_delta_bytes > p_sys->truehd.i_prev_size
++         && i_delta_bytes - p_sys->truehd.i_prev_size < MAT_FRAME_SIZE / 2 )
++            i_padding = i_delta_bytes - p_sys->truehd.i_prev_size;
+     }
+-    else if( p_sys->truehd.i_frame_count == 12 )
++
++    if( !p_sys->p_out_buf )
+     {
+-        static const char p_mat_middle_code[12] = {
+-            0xC3, 0xC1, 0x42, 0x49, 0x3B, 0xFA,
+-            0x82, 0x83, 0x49, 0x80, 0x77, 0xE0
+-        };
+-        write_data( p_filter, p_mat_middle_code, 12, true );
+-        i_padding = TRUEHD_FRAME_OFFSET - p_in_buf->i_buffer - ( 12 - 4 );
++        if( p_sys->truehd.p_next )
++        {
++            p_sys->p_out_buf = p_sys->truehd.p_next;
++            p_sys->i_out_offset = p_sys->truehd.i_next_offset;
++            p_sys->truehd.p_next = NULL;
++        }
++        else if( write_init( p_filter, p_in_buf, MAT_PKT_OFFSET,
++                             MAT_PKT_OFFSET / 16 ) )
++            return SPDIF_ERROR;
+     }
+-    else if( p_sys->truehd.i_frame_count == 23 )
+-    {
+-        static const char p_mat_end_code[16] = {
+-            0xC3, 0xC2, 0xC0, 0xC4, 0x00, 0x00, 0x00, 0x00,
+-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x97, 0x11
+-        };
+ 
+-        /* The end mat code need to be at the ((2560 * 24) - 24) offset */
+-        i_padding = TRUEHD_FRAME_OFFSET - p_in_buf->i_buffer - 24;
+-
+-        if( i_padding < 0 || p_in_buf->i_buffer + i_padding >
+-            p_sys->p_out_buf->i_buffer - p_sys->i_out_offset )
+-            return SPDIF_ERROR;
++    block_t *p_done = NULL;
++    size_t i_total = i_data; /* this frame and the MAT codes it spans */
++    size_t i_filled = p_sys->i_out_offset - SPDIF_HEADER_SIZE;
++    unsigned i_code = 0;
++    while( i_code < MAT_CODES && i_filled > p_mat_codes[i_code].i_pos )
++        i_code++;
++    if( i_code == MAT_CODES )
++        return SPDIF_ERROR;
+ 
+-        write_buffer( p_filter, p_in_buf );
+-        write_padding( p_filter, i_padding );
+-        write_data( p_filter, p_mat_end_code, 16, true );
+-        write_finalize( p_filter, IEC61937_TRUEHD, 1 /* in bytes */ );
+-        p_sys->truehd.i_frame_count = 0;
+-        return SPDIF_SUCCESS;
++    while( i_padding > 0 || i_data > 0
++        || p_mat_codes[i_code].i_pos == i_filled )
++    {
++        if( p_mat_codes[i_code].i_pos == i_filled )
++        {
++            size_t i_code_left = p_mat_codes[i_code].i_len;
++            write_data( p_filter, p_mat_codes[i_code].p_code,
++                        p_mat_codes[i_code].i_len, true );
++            i_filled += p_mat_codes[i_code].i_len;
++
++            if( ++i_code == MAT_CODES )
++            {
++                /* the MAT frame is complete, the rest goes to the next one;
++                 * the gap between the bursts counts as well */
++                write_finalize( p_filter, IEC61937_TRUEHD, 1 /* in bytes */ );
++                p_sys->p_out_buf->i_length = CLOCK_FREQ * MAT_PKT_OFFSET / 16
++                                           / p_filter->fmt_out.audio.i_rate;
++                p_done = p_sys->p_out_buf;
++                p_sys->p_out_buf = NULL;
++                if( write_init( p_filter, p_in_buf, MAT_PKT_OFFSET,
++                                MAT_PKT_OFFSET / 16 ) )
++                {
++                    block_Release( p_done );
++                    return SPDIF_ERROR;
++                }
++                i_code = 0;
++                i_filled = 0;
++                i_code_left += MAT_PKT_OFFSET - MAT_FRAME_SIZE;
++            }
++
++            /* the code counts as padding first, the rest as the frame's */
++            const size_t i_as_padding = __MIN( i_padding, i_code_left );
++            i_padding -= i_as_padding;
++            i_total += i_code_left - i_as_padding;
++        }
++
++        if( i_padding > 0 )
++        {
++            const size_t i_size = __MIN( p_mat_codes[i_code].i_pos - i_filled,
++                                         i_padding );
++            write_padding( p_filter, i_size );
++            i_filled += i_size;
++            i_padding -= i_size;
++            if( i_padding > 0 )
++                continue; /* a MAT code first */
++        }
++
++        if( i_data > 0 )
++        {
++            const size_t i_size = __MIN( p_mat_codes[i_code].i_pos - i_filled,
++                                         i_data );
++            write_data( p_filter, p_data, i_size, true );
++            i_filled += i_size;
++            p_data += i_size;
++            i_data -= i_size;
++        }
+     }
+-    else
+-        i_padding = TRUEHD_FRAME_OFFSET - p_in_buf->i_buffer;
+ 
+-    if( i_padding < 0 || p_in_buf->i_buffer + i_padding >
+-        p_sys->p_out_buf->i_buffer - p_sys->i_out_offset )
+-        return SPDIF_ERROR;
++    p_sys->truehd.i_prev_size = i_total;
++    p_sys->truehd.i_prev_time = i_time;
+ 
+-    write_buffer( p_filter, p_in_buf );
+-    write_padding( p_filter, i_padding );
+-    p_sys->truehd.i_frame_count++;
+-    return SPDIF_MORE_DATA;
++    if( !p_done )
++        return SPDIF_MORE_DATA;
++
++    /* the complete MAT frame out, the begun one kept for the next input */
++    p_sys->truehd.p_next = p_sys->p_out_buf;
++    p_sys->truehd.i_next_offset = p_sys->i_out_offset;
++    p_sys->p_out_buf = p_done;
++    p_sys->i_out_offset = p_done->i_buffer;
++    return SPDIF_SUCCESS;
+ }
+ 
+ static int write_buffer_dts( filter_t *p_filter, block_t *p_in_buf )
+@@ -483,7 +575,10 @@ static int write_buffer_dtshd( filter_t *p_filter, block_t *p_in_buf )
+     if( vlc_dts_header_Parse( &core, p_in_buf->p_buffer,
+                               p_in_buf->i_buffer ) != VLC_SUCCESS )
+         return SPDIF_ERROR;
++    /* in IEC 60958 frames (4 bytes): 4 of them per 8 channel frame of the
++     * HDMI high bitrate audio (192 kHz, 8 channels: 768 kHz) */
+     unsigned i_period = p_filter->fmt_out.audio.i_rate
++                      * ( p_filter->fmt_out.audio.i_bytes_per_frame / 4 )
+                       * core.i_frame_length / core.i_rate;
+ 
+     int i_subtype = dtshd_get_subtype( i_period );
+@@ -540,8 +635,11 @@ static void Flush( filter_t *p_filter )
+     }
+     switch( p_filter->fmt_in.audio.i_format )
+     {
++        case VLC_CODEC_MLP:
+         case VLC_CODEC_TRUEHD:
+-            p_sys->truehd.i_frame_count = 0;
++            if( p_sys->truehd.p_next != NULL )
++                block_Release( p_sys->truehd.p_next );
++            memset( &p_sys->truehd, 0, sizeof( p_sys->truehd ) );
+             break;
+         case VLC_CODEC_EAC3:
+             p_sys->eac3.i_nb_blocks = 0;
+diff --git a/modules/audio_output/audiotrack.c b/modules/audio_output/audiotrack.c
+index 1f70f00e46..ff32b3de49 100644
+--- a/modules/audio_output/audiotrack.c
++++ b/modules/audio_output/audiotrack.c
+@@ -29,6 +29,7 @@
+ #include <jni.h>
+ #include <dlfcn.h>
+ #include <stdbool.h>
++#include <stdio.h>
+ 
+ #include <vlc_common.h>
+ #include <vlc_plugin.h>
+@@ -124,6 +125,7 @@ struct aout_sys_t {
+     uint32_t i_max_audiotrack_samples;
+     long long i_encoding_flags;
+     bool b_passthrough;
++    bool b_passthrough_delay; /* the IEC 61937 output's delay is reported */
+     uint8_t i_chans_to_reorder; /* do we need channel reordering */
+     uint8_t p_chan_table[AOUT_CHAN_MAX];
+ 
+@@ -178,6 +180,11 @@ struct aout_sys_t {
+ 
+ #define AUDIOTRACK_SESSION_ID_TEXT " Id of audio session the AudioTrack must be attached to"
+ 
++#define PASSTHROUGH_DELAY_TEXT N_("Pass-through output delay")
++#define PASSTHROUGH_DELAY_LONGTEXT N_( \
++    "Report the delay of the IEC 61937 pass-through output to keep the " \
++    "sound in sync with the picture (as with PCM).")
++
+ vlc_module_begin ()
+     set_shortname( "AudioTrack" )
+     set_description( "Android AudioTrack audio output" )
+@@ -187,6 +194,8 @@ vlc_module_begin ()
+     add_integer( "audiotrack-session-id", 0,
+             AUDIOTRACK_SESSION_ID_TEXT, NULL, true )
+         change_private()
++    add_bool( "audiotrack-passthrough-delay", true, PASSTHROUGH_DELAY_TEXT,
++              PASSTHROUGH_DELAY_LONGTEXT, true )
+     add_shortcut( "audiotrack" )
+     set_callbacks( Open, Close )
+ vlc_module_end ()
+@@ -755,7 +764,13 @@ TimeGet( audio_output_t *p_aout, vlc_tick_t *restrict p_delay )
+     vlc_tick_t i_audiotrack_us;
+     JNIEnv *env;
+ 
+-    if( p_sys->b_passthrough )
++    /* The IEC 61937 output (ENCODING_IEC61937) plays frames of the format set
++     * up by Start: its position is as good as the PCM one's. Without a delay
++     * the bursts were played as soon as they were written, the sound ahead of
++     * the picture by the caching. The raw AC3 / E_AC3 / DTS encodings (SPDIFB)
++     * count their frames differently: no delay. */
++    if( p_sys->b_passthrough && ( !p_sys->b_passthrough_delay
++                               || p_sys->fmt.i_format != VLC_CODEC_SPDIFL ) )
+         return -1;
+ 
+     vlc_mutex_lock( &p_sys->lock );
+@@ -1042,8 +1057,13 @@ static int GetPassthroughFmt( bool compat, audio_sample_format_t *fmt, bool b_dt
+                 fmt->i_physical_channels = AOUT_CHANS_STEREO;
+                 if( b_dtshd )
+                 {
++                    /* DTS-HD (MA, DTS:X): the HDMI high bitrate audio, 8
++                     * channels at 192 kHz as for TrueHD. With 2 channels at
++                     * 192 kHz (at most 6 Mbit/s) the MA substreams of most
++                     * films did not fit: the DTS core played. */
+                     fmt->i_rate = 192000;
+                     fmt->i_bytes_per_frame = 16;
++                    fmt->i_physical_channels = AOUT_CHANS_7_1;
+                 }
+                 break;
+             case VLC_CODEC_EAC3:
+@@ -1126,11 +1146,85 @@ StartPassthrough( JNIEnv *env, audio_output_t *p_aout )
+         }
+     }
+ 
++    /* no 8 channel IEC 61937 output: the DTS core */
++    if( b_dtshd && jfields.AudioFormat.has_ENCODING_IEC61937 )
++    {
++        int i_at_format;
++        audio_sample_format_t fmt = p_sys->fmt;
++
++        if( GetPassthroughFmt( false, &fmt, false, &i_at_format ) == VLC_SUCCESS
++         && AudioTrack_Create( env, p_aout, fmt.i_rate, i_at_format,
++                               fmt.i_physical_channels ) == VLC_SUCCESS )
++        {
++            msg_Warn( p_aout, "DTS-HD configuration failed, DTS core" );
++            p_sys->i_chans_to_reorder = 0;
++            p_sys->fmt = fmt;
++            return VLC_SUCCESS;
++        }
++    }
++
+     p_sys->b_passthrough = false;
+     msg_Warn( p_aout, "SPDIF configuration failed" );
+     return VLC_EGENERIC;
+ }
+ 
++/* <app files>/audioout: what the output plays, for the player's information
++ * panel ("bitstream <codec> <rate> <channels>", "pcm <rate> <channels>" or
++ * "off"); the package name from /proc/self/cmdline */
++static void
++WriteOutputInfo( const char *psz_info )
++{
++    char psz_pkg[128] = "", psz_path[192];
++    FILE *f = fopen( "/proc/self/cmdline", "r" );
++    if( !f )
++        return;
++    size_t n = fread( psz_pkg, 1, sizeof(psz_pkg) - 1, f );
++    fclose( f );
++    psz_pkg[n] = 0;
++    char *psz_colon = strchr( psz_pkg, ':' ); /* a service process */
++    if( psz_colon )
++        *psz_colon = 0;
++    if( psz_pkg[0] == 0 )
++        return;
++    snprintf( psz_path, sizeof(psz_path), "/data/data/%s/files/audioout",
++              psz_pkg );
++    f = fopen( psz_path, "w" );
++    if( !f )
++        return;
++    fprintf( f, "%s\n", psz_info );
++    fclose( f );
++}
++
++static void
++ReportOutput( audio_output_t *p_aout, vlc_fourcc_t i_codec )
++{
++    aout_sys_t *p_sys = p_aout->sys;
++    char psz_info[64];
++
++    if( p_sys->b_passthrough )
++    {
++        const char *psz_codec;
++        switch( i_codec )
++        {
++            case VLC_CODEC_A52: psz_codec = "ac3"; break;
++            case VLC_CODEC_EAC3: psz_codec = "eac3"; break;
++            case VLC_CODEC_MLP:
++            case VLC_CODEC_TRUEHD: psz_codec = "truehd"; break;
++            case VLC_CODEC_DTS:
++                psz_codec = p_sys->fmt.i_rate > 48000 ? "dtshd" : "dts";
++                break;
++            default: psz_codec = "?"; break;
++        }
++        snprintf( psz_info, sizeof(psz_info), "bitstream %s %u %u", psz_codec,
++                  p_sys->fmt.i_rate, aout_FormatNbChannels( &p_sys->fmt ) );
++    }
++    else
++        snprintf( psz_info, sizeof(psz_info), "pcm %u %u", p_sys->fmt.i_rate,
++                  aout_FormatNbChannels( &p_sys->fmt ) );
++    msg_Dbg( p_aout, "output: %s", psz_info );
++    WriteOutputInfo( psz_info );
++}
++
+ static int
+ StartPCM( JNIEnv *env, audio_output_t *p_aout, unsigned i_max_channels )
+ {
+@@ -1257,6 +1351,8 @@ Start( audio_output_t *p_aout, audio_sample_format_t *restrict p_fmt )
+         return VLC_EGENERIC;
+ 
+     p_sys->fmt = *p_fmt;
++    p_sys->b_passthrough_delay =
++        var_InheritBool( p_aout, "audiotrack-passthrough-delay" );
+ 
+     aout_FormatPrint( p_aout, "VLC is looking for:", &p_sys->fmt );
+ 
+@@ -1425,6 +1521,7 @@ Start( audio_output_t *p_aout, audio_sample_format_t *restrict p_fmt )
+     JNI_AT_CALL_VOID( play );
+     CHECK_AT_EXCEPTION( "play" );
+ 
++    ReportOutput( p_aout, p_fmt->i_format );
+     *p_fmt = p_sys->fmt;
+ 
+     p_aout->volume_set(p_aout, p_sys->volume);
+@@ -1520,6 +1617,7 @@ Stop( audio_output_t *p_aout )
+     p_sys->b_audiotrack_exception = false;
+     p_sys->b_error = false;
+     p_sys->b_passthrough = false;
++    WriteOutputInfo( "off" );
+ }
+ 
+ /**
+-- 
+2.55.0.windows.3
+

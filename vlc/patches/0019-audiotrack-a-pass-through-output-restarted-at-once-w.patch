@@ -1,0 +1,112 @@
+From 3e4630fc88714fa40c281238e5af26b329795d82 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sat, 17 Oct 2026 09:55:38 +0200
+Subject: [PATCH] audiotrack: a pass-through output restarted at once waits for
+ the released one
+
+The DTS packetizer's first frame changes the format, the decoder and the
+audio output restart within a millisecond; a track switch does the same.
+AudioFlinger refused the new direct track while the one just released
+still held the direct output (createTrack_l status -38, for ~0.85 s on
+the S928X): DTS, DTS-HD and the next track fell back to PCM. Within 1.5 s
+of a pass-through stop (of any player) the first format is tried again
+every 50 ms and the others (the raw encodings, the DTS core of DTS-HD)
+only after it: the stereo DTS core took the stereo output just released
+while the 8 channel DTS-HD waited for it.
+
+Message-Id: <20261017-dvfel-audiotrack-passthrough-restart-v2@djnice>
+---
+ modules/audio_output/audiotrack.c | 49 +++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/modules/audio_output/audiotrack.c b/modules/audio_output/audiotrack.c
+index ff32b3de49..cfcc0754a0 100644
+--- a/modules/audio_output/audiotrack.c
++++ b/modules/audio_output/audiotrack.c
+@@ -1112,7 +1112,7 @@ static int GetPassthroughFmt( bool compat, audio_sample_format_t *fmt, bool b_dt
+ }
+ 
+ static int
+-StartPassthrough( JNIEnv *env, audio_output_t *p_aout )
++StartPassthroughOnce( JNIEnv *env, audio_output_t *p_aout, bool b_first_only )
+ {
+     aout_sys_t *p_sys = p_aout->sys;
+ 
+@@ -1121,7 +1121,7 @@ StartPassthrough( JNIEnv *env, audio_output_t *p_aout )
+         return VLC_EGENERIC;
+ 
+     /* Try ENCODING_IEC61937 first, then fallback to ENCODING_[AC3|DTS|...] */
+-    unsigned nb_fmt = jfields.AudioFormat.has_ENCODING_IEC61937 ? 2 : 1;
++    unsigned nb_fmt = jfields.AudioFormat.has_ENCODING_IEC61937 && !b_first_only ? 2 : 1;
+     int i_ret;
+     for( unsigned i = 0; i < nb_fmt; ++i )
+     {
+@@ -1147,7 +1147,7 @@ StartPassthrough( JNIEnv *env, audio_output_t *p_aout )
+     }
+ 
+     /* no 8 channel IEC 61937 output: the DTS core */
+-    if( b_dtshd && jfields.AudioFormat.has_ENCODING_IEC61937 )
++    if( b_dtshd && jfields.AudioFormat.has_ENCODING_IEC61937 && !b_first_only )
+     {
+         int i_at_format;
+         audio_sample_format_t fmt = p_sys->fmt;
+@@ -1168,6 +1168,43 @@ StartPassthrough( JNIEnv *env, audio_output_t *p_aout )
+     return VLC_EGENERIC;
+ }
+ 
++/* A pass-through output restarted at once (the DTS packetizer's first frame
++ * changes the format: the decoder and the output restart) found the direct
++ * output of the AudioTrack just released still taken: AudioFlinger refused the
++ * new one (createTrack_l status -38) and the sound fell back to PCM. Within
++ * 1.5 s of a pass-through stop (of any player: the direct output is the
++ * system's) the creation of the first format is tried again every 50 ms, the
++ * others (the raw encodings, the DTS core of DTS-HD) only after it: the
++ * stereo DTS core took the stereo output just released while the 8 channel
++ * DTS-HD waited for it. */
++static vlc_mutex_t passthrough_lock = VLC_STATIC_MUTEX;
++static vlc_tick_t i_passthrough_stop = 0; /* the last pass-through stop */
++
++static int
++StartPassthrough( JNIEnv *env, audio_output_t *p_aout )
++{
++    aout_sys_t *p_sys = p_aout->sys;
++
++    bool b_dtshd;
++    if( !AudioTrack_HasEncoding( p_aout, p_sys->fmt.i_format, &b_dtshd ) )
++        return VLC_EGENERIC; /* not for this device: PCM at once */
++
++    for( ;; )
++    {
++        vlc_mutex_lock( &passthrough_lock );
++        const vlc_tick_t i_stop = i_passthrough_stop;
++        vlc_mutex_unlock( &passthrough_lock );
++        const bool b_taken = i_stop != 0
++                          && mdate() - i_stop <= CLOCK_FREQ * 3 / 2;
++
++        int i_ret = StartPassthroughOnce( env, p_aout, b_taken );
++        if( i_ret == VLC_SUCCESS || !b_taken )
++            return i_ret;
++        msg_Dbg( p_aout, "pass-through output still taken, trying again" );
++        msleep( CLOCK_FREQ / 20 );
++    }
++}
++
+ /* <app files>/audioout: what the output plays, for the player's information
+  * panel ("bitstream <codec> <rate> <channels>", "pcm <rate> <channels>" or
+  * "off"); the package name from /proc/self/cmdline */
+@@ -1560,6 +1597,12 @@ Stop( audio_output_t *p_aout )
+     /* Release the AudioTrack object */
+     if( p_sys->p_audiotrack )
+     {
++        if( p_sys->b_passthrough )
++        {
++            vlc_mutex_lock( &passthrough_lock );
++            i_passthrough_stop = mdate();
++            vlc_mutex_unlock( &passthrough_lock );
++        }
+         if( !p_sys->b_audiotrack_exception )
+         {
+             JNI_AT_CALL_VOID( stop );
+-- 
+2.55.0.windows.3
+

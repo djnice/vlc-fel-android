@@ -4,7 +4,7 @@
 #   kernel/mvc3d/  <- dvfel/mvc3d (the 3D MVC frame packed output module)
 #   libdvfelplay/  <- dvfelplay (git), without the research scripts
 #   libmvc3dplay/  <- mvc3dplay (git)
-#   vlc/           <- vlc/out-patches, vlc/android-patches, vlc/build-in-docker.sh
+#   vlc/           <- vlc/out-patches, vlc/android-patches, vlc/jni-patches, vlc/build-in-docker.sh
 #   tools/tests/   <- the test scripts (kbuild.sh, modver.py, fwcheck.sh live here)
 set -e
 R=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,6 +29,9 @@ cp $W/vlc/build-in-docker.sh $R/vlc/
 mkdir -p $R/vlc/android-patches
 rm -f $R/vlc/android-patches/*.patch
 cp $W/vlc/android-patches/*.patch $R/vlc/android-patches/
+mkdir -p $R/vlc/jni-patches
+rm -f $R/vlc/jni-patches/*.patch
+cp $W/vlc/jni-patches/*.patch $R/vlc/jni-patches/
 
 cp $W/vlc/tests/{cadence.sh,pauseseek.sh} $R/tools/tests/
 echo "synced from $W ($(cd $W/dvfelplay && git log --oneline -1); mvc3dplay $(cd $W/mvc3dplay && git log --oneline -1))"

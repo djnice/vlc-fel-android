@@ -25,7 +25,9 @@ packing (1080p24) – on 3D displays and projectors, see [3D MVC](#3d-mvc-blu-ra
 Blu-ray **m2ts / .ssif** files, and profile 7 FEL from **dual track / dual PID** files (MP4, m2ts, Ultra HD
 Blu-ray streams), see [Dual layer files](#dual-layer-files-dtdl). Since v0.2.2 a split screen **demo mode**
 compares the FEL composition with the base layer, with measured brightness, see
-[Demo mode](#demo-mode-fel-vs-base-layer).
+[Demo mode](#demo-mode-fel-vs-base-layer). Since v0.2.8 the audio can go to the AV receiver as an **HDMI
+bitstream** (passthrough): Dolby TrueHD (Atmos), DTS-HD MA / DTS:X, E-AC-3 (Atmos), AC-3, DTS, see
+[Audio bitstream](#audio-bitstream-passthrough).
 
 With a **lead time**: VLC presents every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds
 the composed frame back to its vsync. The GPU has ~2.5 frame periods instead of ~1, so its time spikes during
@@ -97,6 +99,32 @@ NAL unit wrapped in a NAL unit of type 63, the RPU last), so it plays exactly li
 - Also fixed on the way, in VLC's MP4 demux: with an edit list skipping the composition delay, the first
   pictures of B-frame streams got wrong (even duplicate) presentation times.
 
+## Audio bitstream (passthrough)
+
+Settings → Audio → *Digital audio output (passthrough)* (off by default) sends the audio undecoded, as IEC 61937,
+over HDMI, for the formats both the HDMI output and the sink (EDID) accept. VLC 3.0's `android_audiotrack` module
+could already do pass-through; what it lacked on these players:
+
+- **TrueHD** was never offered: Android's HDMI device lists no `TRUEHD` encoding on the Amlogic HAL, although the
+  sink's EDID has it. libvlcjni now also takes `ENCODING_DOLBY_MAT` and `ENCODING_E_AC3_JOC`, and on an HDMI device
+  with IEC 61937 the `MAT` line of `/sys/class/amhdmitx/amhdmitx0/aud_cap` (readable by apps) as TrueHD
+  (`vlc/jni-patches/0001`). TrueHD goes out as MAT on 8 channels, 192 kHz (HBR); the MAT framing now places every
+  TrueHD frame by its input timing (as FFmpeg's `spdifenc`) instead of 24 fixed slots, which dropped a whole MAT
+  frame (20 ms) whenever one frame did not fit.
+- **DTS-HD MA / DTS:X** went out on the 2 channel 192 kHz carrier, where most MA tracks do not fit, so `tospdif`
+  fell back to the DTS core for good. Now on 8 channels, 192 kHz (HBR, the repetition period counted in IEC 60958
+  frames, 32768 byte bursts); DTS core only if the 8 channel IEC 61937 output cannot be created.
+- **Sync:** in pass-through `TimeGet` reported no delay, so VLC played the audio ahead by what it buffered. The
+  IEC 61937 output now reports its delay like PCM (`--no-audiotrack-passthrough-delay`: the old behaviour).
+- **Fallback to PCM after a restart:** AudioFlinger does not give out a direct output just released for ~0.85 s
+  (`status -38`), so the DTS packetizer's first restart and track changes fell back to PCM. A pass-through
+  output restarted within 1.5 s now retries its primary format every 50 ms first.
+- The current output is written to `<app files>/audioout` (`bitstream truehd 192000 8`, `pcm 48000 6`, `off`).
+
+The packers' output was checked byte for byte against FFmpeg's `-f spdif` (DTS-HD MA 5.1, TrueHD 7.1). Tested on
+a Dune HD Pro 8K Plus (R22): TrueHD (MAT 8 ch 192 kHz), DTS-HD MA (8 ch 192 kHz), E-AC-3, AC-3, DTS as reported
+by the HDMI driver, track changes and seeks. A track change gives ~1.5 s of silence (VLC 3's restart, PCM too).
+
 ## Download
 
 Releases: <https://github.com/djnice/vlc-fel-android/releases> (APK, read `README.txt`).
@@ -140,7 +168,8 @@ the first MVC file is to play in 3D.
 | `libdvfelplay/` | The player side as a C library (GPL-2.0+): access unit filter (P7 → P8.1, EL extraction), EL decoder, GPU composer (`felgpu`), BL/EL pairing, vsync-aligned render times, lead time, the bundled module and its installer. `include/dvfelplay.h` is the API. Builds with NDK r28c. |
 | `kernel/mvc3d/` | `mvc3d` kernel module (GPL-2.0+): vfm node between video_composer and video_render that replaces the frames by user space's frame packed pictures (`mvc3d_uapi.h`), lead time, and the HDMI frame packing probes for the stock hdmitx21 (R22 and R24). |
 | `libmvc3dplay/` | 3D MVC, player side (GPL-2.0+): the library in the player, `mvc3dhelper` (static aarch64: edge264-mvc decoding, frame packing), the bundled module and its installer, `edge264/` (edge264-mvc at `5757e71` + the picture tag patch). `include/mvc3dplay.h` is the API. |
-| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix), 0011 the demo mode option, 0012 subtitles drawn at the display's size, 0013 pictures released at their time before the subtitles (no dropped frames at subtitle changes), 0014 the live level 1 / level 5 of the RPUs for a player's information panel (a file in the app's files dir, only while asked for), 0015 Dolby Vision pictures released 140 ms ahead up to 30 fps, 0016 those levels in time with the picture on the screen, 0017 a disabled track plays when no track of its kind is enabled (Matroska FlagEnabled 0, MP4 tkhd). |
+| `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix), 0011 the demo mode option, 0012 subtitles drawn at the display's size, 0013 pictures released at their time before the subtitles (no dropped frames at subtitle changes), 0014 the live level 1 / level 5 of the RPUs for a player's information panel (a file in the app's files dir, only while asked for), 0015 Dolby Vision pictures released 140 ms ahead up to 30 fps, 0016 those levels in time with the picture on the screen, 0017 a disabled track plays when no track of its kind is enabled (Matroska FlagEnabled 0, MP4 tkhd), 0018 HDMI pass-through of DTS-HD MA (HBR) and TrueHD (MAT by input timing), in sync, 0019 a pass-through output restarted at once retries the one just released. |
+| `vlc/jni-patches/` | Patches for libvlcjni-3.x's Java side (`0b8dc65`): 0001 TrueHD / E-AC-3 JOC pass-through detection (Android's MAT and JOC encodings, the Amlogic HDMI sink's `aud_cap`). |
 | `vlc/android-patches/` | Patches for the vlc-android app (`fc5fa1f`): 0001 the player menu's *Dolby Vision demo* switch. |
 | `vlc/build-in-docker.sh` | The APK build (vlc-android `fc5fa1f`, libvlcjni-3.x, armeabi-v7a) in VideoLAN's docker image; package `org.videolan.vlc.fel`, name "VLC FEL". |
 | `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `sync.sh` (maintainer: copies the working sources here), `tests/` (cadence and pause/seek measurements, the stop / start / seek stress test `stopstart.sh`, over adb). |
@@ -156,7 +185,7 @@ the first MVC file is to play in 3D.
 3. 3D MVC: `tools/kbuild.sh kernel/mvc3d`, `libmvc3dplay/edge264/build.sh`, `libmvc3dplay/build.sh`
    (NDK r28c for the library, a static capable aarch64 gcc for the helper).
 4. VLC: `docker run -v vlcfel:/work -v $PWD:/src:ro -e PATCHES=/src/vlc/patches
-   -e APATCHES=/src/vlc/android-patches
+   -e APATCHES=/src/vlc/android-patches -e JPATCHES=/src/vlc/jni-patches
    -e DVFELPLAY_SO=/src/libdvfelplay.so -e MVC3D_DIR=/src registry.videolan.org/vlc-debian-android-3.0:20260701183656
    bash /src/vlc/build-in-docker.sh` (copy `libdvfelplay.so`, `libmvc3dplay.so` and `libmvc3dhelper.so` to
    the repository root first; VLC's contribs are built from source the first time, which takes long), then
@@ -192,6 +221,10 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.8-poc** (VLC patches 0018, 0019, libvlcjni patch 0001; modules and libdvfelplay unchanged): **audio as an
+  HDMI bitstream** (passthrough) – TrueHD (MAT) and DTS-HD MA on 8 channel 192 kHz HBR (TrueHD was not offered
+  before, of DTS-HD only the core went through), E-AC-3, AC-3, DTS; pass-through audio in sync with the picture; no
+  fallback to PCM after a track change. See [Audio bitstream](#audio-bitstream-passthrough).
 - **v0.2.7-poc** (libdvfelplay `2026.10.16.1`; modules and VLC patches unchanged): no **stutter in the FEL demo
   mode**. Its level 1 measurement was read back from the GPU synchronously every frame, which stalled the
   composition mid-frame; a heavy 4K 24p film went over its frame time in 30–39 of 100 frames. Now every 6th
