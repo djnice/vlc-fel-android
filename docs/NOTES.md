@@ -110,6 +110,19 @@ kernel `5.4.210` GKI, Android 11 userdebug, SELinux permissive).
   difference.
 - Files pushed with adb to `/sdcard/Download` are invisible to apps until the media scanner sees them
   (Android 11 scoped storage); for tests put them into the app's own `Android/data/<package>/files/`.
+- **USB / internal drives: folders but no files** (users' report, 2026-10-19). The Dune's MediaProvider does
+  not index its drives (`content://media/<volume>/file` is empty), and on Android 11 an app without "all files
+  access" (`MANAGE_EXTERNAL_STORAGE`) sees only indexed files through the FUSE mount: the storage permission
+  shows the folders, none of the files. The firmware has no "all files access" settings page
+  (`ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`: no activity), so app patch `android-patches/0002`
+  (`DuneRoot`) grants it with root: `su -c "appops set org.videolan.vlc.fel MANAGE_EXTERNAL_STORAGE allow"`;
+  when su is off on a Dune (detected by `dune.afrc.afr`) `persist.vendor.root_access` is set to 1 for the
+  moment and back to its value after (kept in the preferences meanwhile and put back at the next start if the
+  app died in between – a crash in that window left it on in a test). It runs at the app's start before the
+  media library (silently; after a failure not again for a day) and when the storage permission is asked
+  (always). Measured on a Pro One 8K Plus (R24) in a user's state (storage permission, MANAGE default, root access 0):
+  root on for 0.64 s, back to `0`, MANAGE allow; the browser lists the drive's videos with thumbnails and the
+  folders' file counts.
 
 ## 3D MVC (mvc3d, libmvc3dplay)
 

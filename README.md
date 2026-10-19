@@ -141,6 +141,10 @@ Releases: <https://github.com/djnice/vlc-fel-android/releases> (APK, read `READM
   Tested with an Optoma 1080p 3D projector on both players.
 - Root access for the one-time module installation (the firmware's `sud`; VLC FEL asks to switch it on for
   the installation and switches it off again).
+- USB / internal drives: the player's media index leaves them out, so on Android 11 only an app with "all files
+  access" sees their files (the storage permission shows the folders only), and the firmware has no settings
+  page for that access. Since v0.2.9 VLC FEL grants it to itself with root at its start (the root access
+  switched on for under a second if it is off, then back as it was).
 
 ## How the module gets installed
 
@@ -170,7 +174,7 @@ the first MVC file is to play in 3D.
 | `libmvc3dplay/` | 3D MVC, player side (GPL-2.0+): the library in the player, `mvc3dhelper` (static aarch64: edge264-mvc decoding, frame packing), the bundled module and its installer, `edge264/` (edge264-mvc at `5757e71` + the picture tag patch). `include/mvc3dplay.h` is the API. |
 | `vlc/patches/` | Patches for VLC 3.0.x (`84177b2273`, as libvlcjni-3.x `0b8dc65` takes it): 0001 Dolby Vision decoder + FEL composition, 0002 vsync-aligned render times, 0003 lead time, 0004 pictures released ahead of their time, 0005 module installation, 0006 3D MVC, 0007 3D MVC lead time, 0008 3D MVC module installation, 0009 3D MVC from m2ts / `.ssif` (ts demux, h264 packetizer), 0010 Dolby Vision dual track / dual PID merging (mp4 and ts demux, MP4 presentation time fix), 0011 the demo mode option, 0012 subtitles drawn at the display's size, 0013 pictures released at their time before the subtitles (no dropped frames at subtitle changes), 0014 the live level 1 / level 5 of the RPUs for a player's information panel (a file in the app's files dir, only while asked for), 0015 Dolby Vision pictures released 140 ms ahead up to 30 fps, 0016 those levels in time with the picture on the screen, 0017 a disabled track plays when no track of its kind is enabled (Matroska FlagEnabled 0, MP4 tkhd), 0018 HDMI pass-through of DTS-HD MA (HBR) and TrueHD (MAT by input timing), in sync, 0019 a pass-through output restarted at once retries the one just released. |
 | `vlc/jni-patches/` | Patches for libvlcjni-3.x's Java side (`0b8dc65`): 0001 TrueHD / E-AC-3 JOC pass-through detection (Android's MAT and JOC encodings, the Amlogic HDMI sink's `aud_cap`). |
-| `vlc/android-patches/` | Patches for the vlc-android app (`fc5fa1f`): 0001 the player menu's *Dolby Vision demo* switch. |
+| `vlc/android-patches/` | Patches for the vlc-android app (`fc5fa1f`): 0001 the player menu's *Dolby Vision demo* switch, 0002 "all files access" with root on Dune / R_volution players (their USB / internal drives' files). |
 | `vlc/build-in-docker.sh` | The APK build (vlc-android `fc5fa1f`, libvlcjni-3.x, armeabi-v7a) in VideoLAN's docker image; package `org.videolan.vlc.fel`, name "VLC FEL". |
 | `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `sync.sh` (maintainer: copies the working sources here), `tests/` (cadence and pause/seek measurements, the stop / start / seek stress test `stopstart.sh`, over adb). |
 | `docs/NOTES.md` | Technical notes and pitfalls of this firmware, the lead time, VLC. |
@@ -221,6 +225,11 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.9-poc** (app patch 0002; modules, libdvfelplay and the VLC patches unchanged): the **files of USB /
+  internal drives** show (users' report: folders only). The player's media index leaves its drives out, and on
+  Android 11 an app without "all files access" sees only indexed files there; the firmware has no page to allow
+  it. VLC FEL now grants it to itself with root at its start: `su` if it is on, else the root access switched on
+  for the moment (~0.7 s measured) and back to its value, also after a crash in between (at the next start).
 - **v0.2.8-poc** (VLC patches 0018, 0019, libvlcjni patch 0001; modules and libdvfelplay unchanged): **audio as an
   HDMI bitstream** (passthrough) – TrueHD (MAT) and DTS-HD MA on 8 channel 192 kHz HBR (TrueHD was not offered
   before, of DTS-HD only the core went through), E-AC-3, AC-3, DTS; pass-through audio in sync with the picture; no

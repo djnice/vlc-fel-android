@@ -41,6 +41,10 @@ FELTÉTELEK
   kernelszimbólumokat is kiírja).
 - Root-hozzáférés a modul telepítéséhez. Ha a lejátszón ki van kapcsolva, a VLC FEL megkérdezi,
   bekapcsolhatja-e a telepítés idejére („Install”); utána visszakapcsolja.
+- USB-s / belső meghajtók: a lejátszó médiaindexe kihagyja őket, ezért Android 11-en csak a „Minden
+  fájl elérése” engedéllyel látszanak a fájljaik (a tárhely-engedéllyel csak a mappák), és ehhez a
+  firmware-ben nincs beállítási oldal. A 0.2.9 óta a VLC FEL induláskor rootból megadja magának
+  (ha a root ki van kapcsolva, egy másodpercnél rövidebb időre bekapcsolja, utána visszaállítja).
 
 DEMO MÓD (FEL vs. BL)
 ---------------------
@@ -126,6 +130,12 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.9-poc (app-javítás, a modulok, a libdvfelplay és a VLC-javítások változatlanok) – látszanak az
+          USB-s / belső meghajtók fájljai (eddig csak a mappáik): a lejátszó médiaindexe kihagyja a
+          meghajtókat, Android 11-en pedig „Minden fájl elérése” nélkül egy app ott csak az indexelt
+          fájlokat látja, és a firmware-ben nincs oldal ennek a megadására. A VLC FEL most induláskor
+          rootból megadja magának: su-val, vagy ha a root ki van kapcsolva, egy pillanatra (~0,7 s)
+          bekapcsolja, utána visszaállítja (egy közbeni összeomlás után a következő induláskor).
 0.2.8-poc (VLC-javítások, a modulok és a libdvfelplay változatlanok) – hang bitstreamként (HDMI
           passthrough): TrueHD (MAT) és DTS-HD MA 8 csatornás 192 kHz-es HBR-en (eddig a TrueHD-t nem
           ismerte fel, a DTS-HD-ból csak a core ment át), E-AC-3, AC-3, DTS; a hang passthrough-ban is
@@ -216,6 +226,10 @@ REQUIREMENTS
   the tested firmware).
 - Root access for the module installation. If it is switched off on the player, VLC FEL asks whether
   to switch it on for the installation ("Install"), and switches it off again afterwards.
+- USB / internal drives: the player's media index leaves them out, so on Android 11 their files show
+  only with "All files access" (the storage permission shows the folders only), and the firmware has
+  no settings page for it. Since 0.2.9 VLC FEL grants it to itself with root at its start (if the
+  root access is off, it is switched on for under a second and then restored).
 
 DEMO MODE (FEL vs. BASE LAYER)
 ------------------------------
@@ -299,6 +313,12 @@ NOTES
 
 CHANGES
 -------
+0.2.9-poc (app fix; modules, libdvfelplay and VLC patches unchanged) – the files of USB / internal
+          drives show (before: their folders only). The player's media index leaves the drives out, and
+          on Android 11 an app without "All files access" sees only indexed files there; the firmware
+          has no page to allow it. VLC FEL now grants it to itself with root at its start: with su, or
+          if the root access is off, it is switched on for a moment (~0.7 s) and restored afterwards
+          (after a crash in between, at the next start).
 0.2.8-poc (VLC fixes, modules and libdvfelplay unchanged) – audio as a bitstream (HDMI passthrough):
           TrueHD (MAT) and DTS-HD MA on 8 channel 192 kHz HBR (TrueHD was not detected before, of
           DTS-HD only the core went through), E-AC-3, AC-3, DTS; pass-through audio in sync with the

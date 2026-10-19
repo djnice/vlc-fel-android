@@ -1,0 +1,150 @@
+diff --git a/application/vlc-android/src/org/videolan/vlc/StartActivity.kt b/application/vlc-android/src/org/videolan/vlc/StartActivity.kt
+index 5410f79..3331c6b 100644
+--- a/application/vlc-android/src/org/videolan/vlc/StartActivity.kt
++++ b/application/vlc-android/src/org/videolan/vlc/StartActivity.kt
+@@ -79,6 +79,7 @@ import org.videolan.vlc.gui.onboarding.ONBOARDING_DONE_KEY
+ import org.videolan.vlc.gui.onboarding.startOnboarding
+ import org.videolan.vlc.gui.video.VideoPlayerActivity
+ import org.videolan.vlc.media.MediaUtils
++import org.videolan.vlc.util.DuneRoot
+ import org.videolan.vlc.util.FileUtils
+ import org.videolan.vlc.util.Permissions
+ import org.videolan.vlc.util.Util
+@@ -308,6 +309,8 @@ class StartActivity : FragmentActivity() {
+                     if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P && !awaitAppIsForegroung()) {
+                         return@launch
+                     }
++                    // VLC FEL: a Dune's drives show no files without "all files access" (DuneRoot)
++                    withContext(Dispatchers.IO) { DuneRoot.grantAllFilesAccess(applicationContext) }
+                     this@StartActivity.startMedialibrary(firstRun, upgrade, true, removeDevices)
+                     if (onboarding) settings.putSingle(ONBOARDING_DONE_KEY, true)
+                 }
+diff --git a/application/vlc-android/src/org/videolan/vlc/gui/helpers/hf/StoragePermissionsDelegate.kt b/application/vlc-android/src/org/videolan/vlc/gui/helpers/hf/StoragePermissionsDelegate.kt
+index 860dc3d..4468b1d 100644
+--- a/application/vlc-android/src/org/videolan/vlc/gui/helpers/hf/StoragePermissionsDelegate.kt
++++ b/application/vlc-android/src/org/videolan/vlc/gui/helpers/hf/StoragePermissionsDelegate.kt
+@@ -54,6 +54,7 @@ import org.videolan.tools.putSingle
+ import org.videolan.vlc.StartActivity
+ import org.videolan.vlc.gui.dialogs.PermissionListDialog
+ import org.videolan.vlc.gui.onboarding.ONBOARDING_DONE_KEY
++import org.videolan.vlc.util.DuneRoot
+ import org.videolan.vlc.util.FileUtils
+ import org.videolan.vlc.util.Permissions
+ import org.videolan.vlc.util.Permissions.canReadStorage
+@@ -196,6 +197,12 @@ class StoragePermissionsDelegate : BaseHeadlessFragment() {
+             if (isFinishing) return false
+             Settings.getInstance(this).putSingle(INITIAL_PERMISSION_ASKED, true)
+             val model : PermissionViewmodel by viewModels()
++            // VLC FEL: on a Dune the storage permission shows the drives' folders but not
++            // their files, and there is no "all files access" page: granted with root
++            if (!onlyMedia && withContext(Dispatchers.IO) { DuneRoot.grantAllFilesAccess(this@getStoragePermission, force = true) }) {
++                storageAccessGranted.value = true
++                return true
++            }
+             if (model.isCompleted && storageAccessGranted.value == true) return model.deferredGrant.getCompleted()
+             if (model.permissionPending) {
+                 val fragment = supportFragmentManager.findFragmentByTag(TAG) as? StoragePermissionsDelegate
+diff --git a/application/vlc-android/src/org/videolan/vlc/util/DuneRoot.kt b/application/vlc-android/src/org/videolan/vlc/util/DuneRoot.kt
+new file mode 100644
+index 0000000..b0c60af
+--- /dev/null
++++ b/application/vlc-android/src/org/videolan/vlc/util/DuneRoot.kt
+@@ -0,0 +1,98 @@
++package org.videolan.vlc.util
++
++import android.content.Context
++import android.os.Build
++import android.util.Log
++import org.videolan.resources.util.isExternalStorageManager
++import org.videolan.tools.Settings
++import org.videolan.tools.putSingle
++
++/**
++ * "All files access" (MANAGE_EXTERNAL_STORAGE) with root, for Dune HD / R_volution boxes.
++ *
++ * Their MediaProvider does not index the USB / internal drives, and on Android 11
++ * an app without "all files access" sees only the indexed files through the FUSE
++ * mount: the drive's folders show, its files do not. These boxes have no settings
++ * page for the access either (ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION: no
++ * activity), so it is set with root: `appops set <pkg> MANAGE_EXTERNAL_STORAGE
++ * allow`. When su is off (persist.vendor.root_access 0, the firmware's switch for
++ * its su daemon; an app may set it on this firmware, as the kernel module
++ * installer of libdvfelplay does), it is turned on for the moment and back as it
++ * was after.
++ */
++object DuneRoot {
++    private const val TAG = "VLC/DuneRoot"
++    private const val ROOT_PROP = "persist.vendor.root_access"
++    // the time of the last failed try (no su, or a rooted box's user said no): no
++    // new try at the app's start for a day (an explicit request still tries)
++    private const val KEY_ROOT_FAILED = "fel_all_files_root_failed"
++    // the root access's value while it is on for the moment
++    private const val KEY_ROOT_PREVIOUS = "fel_root_access_previous"
++
++    @Volatile private var tried = 0L
++
++    private fun sh(cmd: String): String = runCatching {
++        val p = ProcessBuilder("sh", "-c", cmd).redirectErrorStream(true).start()
++        p.inputStream.bufferedReader().readText().also { p.waitFor() }
++    }.getOrDefault("")
++
++    /** [cmd] run as root; false: no root (or it failed) */
++    private fun suOk(cmd: String): Boolean = runCatching {
++        val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
++        p.inputStream.bufferedReader().readText()
++        p.waitFor() == 0
++    }.getOrDefault(false)
++
++    private fun isDune() = sh("getprop dune.afrc.afr").isNotBlank()
++
++    /**
++     * [block] with the Dune's root access on for the moment; null: su did not come up. The value it had is kept
++     * ([KEY_ROOT_PREVIOUS]) until it is back, so that a crash in the meantime does not leave it on: [restoreRoot]
++     */
++    private fun <T> withRootOn(context: Context, block: () -> T): T? {
++        val previous = sh("getprop $ROOT_PROP").trim()
++        Log.i(TAG, "root access on for the moment (was '$previous')")
++        Settings.getInstance(context).edit().putString(KEY_ROOT_PREVIOUS, previous).commit()
++        sh("setprop $ROOT_PROP 1")
++        try {
++            for (i in 0 until 20) {
++                Thread.sleep(500)
++                if (suOk("true")) return block()
++            }
++            Log.w(TAG, "su still unavailable")
++            return null
++        } finally {
++            restoreRoot(context)
++        }
++    }
++
++    /** the root access back as it was, when [withRootOn] did not get to it (the app died) */
++    private fun restoreRoot(context: Context) {
++        val settings = Settings.getInstance(context)
++        val previous = settings.getString(KEY_ROOT_PREVIOUS, null) ?: return
++        sh("setprop $ROOT_PROP '$previous'")
++        settings.edit().remove(KEY_ROOT_PREVIOUS).commit()
++        Log.i(TAG, "root access back to '$previous'")
++    }
++
++    /**
++     * Grants the app "all files access" with root (blocking: call it off the main
++     * thread). [force]: an explicit request (the storage permission asked), else at
++     * most once a minute and not for a day after su failed. True: the app has it.
++     */
++    fun grantAllFilesAccess(context: Context, force: Boolean = false): Boolean {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
++        restoreRoot(context)
++        if (isExternalStorageManager()) return true
++        val now = System.currentTimeMillis()
++        val settings = Settings.getInstance(context)
++        if (!force && (now - tried < 60_000 || now - settings.getLong(KEY_ROOT_FAILED, 0L) < 86_400_000L)) return false
++        tried = now
++        val cmd = "appops set ${context.packageName} MANAGE_EXTERNAL_STORAGE allow"
++        if (!suOk(cmd) && isDune()) withRootOn(context) { suOk(cmd) }
++        val ok = isExternalStorageManager()
++        Log.i(TAG, if (ok) "all files access granted (root)" else "no root for all files access")
++        if (ok) Permissions.emptyCache() else settings.putSingle(KEY_ROOT_FAILED, now)
++        return ok
++    }
++}
