@@ -1,0 +1,48 @@
+From 809f10ac4af4e005e42c837ded001534158b2435 Mon Sep 17 00:00:00 2001
+From: Aidar Garikhanov <a1d4r@yandex.ru>
+Date: Tue, 20 Oct 2026 18:05:21 +0300
+Subject: [PATCH] ts: no base layer picture let go ahead of its dual PID
+ enhancement layer
+
+MVCFinishDep let the held base view PES go on while the AU it had just
+queued was not older than they were, and read p_au->i_dts again at every
+turn. The first MVCReleaseHeld merges that AU (MVCMerge: DVWrapEL, or the
+ParsePESDataChain gather for 3D MVC, releases it), so from the second turn
+on the condition read freed memory. Two base view PES are held after an
+enhancement layer PES with no PES_packet_length (an EL AU over 64 KiB ends
+only at the next EL PES start, when the next base view PES is complete and
+held): once the freed block was reused, that next base view PES went on
+before its EL had come, "Dolby Vision: no enhancement layer for dts ...
+(0 queued from -1)", a picture without its EL and RPU, and the EL decoder
+waited for the next IRAP (FEL drop outs at other pictures in every run).
+The AU's DTS is now kept before it is queued.
+
+Message-Id: <20261020-dvfel-ts-dual-pid-merge-uaf@a1d4r>
+---
+ modules/demux/mpeg/ts.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 0c119c8d63..ee3944ec0a 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -1704,6 +1704,7 @@ static void MVCFinishDep( demux_t *p_demux )
+     p_au->i_dts = i_dts != TS_90KHZ_INVALID ? i_dts : i_pts;
+     p_au->i_pts = VLC_TICK_INVALID;
+     p_au->i_flags = 0;
++    const ts_90khz_t i_au_dts = p_au->i_dts; /* p_au is freed once merged */
+ 
+     block_ChainLastAppend( &p_sys->mvc.pp_queue_last, p_au );
+     if( ++p_sys->mvc.i_queue > MVC_QUEUE_MAX )
+@@ -1718,7 +1719,7 @@ static void MVCFinishDep( demux_t *p_demux )
+     /* the held base view PES up to this AU go on */
+     while( p_sys->mvc.i_held &&
+            ( p_sys->mvc.held[0].i_dts == TS_90KHZ_INVALID ||
+-             MVCDiff( p_au->i_dts, p_sys->mvc.held[0].i_dts ) >= 0 ) )
++             MVCDiff( i_au_dts, p_sys->mvc.held[0].i_dts ) >= 0 ) )
+         MVCReleaseHeld( p_demux );
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
