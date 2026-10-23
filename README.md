@@ -225,6 +225,15 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **Dune HD plugin `dvfel 2026.10.23.3`** (kernel module only; the apps unchanged, their bundled module stays
+  `2026.10.15.1`): for the Dune HD firmware that brings the module itself (r25), as the plugin
+  `dune_plugin_s928x_dvfel-2026.10.23.3-0.2.10.zip`. In **Blu-ray menu mode** FEL is composed from the start of the
+  main movie and after seeks: the player keeps one video composer session across the titles, so the compositor
+  connected while the composer already played to the display and dvfel never got into the path (0 frames
+  composed); dvfel now joins the running path. **No stutter in a MEL / SDR title after a FEL one** (e.g. a 4K
+  59.94p MEL film after a FEL intro): dvfel stayed in the path without a compositor, copied every frame through
+  VICP (~25 ms per 2160p frame, ~40% of the frames dropped) and, passed through, put them out in pairs; it now
+  leaves the running path when the compositor is gone, so such titles play as without dvfel.
 - **v0.2.9-poc** (app patch 0002; modules, libdvfelplay and the VLC patches unchanged): the **files of USB /
   internal drives** show (users' report: folders only). The player's media index leaves its drives out, and on
   Android 11 an app without "all files access" sees only indexed files there; the firmware has no page to allow

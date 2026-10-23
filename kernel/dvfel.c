@@ -199,7 +199,9 @@ MODULE_PARM_DESC(early_release, "give the upstream frame back right after (A): -
  * an S5 never decodes) is rewritten to route video_composer.0 through dvfel.
  */
 #define VC_MAP_ID	"dvelpath2"
-#define VC_MAP_ON	"video_composer.0 " DRV_NAME " video_render.0"
+#define VC_NAME		"video_composer.0"
+#define VC_RENDER	"video_render.0"
+#define VC_MAP_ON	VC_NAME " " DRV_NAME " " VC_RENDER
 #define VC_MAP_OFF	"dveldec2 dvel"
 #ifdef DVFEL_KERNEL_54
 static int vc_path = 2;
@@ -340,6 +342,19 @@ struct dvfel_dev {
 	int gets_this_vsync;
 	bool vc_on;		/* VC_MAP_ID routes video_composer.0 through dvfel */
 	struct work_struct vc_work;
+	/*
+	 * dvfel joined a running video_composer.0 path (vc_join): the display
+	 * gives the composer's frames it took before back through dvfel
+	 */
+	bool joined;
+	struct vframe_provider_s join_prov;
+	u64 joins, join_puts;
+	/*
+	 * vc_leave: dvfel leaves a running path without a compositor (stage A
+	 * takes nothing while leaving; a_busy: it holds a frame just taken)
+	 */
+	bool leaving, leave_pending, a_busy;
+	u64 leaves;
 	bool new_stream;
 	bool shown_new;		/* the display took a frame since the last reset */
 
@@ -1452,12 +1467,198 @@ static void detach_orig(struct dvfel_dev *d, struct dvfel_slot *s, struct vframe
 		up_put(d, prev, "previous held frame");
 }
 
+static void dvfel_kick(struct dvfel_dev *d);
+
+/* a new upstream (its REG, or vc_join); process context */
+static void up_attach(struct dvfel_dev *d, const char *name)
+{
+	unsigned long flags;
+
+	cancel_delayed_work_sync(&d->free_work);
+	spin_lock_irqsave(&d->lock, flags);
+	dvfel_reset_locked(d);
+	d->up_held = NULL;
+	d->prov_reg = true;
+	d->joined = false;
+	d->vc_upstream = name && !strncmp(name, "video_composer", 14);
+	d->early = early_release > 0 || (early_release < 0 && d->vc_upstream);
+	d->dump_left = 40;
+	d->in_seq = 0;
+	spin_unlock_irqrestore(&d->lock, flags);
+	if (d->early)
+		pr_info(DRV_NAME ": upstream %s: early release\n", name);
+}
+
+/* video_composer.0 plays straight to the display (not through dvfel) */
+static bool vc_direct(void)
+{
+	struct vframe_provider_s *p = vf_get_provider(VC_RENDER);
+
+	return p && p->name && !strcmp(p->name, VC_NAME);
+}
+
+/*
+ * The compositor connected while video_composer.0 already plays to the
+ * display: a Blu-ray player in menu mode keeps one composer session across
+ * the titles (MEL menu or intro, then the FEL main title), so no upstream
+ * REG would ever reach dvfel. dvfel joins the running path instead. Its
+ * provider is registered while no map lists it yet, and vfm activates the
+ * rewritten map only at the next provider (un)registration (join_prov):
+ * the display gets no REG, which would make it drop the composer's frames
+ * it holds without giving them back (their release fences would never
+ * signal and the decoder would stall); it gives them back through dvfel
+ * (dvfel_put). Process context, client_lock held.
+ */
+static void vc_join(struct dvfel_dev *d, char *id, char *on)
+{
+	struct vframe_provider_s *p;
+	unsigned long flags;
+
+	up_attach(d, VC_NAME);
+	spin_lock_irqsave(&d->lock, flags);
+	d->joined = true;
+	spin_unlock_irqrestore(&d->lock, flags);
+	vf_reg_provider(&d->prov);
+	vfm_map_remove(id);
+	if (vfm_map_add(id, on) < 0) {
+		pr_err(DRV_NAME ": cannot set vfm map %s\n", id);
+		goto undo;
+	}
+	d->vc_on = true;
+	vf_reg_provider(&d->join_prov);
+	vf_unreg_provider(&d->join_prov);
+	p = vf_get_provider(DRV_NAME);
+	if (!p || !p->name || strcmp(p->name, VC_NAME)) {
+		pr_warn(DRV_NAME ": " VC_NAME " gone while joining its path\n");
+		goto undo;
+	}
+	d->joins++;
+	pr_info(DRV_NAME ": joined the running " VC_NAME " path\n");
+	dvfel_kick(d);
+	return;
+undo:
+	spin_lock_irqsave(&d->lock, flags);
+	d->prov_reg = false;
+	d->joined = false;
+	dvfel_reset_locked(d);
+	spin_unlock_irqrestore(&d->lock, flags);
+	vf_unreg_provider(&d->prov);
+}
+
+/*
+ * The compositor is gone but video_composer.0 keeps playing through dvfel
+ * (Blu-ray menu mode: a MEL or SDR title after a FEL one): dvfel leaves the
+ * running path, the reverse of vc_join, so the display takes the composer's
+ * frames itself again (passed through dvfel its cadence suffers: at 60 fps
+ * frames went out in pairs). Only once the display holds none of dvfel's own
+ * frames (it gives them back to their provider, which would then be the
+ * composer); retried from dvfel_put. The composer frames queued in dvfel go
+ * back to it; those the display holds it gives back to the composer itself.
+ * The map is switched back while nothing goes through dvfel, and its
+ * provider is unregistered once no map lists it, so the display gets no
+ * UNREG. Process context, client_lock held. Returns true when dvfel left.
+ */
+static bool vc_leave(struct dvfel_dev *d, char *id, char *off)
+{
+	struct vframe_s *back[QUEUE_LEN * 2 + 1];
+	unsigned long flags;
+	int i, n = 0, wait;
+
+	spin_lock_irqsave(&d->lock, flags);
+	for (i = 0; i < d->nslots; i++) {
+		struct dvfel_slot *s = &d->slots[i];
+
+		if (s->state == SLOT_BUSY || (s->state == SLOT_OUT && s->taken)) {
+			d->leave_pending = true;
+			spin_unlock_irqrestore(&d->lock, flags);
+			return false;
+		}
+	}
+	d->leave_pending = false;
+	d->leaving = true;
+	spin_unlock_irqrestore(&d->lock, flags);
+
+	/* a frame stage A has just taken is queued or dropped (reset) shortly */
+	for (wait = 0; wait < 50 && READ_ONCE(d->a_busy); wait++)
+		usleep_range(1000, 2000);
+
+	spin_lock_irqsave(&d->lock, flags);
+	/* not taken by the display yet: composer frames go back, slots are free */
+	while (d->pend_cnt) {
+		struct dvfel_pend *p = &d->pendq[d->pend_head];
+		struct dvfel_slot *s = p->vf ? slot_of(d, p->vf) : NULL;
+
+		if (s)
+			s->state = SLOT_FREE;
+		else if (p->vf && p->job < 0 && p->gen == d->gen)
+			back[n++] = p->vf;
+		pend_pop(d);
+	}
+	while (d->outq_cnt) {
+		struct vframe_s *vf = d->outq[d->outq_head];
+		struct dvfel_slot *s = slot_of(d, vf);
+
+		if (s)
+			s->state = SLOT_FREE;
+		else
+			back[n++] = vf;
+		d->outq_head = (d->outq_head + 1) % QUEUE_LEN;
+		d->outq_cnt--;
+	}
+	if (d->up_held)
+		back[n++] = d->up_held;
+	d->up_held = NULL;
+	/* the passthrough frames the display holds go back to the composer itself */
+	memset(d->pass, 0, sizeof(d->pass));
+	d->up_nown = 0;
+	spin_unlock_irqrestore(&d->lock, flags);
+	for (i = 0; i < n; i++)
+		vf_put(back[i], DRV_NAME);
+
+	vfm_map_remove(id);
+	if (vfm_map_add(id, off) < 0)
+		pr_err(DRV_NAME ": cannot set vfm map %s\n", id);
+	d->vc_on = false;
+	/* listed by no map now: no receiver to notify */
+	vf_unreg_provider(&d->prov);
+
+	spin_lock_irqsave(&d->lock, flags);
+	d->prov_reg = false;
+	d->joined = false;
+	d->leaving = false;
+	dvfel_reset_locked(d);
+	spin_unlock_irqrestore(&d->lock, flags);
+	d->leaves++;
+	d->kick_b = true;
+	wake_up_interruptible(&d->wq_b);
+	schedule_delayed_work(&d->free_work, msecs_to_jiffies(3000));
+	pr_info(DRV_NAME ": left the running " VC_NAME " path (%d frames given back)\n", n);
+	return true;
+}
+
 /* process context; the map may change only while nothing plays through it */
 static void vc_path_apply(struct dvfel_dev *d)
 {
 	char id[] = VC_MAP_ID, on[] = VC_MAP_ON, off[] = VC_MAP_OFF;
 	bool want = vc_path == 1 || (vc_path == 2 && d->client_ready);
 
+	if (want && !d->prov_reg && vc_direct()) {
+		d->leave_pending = false;
+		vc_join(d, id, on);
+		return;
+	}
+	if (want) {
+		d->leave_pending = false;
+	} else if (d->vc_on && d->prov_reg && d->vc_upstream) {
+		/*
+		 * the frames from now on pass through: the upstream frame early
+		 * release kept goes back now (nothing would replace it, and the
+		 * decoder may need its buffer to go on, e.g. after a seek)
+		 */
+		up_release_held(d);
+		vc_leave(d, id, off);
+		return;
+	}
 	if (want == d->vc_on)
 		return;
 	if (d->vc_on && d->prov_reg)
@@ -1990,11 +2191,18 @@ static int dvfel_thread_a(void *data)
 			if (!vc_may_get(d))
 				break;
 			spin_lock_irqsave(&d->lock, flags);
-			if (!d->prov_reg || d->pend_cnt >= QUEUE_LEN || !pass_free(d)) {
+			if (!d->prov_reg || d->leaving || d->pend_cnt >= QUEUE_LEN || !pass_free(d)) {
 				spin_unlock_irqrestore(&d->lock, flags);
 				break;
 			}
-			if (mode) {
+			/*
+			 * a video composer path without a compositor (dvfel stays in
+			 * it until the composer unregisters, e.g. a MEL title after a
+			 * FEL one in Blu-ray menu mode): frames go through untouched.
+			 * The VICP round trip would give the same picture at ~25 ms
+			 * per 2160p frame, too slow for 50/60 fps.
+			 */
+			if (mode && !(mode == 2 && !d->client_ready && d->vc_upstream)) {
 				/*
 				 * backpressure: never fall back to passthrough, except
 				 * to break the held slot deadlock (held_deadlock_locked)
@@ -2021,6 +2229,7 @@ static int dvfel_thread_a(void *data)
 				}
 			}
 			gen = d->gen;
+			d->a_busy = true;
 			spin_unlock_irqrestore(&d->lock, flags);
 
 			vf = vf_peek(DRV_NAME) ? vf_get(DRV_NAME) : NULL;
@@ -2030,6 +2239,7 @@ static int dvfel_thread_a(void *data)
 					s->state = SLOT_FREE;
 				if (j >= 0)
 					d->jobs[j].state = JOB_FREE;
+				d->a_busy = false;
 				spin_unlock_irqrestore(&d->lock, flags);
 				break;
 			}
@@ -2170,6 +2380,7 @@ static int dvfel_thread_a(void *data)
 					s->state = SLOT_FREE;
 				if (j >= 0)
 					d->jobs[j].state = JOB_FREE;
+				d->a_busy = false;
 				spin_unlock_irqrestore(&d->lock, flags);
 				continue;
 			}
@@ -2215,7 +2426,11 @@ static int dvfel_thread_a(void *data)
 				pend_push(d, vf, -1, gen, due, hold);
 				d->frames_pass++;
 			}
+			d->a_busy = false;
 			spin_unlock_irqrestore(&d->lock, flags);
+			/* passed through: no copy stands in for the held upstream frame */
+			if (!ok && !d->client_ready && d->vc_upstream && READ_ONCE(d->up_held))
+				up_release_held(d);
 			d->kick_b = true;
 			wake_up_interruptible(&d->wq_b);
 		}
@@ -2451,7 +2666,7 @@ static struct vframe_s *dvfel_get(void *op_arg)
 static void dvfel_put(struct vframe_s *vf, void *op_arg)
 {
 	struct dvfel_dev *d = op_arg;
-	struct vframe_s *upstream = NULL, *refused = NULL;
+	struct vframe_s *upstream = NULL, *refused = NULL, *foreign = NULL;
 	struct dvfel_slot *s;
 	unsigned long flags;
 	int i;
@@ -2470,6 +2685,9 @@ static void dvfel_put(struct vframe_s *vf, void *op_arg)
 		if (s->state == SLOT_OUT || (s->state == SLOT_HELD && !slot_kept(s)))
 			s->state = SLOT_FREE;
 		s->orig = NULL;
+		/* vc_leave waited for the display to give our frames back */
+		if (d->leave_pending)
+			schedule_work(&d->vc_work);
 	} else {
 		for (i = 0; i < QUEUE_LEN; i++) {
 			if (d->pass[i].vf == vf) {
@@ -2478,6 +2696,14 @@ static void dvfel_put(struct vframe_s *vf, void *op_arg)
 				d->pass[i].vf = NULL;
 				break;
 			}
+		}
+		/*
+		 * taken by the display from the composer before dvfel joined, or
+		 * passed through while it leaves (vc_leave forgot them)
+		 */
+		if (i == QUEUE_LEN && (d->joined || d->leaving) && d->prov_reg) {
+			foreign = vf;
+			d->join_puts++;
 		}
 	}
 	if (!d->prov_reg) {
@@ -2496,6 +2722,8 @@ static void dvfel_put(struct vframe_s *vf, void *op_arg)
 			upstream->rendered = vf->rendered;
 		vf_put(upstream, DRV_NAME);
 	}
+	if (foreign)
+		vf_put(foreign, DRV_NAME);
 	dvfel_kick(d);
 }
 
@@ -2569,18 +2797,7 @@ static int dvfel_recv_event(int type, void *data, void *op_arg)
 	switch (type) {
 	case VFRAME_EVENT_PROVIDER_REG:
 		dvfel_dbg("upstream REG %s\n", data ? (char *)data : "");
-		cancel_delayed_work_sync(&d->free_work);
-		spin_lock_irqsave(&d->lock, flags);
-		dvfel_reset_locked(d);
-		d->up_held = NULL;
-		d->prov_reg = true;
-		d->vc_upstream = data && !strncmp(data, "video_composer", 14);
-		d->early = early_release > 0 || (early_release < 0 && d->vc_upstream);
-		d->dump_left = 40;
-		d->in_seq = 0;
-		spin_unlock_irqrestore(&d->lock, flags);
-		if (d->early)
-			pr_info(DRV_NAME ": upstream %s: early release\n", (char *)data);
+		up_attach(d, data);
 		vf_reg_provider(&d->prov);
 		dvfel_kick(d);
 		break;
@@ -2588,6 +2805,7 @@ static int dvfel_recv_event(int type, void *data, void *op_arg)
 		dvfel_dbg("upstream UNREG\n");
 		spin_lock_irqsave(&d->lock, flags);
 		d->prov_reg = false;
+		d->joined = false;
 		/*
 		 * the provider is gone already (vf_put cannot reach it); the
 		 * composer cleans up what its receiver holds, as for the display
@@ -3151,6 +3369,8 @@ static long dvfel_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (d->client == f) {
 			client_unreg(d);
 			d->client = NULL;
+			/* libdvfelplay keeps the device open: leave a running path now */
+			vc_path_apply(d);
 		}
 		mutex_unlock(&d->client_lock);
 		return 0;
@@ -3215,6 +3435,10 @@ static int stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "queued %d, pending %d\n", d->outq_cnt, d->pend_cnt);
 	seq_printf(m, "upstream frames held %d, refused puts %llu, taken twice %llu, unrecorded %llu, slots lost %llu\n",
 		   d->up_nown, d->up_refused, d->up_dup_gets, d->up_own_full, d->slot_lost);
+	seq_printf(m, "path: map %s, " VC_RENDER " from %s, joins %llu (%s), composer frames given back %llu, leaves %llu%s\n",
+		   d->vc_on ? "on" : "off", vc_direct() ? VC_NAME : "dvfel or none",
+		   d->joins, d->joined ? "joined" : "not joined", d->join_puts, d->leaves,
+		   d->leave_pending ? " (leave pending)" : "");
 	{
 		/* F free, B busy, O out (t: taken by the display), H held; jobs by state */
 		static const char st[] = "FBOH";
@@ -3269,6 +3493,7 @@ static ssize_t stats_reset_write(struct file *f, const char __user *buf,
 	d->frames_in = d->frames_proc = d->frames_pass = d->vicp_err = 0;
 	d->slot_waits = d->held_breaks = 0;
 	d->up_refused = d->up_dup_gets = d->up_own_full = d->slot_lost = 0;
+	d->joins = d->join_puts = d->leaves = 0;
 	memset(d->disp_gap, 0, sizeof(d->disp_gap));
 	memset(d->in_gap, 0, sizeof(d->in_gap));
 	memset(d->av_hist, 0, sizeof(d->av_hist));
@@ -3494,6 +3719,8 @@ static int __init dvfel_init(void)
 
 	vf_receiver_init(&d->recv, DRV_NAME, &dvfel_recv_ops, d);
 	vf_provider_init(&d->prov, DRV_NAME, &dvfel_vf_ops, d);
+	/* in no map: its (un)registration only makes vfm re-evaluate the maps */
+	vf_provider_init(&d->join_prov, DRV_NAME "_join", NULL, d);
 
 	d->thread_a = kthread_run(dvfel_thread_a, d, DRV_NAME "_a");
 	if (IS_ERR(d->thread_a)) {
