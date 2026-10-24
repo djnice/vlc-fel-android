@@ -1,5 +1,7 @@
 # VLC FEL for Android (Dune HD / R_volution, Amlogic S928X)
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%98%95%20buy%20me%20a%20coffee-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/djnice)
+
 > **Proof of concept.** Experimental build for enthusiasts. It installs a kernel module on your player –
 > use at your own risk.
 
