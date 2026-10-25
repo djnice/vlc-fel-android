@@ -272,6 +272,10 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **Dune HD plugin `2026.10.25.1-0.2.10`** (libdvfelplay only; the module stays `dvfel 2026.10.23.3`): the
+  firmware's copy of libdvfelplay is the one of v0.2.10-poc (`2026.10.25.2`), as the plugin
+  `dune_plugin_s928x_dvfel-2026.10.25.1-0.2.10.zip`. Playback on the S928X as with the plugin before; restart the
+  player after the installation (the library changed).
 - **v0.2.10-poc** (libdvfelplay `2026.10.25.2`, kernel modules `dvfel 2026.10.23.3` (S928X) and `dvfel
   2026.10.25.4` (S905X4, new), VLC patch 0020, app patch 0001; 3D MVC unchanged): **Amlogic S905X4 Dune HD
   players** – profile 7 FEL composed by the SoC's Dolby Vision core, the EL decoded by VLC FEL and handed to
