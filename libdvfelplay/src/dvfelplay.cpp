@@ -30,6 +30,7 @@
 
 #include "dvfelplay.h"
 
+#include "dvfel_sc2_uapi.h"
 #include "dvfel_uapi.h"
 #include "felgpu.h"
 
@@ -78,7 +79,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.16.1"
+#define DVFP_VERSION "2026.10.25.2"
 
 namespace
 {
@@ -104,6 +105,22 @@ constexpr int EL_POOL = 12;
 // carries the decoder frame
 constexpr const char* HW_EL_CODEC = "OMX.amlogic.hevc.decoder.awesome2";
 constexpr int HW_EL_IMAGES = 2;
+// SC2 (S905X4): the Dolby Vision core composes. Each EL picture goes to the
+// kernel and its image back to the reader at once, with a release fence: the
+// decoder decodes into the buffer again only after the display. The decoder
+// has 12 output buffers in all: the reader gets 3 images (4: the decoder
+// cannot allocate its buffers)
+constexpr int SC2_EL_IMAGES = 3;
+constexpr const char* PROP_SC2_IMAGES = "debug.dvfp.sc2_images"; // test: SC2_EL_IMAGES
+// EL pictures the kernel holds (queued ahead of their frames, on display)
+constexpr int SC2_EL_AHEAD = 4;
+// the pictures in the decoder and the ones with the kernel stay below the 12
+// buffers, or the decoder waits for a fence (1 s) and then decodes into a
+// buffer still on display (seen in a pause)
+constexpr int SC2_EL_BUFFERS = 8; // 6: the decoder gives no output, 10: more fence waits
+constexpr const char* PROP_SC2_BUFFERS = "debug.dvfp.sc2_buffers"; // test: SC2_EL_BUFFERS
+// the SC2 kernel module this library talks to
+constexpr const char* MIN_MODULE_SC2 = "2026.10.25.2";
 constexpr int HW_EL_IMAGE_WAIT_MS = 40;
 // a picture still in the EL decoder this far (us) behind its latest output
 // will not come out any more (dropped by the decoder as broken)
@@ -220,6 +237,17 @@ std::string ReadLine(const char* path)
   std::string s;
   std::getline(f, s);
   return s;
+}
+
+// an Amlogic S905X4 (SC2): FEL composition by the SoC's Dolby Vision core
+// (the dvfel SC2 module), not on the GPU
+bool IsSc2()
+{
+  static const bool sc2 = [] {
+    char v[PROP_VALUE_MAX] = {};
+    return __system_property_get("ro.board.platform", v) > 0 && !strcmp(v, "sc2");
+  }();
+  return sc2;
 }
 
 int PropInt(const char* name, int fallback)
@@ -763,6 +791,13 @@ private:
   bool StartElDecoder();
   void ElThread();
   void GpuThread(std::promise<bool> ready);
+  // SC2: hands an EL picture (the image of pts) to the kernel, which keeps it
+  // until the display is done with it; false: the image is deleted
+  bool Sc2Queue(AImage* image, int64_t pts);
+  // SC2: deletes the images the display is done with (DVFEL_IOC_SC2_WAIT_DONE)
+  void Sc2DoneThread();
+  // SC2: deletes all images (after the session ended)
+  void Sc2ReleaseAll();
   // takes the EL frame of pts out of m_elFrames; release with ReleaseElFrame
   bool WaitForFrame(int64_t pts, ElFrame& el);
   void ReleaseElFrame(ElFrame& el); // m_lock held
@@ -778,6 +813,14 @@ private:
   int m_elPoolFd[EL_POOL];
   bool m_elPoolBusy[EL_POOL]{};
   bool m_started{false};
+  // SC2: composition by the Dolby Vision core (FEL mode on an S905X4)
+  bool m_sc2{false};
+  std::set<uint32_t> m_sc2Ids;             // EL pictures the kernel holds (ids), m_lock
+  std::atomic<int> m_sc2Held{0};           // their number
+  int m_sc2MaxImages{SC2_EL_IMAGES};       // the reader's images
+  int m_sc2Buffers{SC2_EL_BUFFERS};        // pictures in the decoder + with the kernel
+  std::thread m_sc2DoneThread;
+  uint64_t m_sc2QueueErrors{0};
   std::atomic<bool> m_stop{false};
   std::atomic<int> m_leadUs{0}; // the kernel holds the frames back by this (DVFEL_IOC_SET_LEAD)
   std::atomic<int> m_demo{0};   // dvfp_set_demo (debug.dvfp.demo 1 turns it on too)
@@ -896,7 +939,8 @@ int dvfp::Filter(const uint8_t* in, size_t size, const uint8_t** out, size_t* ou
       const DoviData* converted = nullptr;
       DoviRpuOpaque* rpu = dovi_parse_unspec62_nalu(nal, n);
       const DoviRpuDataHeader* hdr = rpu ? dovi_rpu_get_header(rpu) : nullptr;
-      if (hdr && hdr->guessed_profile == 7)
+      // SC2: the Dolby Vision core composes with the original profile 7 RPU
+      if (hdr && hdr->guessed_profile == 7 && !m_sc2)
       {
         // profile 8.1 with a no-op mapping (libdovi mode 2)
         if (dovi_convert_rpu_with_mode(rpu, 2) >= 0)
@@ -981,6 +1025,14 @@ void dvfp::Commit(int64_t pts)
   if (meta)
     m_lastMeta = meta;
 
+  if (m_sc2 && m_pendingCrcValid)
+  {
+    // the kernel names the frames the display shows by these
+    dvfel_sc2_hint hint{};
+    hint.pts_us = pts;
+    hint.rpu_crc = m_pendingCrc;
+    ioctl(m_elDev, DVFEL_IOC_SC2_BL_HINT, &hint);
+  }
   std::lock_guard<std::mutex> lock(m_lock);
   if (m_pendingCrcValid)
   {
@@ -1028,6 +1080,12 @@ void dvfp::Flush()
   // (VLC restarts its decoder between the filter and the queueing)
   if (!m_started)
     return;
+  if (m_sc2)
+  {
+    // the frames before the seek are not shown any more (or without EL)
+    uint32_t what = DVFEL_SC2_FLUSH_EL | DVFEL_SC2_FLUSH_HINTS;
+    ioctl(m_elDev, DVFEL_IOC_SC2_FLUSH, &what);
+  }
   std::lock_guard<std::mutex> lock(m_lock);
   m_elQueue.clear();
   m_elQueue.push_back({0, {}, nullptr, true});
@@ -1098,6 +1156,46 @@ bool dvfp::Start(int width, int height)
   m_noPairLogged = 0;
   m_noCrcLogged = 0;
 
+  if (IsSc2())
+  {
+    // the Dolby Vision core composes: the EL decoder only, its pictures to the kernel
+    m_sc2 = true;
+    m_sc2Held = 0;
+    m_sc2MaxImages = std::clamp(PropInt(PROP_SC2_IMAGES, SC2_EL_IMAGES), 3, 16);
+    m_sc2Buffers = std::clamp(PropInt(PROP_SC2_BUFFERS, SC2_EL_BUFFERS), 4, 16);
+    if (!StartElDecoder())
+    {
+      m_sc2 = false;
+      return false;
+    }
+    if (ioctl(m_elDev, DVFEL_IOC_SC2_START) < 0)
+    {
+      LOGE("DVFEL_IOC_SC2_START failed: %s", strerror(errno));
+      AMediaCodec_stop(m_elCodec);
+      AMediaCodec_delete(m_elCodec);
+      AImageReader_delete(m_reader);
+      close(m_elDev);
+      m_elCodec = nullptr;
+      m_reader = nullptr;
+      m_elDev = -1;
+      m_sc2 = false;
+      return false;
+    }
+    m_elThread = std::thread(&dvfp::ElThread, this);
+    m_sc2DoneThread = std::thread(&dvfp::Sc2DoneThread, this);
+    m_started = true;
+    // the player's sign that a FEL composition runs (removed by Stop); no demo mode here
+    const int sfd = open(AppFile("dvfp_fel").c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (sfd >= 0)
+    {
+      const char state[] = "demo=0\nsc2=1\n";
+      (void)!write(sfd, state, sizeof(state) - 1);
+      close(sfd);
+    }
+    LOGI("FEL composition by the Dolby Vision core started for %dx%d (SC2)", width, height);
+    return true;
+  }
+
   std::promise<bool> ready;
   std::future<bool> ok = ready.get_future();
   m_gpuThread = std::thread(&dvfp::GpuThread, this, std::move(ready));
@@ -1149,7 +1247,7 @@ bool dvfp::StartElDecoder()
   bool ok = m_api.Load() && m_elDev >= 0;
   if (ok)
     ok = m_api.newWithUsage(m_elWidth, m_elHeight, AIMAGE_FORMAT_PRIVATE_, AHB_USAGE_GPU_SAMPLED_IMAGE,
-                            HW_EL_IMAGES, &m_reader) == AMEDIA_OK &&
+                            m_sc2 ? m_sc2MaxImages : HW_EL_IMAGES, &m_reader) == AMEDIA_OK &&
          AImageReader_getWindow(m_reader, &window) == AMEDIA_OK;
   if (ok)
   {
@@ -1203,6 +1301,16 @@ void dvfp::Stop()
     m_elThread.join();
   if (m_gpuThread.joinable())
     m_gpuThread.join();
+  if (m_sc2DoneThread.joinable())
+    m_sc2DoneThread.join();
+  if (m_sc2)
+  {
+    // the queued pictures go back; the one on display stays with the kernel
+    // (its dma-buf reference) until the driver lets it go
+    if (m_elDev >= 0)
+      ioctl(m_elDev, DVFEL_IOC_SC2_STOP);
+    Sc2ReleaseAll();
+  }
 
   if (m_elCodec)
   {
@@ -1267,6 +1375,75 @@ void dvfp::ReleaseElFrame(ElFrame& el)
   }
   el.buf = -1;
   el.meta.reset();
+}
+
+bool dvfp::Sc2Queue(AImage* image, int64_t pts)
+{
+  uint32_t crc = 0;
+  {
+    std::lock_guard<std::mutex> lock(m_lock);
+    auto c = m_crcByPts.find(pts);
+    if (c != m_crcByPts.end())
+      crc = c->second;
+  }
+  AHardwareBuffer* hb = nullptr;
+  const NdkImageApi::NativeHandle* h = nullptr;
+  if (m_api.getHardwareBuffer(image, &hb) == AMEDIA_OK && hb)
+    h = m_api.getNativeHandle(hb);
+  dvfel_sc2_el el{};
+  el.fence_fd = -1;
+  bool queued = false;
+  if (h && h->numFds > 0)
+  {
+    el.fd = h->data[0];
+    el.rpu_crc = crc;
+    el.pts_us = pts;
+    queued = ioctl(m_elDev, DVFEL_IOC_SC2_EL_QUEUE, &el) == 0;
+    if (!queued && m_sc2QueueErrors++ < 10)
+      LOGE("DVFEL_IOC_SC2_EL_QUEUE failed for %lld us: %s", (long long)pts, strerror(errno));
+  }
+  else if (m_sc2QueueErrors++ < 10)
+  {
+    LOGI("EL picture %lld us not queued (no buffer)", (long long)pts);
+  }
+  // the image goes back at once; the decoder waits on the fence before it
+  // decodes into the buffer again (the display shows it until then)
+  AImage_deleteAsync(image, queued ? el.fence_fd : -1);
+  if (!queued)
+    return false;
+  std::lock_guard<std::mutex> lock(m_lock);
+  m_sc2Ids.insert(el.id);
+  m_sc2Held = static_cast<int>(m_sc2Ids.size());
+  return true;
+}
+
+void dvfp::Sc2DoneThread()
+{
+  pthread_setname_np(pthread_self(), "dvfp-sc2");
+  while (!m_stop)
+  {
+    dvfel_sc2_done done{};
+    done.timeout_ms = 100;
+    if (ioctl(m_elDev, DVFEL_IOC_SC2_WAIT_DONE, &done) < 0)
+    {
+      if (errno != EINTR)
+        usleep(10000);
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(m_lock);
+    for (uint32_t i = 0; i < done.count && i < DVFEL_SC2_MAX_DONE; i++)
+      m_sc2Ids.erase(done.id[i]);
+    m_sc2Held = static_cast<int>(m_sc2Ids.size());
+    if (done.count)
+      m_elCond.notify_all();
+  }
+}
+
+void dvfp::Sc2ReleaseAll()
+{
+  std::lock_guard<std::mutex> lock(m_lock);
+  m_sc2Ids.clear();
+  m_sc2Held = 0;
 }
 
 void dvfp::GetStats(dvfp_stats& s) const
@@ -1364,12 +1541,20 @@ void dvfp::ElThread()
       int buf;
       {
         std::lock_guard<std::mutex> lock(m_lock);
-        buf = freeBuf();
-        if (buf >= 0)
-          m_elPoolBusy[buf] = true;
+        if (m_sc2)
+        {
+          // no pool: the image goes to the kernel and back at once
+          buf = 0;
+        }
+        else
+        {
+          buf = freeBuf();
+          if (buf >= 0)
+            m_elPoolBusy[buf] = true;
+        }
       }
       auto unbusy = [&] {
-        if (buf < 0)
+        if (buf < 0 || m_sc2)
           return;
         std::lock_guard<std::mutex> lock(m_lock);
         m_elPoolBusy[buf] = false;
@@ -1425,6 +1610,13 @@ void dvfp::ElThread()
       if (buf >= 0 && !image && lateImages++ < 10)
         LOGI("no EL image for output %lld us", (long long)info.presentationTimeUs);
       bool imported = false;
+      // SC2: the image itself goes to the kernel once its frame is known
+      AImage* keep = nullptr;
+      if (image && m_sc2)
+      {
+        keep = image;
+        image = nullptr;
+      }
       if (image)
       {
         AHardwareBuffer* hb = nullptr;
@@ -1456,6 +1648,8 @@ void dvfp::ElThread()
       if (slots.empty())
       {
         unbusy();
+        if (keep)
+          AImage_delete(keep);
         continue;
       }
       const int64_t slot = *slots.begin();
@@ -1483,6 +1677,14 @@ void dvfp::ElThread()
         meta = std::move(m->second);
         metas.erase(m);
       }
+      if (m_sc2)
+      {
+        // the frame of display time pts takes it (by the CRC of its RPU)
+        lock.unlock();
+        if (keep && Sc2Queue(keep, pts))
+          m_elDecoded++;
+        continue;
+      }
       if (!imported || !meta)
       {
         if (buf >= 0)
@@ -1503,6 +1705,12 @@ void dvfp::ElThread()
   // its next IRAP, the frames before it are shown without EL at once
   auto flushDecoder = [&] {
     AMediaCodec_flush(codec);
+    // SC2: the EL pictures queued for frames before the seek go back
+    if (m_sc2)
+    {
+      uint32_t what = DVFEL_SC2_FLUSH_EL;
+      ioctl(dev, DVFEL_IOC_SC2_FLUSH, &what);
+    }
     m_elOutputs = m_elInputs.load(); // the pictures in the decoder are gone
     inFlight.clear();
     m_elInFlight = 0;
@@ -1537,6 +1745,14 @@ void dvfp::ElThread()
       // pace decoding by the display: stay at most EL_LEAD_US ahead of the
       // last requested frame; the pool bounds it too
       auto paced = [this] {
+        // SC2: the display paces it: the pictures in the decoder and the ones
+        // the kernel holds (queued ahead of their frames, on display) need
+        // reader images
+        if (m_sc2)
+          // nothing with the kernel (start, seek): the decoder may need more
+          // pictures for its first output than the bound (no fence to wait on)
+          return m_sc2Held == 0 ? m_elInFlight < EL_POOL
+                                : m_sc2Held < SC2_EL_AHEAD && m_sc2Held + m_elInFlight < m_sc2Buffers;
         // the pictures still in the decoder need pool buffers too (before
         // the first frame after a start or flush nothing can be evicted)
         if (static_cast<int>(m_elFrames.size()) + m_elInFlight >= EL_POOL)
@@ -1705,7 +1921,8 @@ void dvfp::ElThread()
         std::lock_guard<std::mutex> lock(m_lock);
         seek = !m_elQueue.empty() && m_elQueue.front().flush;
       }
-      const bool stalled = m_elOutputs.load() == outsBefore &&
+      // SC2: outputs wait while the display holds all images (e.g. pause)
+      const bool stalled = !(m_sc2 && m_sc2Held >= SC2_EL_AHEAD) && m_elOutputs.load() == outsBefore &&
                            std::chrono::steady_clock::now() - waitFrom > std::chrono::milliseconds(EL_STALL_MS);
       if (seek || stalled)
       {
@@ -2254,6 +2471,8 @@ int dvfp_available(void)
 {
   const std::string v = ReadLine("/sys/module/dvfel/version");
   // versions are dates (YYYY.MM.DD[.n]): compare as strings
+  if (IsSc2()) // the Dolby Vision core composes: no GPU buffers (ION)
+    return !v.empty() && v >= std::string(MIN_MODULE_SC2) && access(DVFEL_DEV, R_OK | W_OK) == 0;
   return !v.empty() && v >= std::string(MIN_MODULE) && access(DVFEL_DEV, R_OK | W_OK) == 0 &&
          access(ION_DEV, R_OK) == 0;
 }

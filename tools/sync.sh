@@ -2,6 +2,7 @@
 # Maintainer tool (WSL): copies the working sources into this repository.
 #   kernel/        <- dvfel/kernel (the Android build of the dvfel module)
 #   kernel/mvc3d/  <- dvfel/mvc3d (the 3D MVC frame packed output module)
+#   kernel/sc2/    <- dvfel/sc2/kernel (the dvfel module for the Amlogic S905X4)
 #   libdvfelplay/  <- dvfelplay (git), without the research scripts
 #   libmvc3dplay/  <- mvc3dplay (git)
 #   vlc/           <- vlc/out-patches, vlc/android-patches, vlc/jni-patches, vlc/build-in-docker.sh
@@ -13,6 +14,8 @@ W=${W:-/mnt/c/dovi_s5}
 cp $W/dvfel/kernel/{dvfel.c,dvfel_uapi.h,dvfel_compat.h,Makefile} $R/kernel/
 mkdir -p $R/kernel/mvc3d
 cp $W/dvfel/mvc3d/{mvc3d.c,mvc3d_uapi.h,Makefile} $R/kernel/mvc3d/
+mkdir -p $R/kernel/sc2
+cp $W/dvfel/sc2/kernel/{dvfel_sc2.c,dvfel_sc2_uapi.h,Makefile} $R/kernel/sc2/
 
 M=$R/libmvc3dplay
 rm -rf $M && mkdir -p $M

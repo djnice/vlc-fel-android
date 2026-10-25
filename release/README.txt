@@ -1,4 +1,5 @@
-VLC FEL – Dolby Vision Profile 7 FEL lejátszás S928X-es Dune HD / R_volution lejátszókon (Android)
+VLC FEL – Dolby Vision Profile 7 FEL lejátszás S928X-es Dune HD / R_volution és S905X4-es Dune HD
+lejátszókon (Android)
 =================================================================================================
 PROOF OF CONCEPT – kísérleti build, saját felelősségre.
 
@@ -23,6 +24,9 @@ A 0.2.2 óta demo mód is van: osztott kép, a FEL és a BL összehasonlítása 
 A 0.2.8 óta a hangot bitstreamként (passthrough) is kiadhatja az erősítőnek: Dolby TrueHD (Atmos),
 DTS-HD MA / DTS:X, E-AC-3 (Atmos), AC-3, DTS (lásd lent: HANG BITSTREAMKÉNT).
 
+A 0.2.10 óta Amlogic S905X4-es Dune HD lejátszókon is megy: ott a két réteget a SoC saját Dolby
+Vision magja rakja össze (lásd lent: S905X4).
+
 Előfutással működik: a VLC minden képet
 3 vsync-kel (24 Hz-en 125 ms) korábban ad ki, a kernelmodul pedig a kész képet a saját vsyncjéig
 visszatartja. Így a GPU-nak ~2,5 képkockányi ideje van ~1 helyett: a lejátszás közbeni GPU-kiugrások
@@ -36,6 +40,9 @@ FELTÉTELEK
   Tesztelve: Dune HD Pro 8K Plus, firmware 250815_1012_r22;
              Dune HD Pro One 8K Plus, firmware 260303_1721_r24 és a 2026-08-27-i R24 frissítés
              (egy modul mindegyikre).
+  Vagy Amlogic S905X4-es Dune HD lejátszó R24-es Android firmware-rel.
+  Tesztelve: Dune HD Pro Vision 4K, firmware 260303_1721_r24 (R22-n nem tesztelt; r25 S905X4-re még
+             nincs).
   Más firmware-en / modellen kérjük jelezd,
   hogyan működik (adb logcat -s dvfelplay: a telepítő a tesztelt firmware-től eltérő
   kernelszimbólumokat is kiírja).
@@ -56,6 +63,23 @@ DEMO MÓD (FEL vs. BL)
   közben látszik, az adott lejátszásra érvényes; minden fájl demó nélkül indul).
 - Mindig bekapcsolva: Beállítások → Speciális → Egyéni libVLC opciók: --mediacodec-dovi-demo
 - Az „RPU L1” a fájl RPU-jában tárolt érték; egyes fájlokban nincs vagy nulla.
+- Csak S928X-en: S905X4-en a FEL-képet a SoC Dolby Vision magja rakja össze, a menüpont ott
+  „Dolby Vision demo: not available”.
+
+S905X4 (DUNE HD)
+----------------
+- Az S905X4 Dolby Vision magja maga is fogad EL-t, és a Dune S905X4-es firmware-ének Dolby Vision
+  meghajtójában a FEL-hibák már javítva vannak; az Android-lejátszók MediaCodec-dekódere viszont csak
+  az alapréteget adja ki. A VLC FEL az EL-t egy második dekóderrel dekódolja, és a dvfel kernelmodul
+  S905X4-es változata (2026.10.25.4) képenként átadja a Dolby Vision meghajtónak, a hozzá tartozó
+  alapréteg-képpel párosítva. GPU-munka nincs, az RPU marad profile 7.
+- A modult a VLC FEL ugyanúgy telepíti, mint S928X-en (a lejátszó típusa szerint választja ki).
+- Tesztelve Dune HD Pro Vision 4K-n (R24), TV-n nézve: lejátszás, szünet, tekerés, a telepítés
+  root-kérdéssel, a modul frissítése és a betöltés bekapcsoláskor.
+- Tekerés után 1–4 képkocka EL nélkül jelenik meg. Szünet közben az EL-dekóder néhány
+  „wait fence” időtúllépést ír a naplóba.
+- Demó mód nincs (lásd fent). 3D MVC csak S928X-en: az mvc3d modul S905X4-en nem töltődik be;
+  3D-s kijelzővel a telepítő egyszer rákérdezhet a rootra, utána hibát jelez, az MVC 2D-ben megy.
 
 KÉTSÁVOS (DTDL) FEL
 -------------------
@@ -109,7 +133,8 @@ HANG BITSTREAMKÉNT (PASSTHROUGH)
 TELEPÍTÉS
 ---------
 1. Az APK telepítése (pendrive + fájlkezelő, „Downloader” app, vagy: adb install VLC-FEL-*.apk).
-2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.15.1) a
+2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.23.3;
+   S905X4-en 2026.10.25.4) a
    firmware boot-könyvtárába (<app>/config/boot/dvfel.sh), és be is tölti; ha kell, előtte
    rákérdez a root-hozzáférésre. Ezután minden bekapcsoláskor magától betöltődik.
    Régebbi modulra a telepítő sosem cserél.
@@ -122,7 +147,9 @@ TUDNIVALÓK
 - A Dune automatikus frame rate (AFR) kezelése 23,976/24 Hz-re vált lejátszáskor. Stop után a Dune
   nem vált vissza, amíg vissza nem lépsz a Dune főképernyőjére (a firmware viselkedése minden
   külső lejátszónál).
-- 4K 24p FEL valós időben megy. 4K 50/60p FEL-hez nem elég gyors.
+- 4K 24p FEL valós időben megy. 4K 50/60p FEL-hez S928X-en nem elég gyors (S905X4-en nem tesztelt).
+- A Dune HD r25-ös firmware-e maga hozza a modult: ott a VLC FEL a firmware moduljával megy, nem
+  telepít semmit.
 - Ugrás (seek) után 1–2 képkocka csak az RPU-leképezéssel (EL nélkül) jelenhet meg, és az első
   képkockák egy vsync-kel késhetnek, amíg a lánc feltelik.
 - A FEL-kompozíció kikapcsolható: Beállítások → Speciális → Egyéni libVLC opciók:
@@ -130,6 +157,16 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.10-poc (libdvfelplay 2026.10.25.2, dvfel 2026.10.23.3 és S905X4-re 2026.10.25.4, VLC- és
+          app-javítás; a 3D változatlan) – Amlogic S905X4-es Dune HD lejátszók: a P7 FEL-t a SoC
+          Dolby Vision magja rakja össze, az EL-t a VLC FEL dekódolja, és az új S905X4-es modul adja át
+          a meghajtónak (lásd fent); a demó menüpontja ott „not available”. S928X-en a csomagolt modul
+          a Dune HD plugin 2026.10.23.3-as modulja (a javításai a firmware saját lejátszójának szólnak,
+          a VLC FEL ugyanúgy játszik); a r25-ös firmware-en a firmware modulját használja, nem telepít
+          (a firmware minden bekapcsoláskor kiveszi a más verziójú modult, a VLC FEL különben minden
+          induláskor rootot kérne). Kétsávos (dual PID) m2ts-nél nincs FEL-kiesés (a1d4r javítása):
+          a ts demux néha egy alapréteg-képet a hozzá tartozó EL előtt továbbengedett, az EL és RPU
+          nélkül ment.
 0.2.9-poc (app-javítás, a modulok, a libdvfelplay és a VLC-javítások változatlanok) – látszanak az
           USB-s / belső meghajtók fájljai (eddig csak a mappáik): a lejátszó médiaindexe kihagyja a
           meghajtókat, Android 11-en pedig „Minden fájl elérése” nélkül egy app ott csak az indexelt
@@ -186,7 +223,8 @@ GPL v2+. https://github.com/djnice/vlc-fel-android
 
 --------------------------------------------------------------------------------------------------
 
-VLC FEL – Dolby Vision Profile 7 FEL playback on S928X Dune HD / R_volution players (Android)
+VLC FEL – Dolby Vision Profile 7 FEL playback on S928X Dune HD / R_volution and S905X4 Dune HD
+players (Android)
 ==============================================================================================
 PROOF OF CONCEPT – experimental build, use at your own risk.
 
@@ -208,6 +246,9 @@ Since 0.2.2 a demo mode: split screen comparing FEL and the base layer, with mea
 Since 0.2.8 it can send the audio to the AV receiver as a bitstream (passthrough): Dolby TrueHD (Atmos),
 DTS-HD MA / DTS:X, E-AC-3 (Atmos), AC-3, DTS (see AUDIO BITSTREAM below).
 
+Since 0.2.10 also on Amlogic S905X4 Dune HD players, where the SoC's own Dolby Vision core composes
+the two layers (see S905X4 below).
+
 It works with a lead time: VLC presents
 every frame 3 vsyncs (125 ms at 24 Hz) early and the kernel module holds the composed frame back to
 its vsync. The GPU gets ~2.5 frame periods instead of ~1: its time spikes during playback no longer
@@ -221,6 +262,9 @@ REQUIREMENTS
   Tested: Dune HD Pro 8K Plus, firmware 250815_1012_r22;
           Dune HD Pro One 8K Plus, firmware 260303_1721_r24 and its 2026-08-27 R24 update
           (one module build for all).
+  Or an Amlogic S905X4 Dune HD player with the R24 Android firmware.
+  Tested: Dune HD Pro Vision 4K, firmware 260303_1721_r24 (R22 not tested; r25 is not out for the
+          S905X4 yet).
   On other firmware / models please report how it
   works (adb logcat -s dvfelplay: the installer also lists kernel symbols whose versions differ from
   the tested firmware).
@@ -241,6 +285,23 @@ DEMO MODE (FEL vs. BASE LAYER)
   composition runs, for the current playback; every file starts without it).
 - Always on: Settings → Advanced → Custom libVLC options: --mediacodec-dovi-demo
 - "RPU L1" is the value the file's RPU carries; some files carry none or zeros.
+- S928X only: on the S905X4 the SoC's Dolby Vision core composes the FEL picture, the menu item shows
+  "Dolby Vision demo: not available" there.
+
+S905X4 (DUNE HD)
+----------------
+- The S905X4's Dolby Vision core takes an EL itself, and the Dolby Vision driver of the Dune S905X4
+  firmware already has the FEL fixes; but the MediaCodec decoder of Android players outputs the base
+  layer only. VLC FEL decodes the EL with a second decoder, and the S905X4 build of the dvfel kernel
+  module (2026.10.25.4) hands each EL picture to the Dolby Vision driver, paired with its base layer
+  picture. No GPU work, the RPU stays profile 7.
+- VLC FEL installs the module as on the S928X (it picks the build by the player's SoC).
+- Tested on a Dune HD Pro Vision 4K (R24), watched on the TV: playback, pause, seeks, the installation
+  with the root question, the module update and the load at boot.
+- After a seek 1–4 frames show without the EL. During a pause the EL decoder logs a few "wait fence"
+  timeouts.
+- No demo mode (see above). 3D MVC on the S928X only: the mvc3d module does not load on the S905X4;
+  with a 3D display the installer may ask for root once and then report a failure, MVC plays in 2D.
 
 DUAL TRACK (DTDL) FEL
 ---------------------
@@ -293,7 +354,8 @@ AUDIO BITSTREAM (PASSTHROUGH)
 INSTALLATION
 ------------
 1. Install the APK (USB stick + file manager, the "Downloader" app, or adb install VLC-FEL-*.apk).
-2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.15.1) into
+2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.23.3; on
+   the S905X4 2026.10.25.4) into
    the firmware's boot hook directory (<app>/config/boot/dvfel.sh) and loads it, asking for root
    access first if needed. It then loads at every boot.
    The installer never replaces a newer module with an older one.
@@ -305,7 +367,9 @@ NOTES
 -----
 - The Dune auto frame rate (AFR) switches to 23.976/24 Hz for playback and does not switch back after
   stop until you return to the Dune home screen (firmware behaviour with all third-party players).
-- 4K 24p FEL plays in real time; 4K 50/60p FEL is too heavy.
+- 4K 24p FEL plays in real time; 4K 50/60p FEL is too heavy on the S928X (not tested on the S905X4).
+- The Dune HD r25 firmware brings the module itself: VLC FEL uses the firmware's module there and
+  installs nothing.
 - After a seek, 1–2 frames may be shown with the RPU mapping only (no EL), and the first frames may
   be a vsync late while the chain fills.
 - FEL composition can be switched off: Settings → Advanced → Custom libVLC options:
@@ -313,6 +377,15 @@ NOTES
 
 CHANGES
 -------
+0.2.10-poc (libdvfelplay 2026.10.25.2, dvfel 2026.10.23.3 and for the S905X4 2026.10.25.4, VLC and
+          app fixes; 3D unchanged) – Amlogic S905X4 Dune HD players: P7 FEL composed by the SoC's
+          Dolby Vision core, the EL decoded by VLC FEL and handed to the driver by the new S905X4 module
+          (see above); the demo menu item says "not available" there. On the S928X the bundled module
+          is the Dune HD plugin's 2026.10.23.3 (its fixes are for the firmware's own player, VLC FEL
+          plays as before); on the r25 firmware the firmware's module is used, nothing is installed
+          (the firmware unloads other module versions at every boot, VLC FEL would otherwise ask for
+          root at every start). Dual PID m2ts: no FEL drop outs (fix by a1d4r): the ts demux now and
+          then let a base layer picture go on before its EL, which then played without EL and RPU.
 0.2.9-poc (app fix; modules, libdvfelplay and VLC patches unchanged) – the files of USB / internal
           drives show (before: their folders only). The player's media index leaves the drives out, and
           on Android 11 an app without "All files access" sees only indexed files there; the firmware

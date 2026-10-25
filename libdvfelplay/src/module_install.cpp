@@ -5,11 +5,15 @@
  * into the Dune HD firmware's config directory together with a boot script,
  * which the firmware runs as root at every boot (R24: binit.sh, R22: the
  * /system/xbin/dunehd/init service itself). A newer module is never
- * replaced by an older one.
+ * replaced by an older one. A firmware that brings the module itself (Dune
+ * HD r25 on: the plugin s928x_dvfel) keeps it: nothing is installed there.
+ * On an Amlogic SC2 (S905X4) the SC2 module is installed instead (another
+ * kernel, composition by the Dolby Vision core).
  */
 
 #include "dvfelplay.h"
 
+#include "dvfel_sc2_uapi.h"
 #include "dvfel_uapi.h"
 
 #include <chrono>
@@ -23,15 +27,54 @@
 
 #include <android/log.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #ifdef DVFP_HAVE_KO
 // the module (module_blob.S)
 extern "C" const unsigned char dvfp_ko_start[], dvfp_ko_end[];
 #endif
+#ifdef DVFP_HAVE_KO_SC2
+// the SC2 module (module_blob_sc2.S)
+extern "C" const unsigned char dvfp_ko_sc2_start[], dvfp_ko_sc2_end[];
+#endif
 
 namespace
 {
+bool IsSc2()
+{
+  static const bool sc2 = [] {
+    char v[PROP_VALUE_MAX] = {};
+    return __system_property_get("ro.board.platform", v) > 0 && !strcmp(v, "sc2");
+  }();
+  return sc2;
+}
+
+// the bundled module of this SoC: its version, its image (nullptr: none)
+const char* BundledVersion()
+{
+  return IsSc2() ? DVFEL_SC2_VERSION : DVFEL_VERSION;
+}
+
+const unsigned char* BundledKo(size_t& size)
+{
+  size = 0;
+#ifdef DVFP_HAVE_KO_SC2
+  if (IsSc2())
+  {
+    size = dvfp_ko_sc2_end - dvfp_ko_sc2_start;
+    return dvfp_ko_sc2_start;
+  }
+#endif
+#ifdef DVFP_HAVE_KO
+  if (!IsSc2())
+  {
+    size = dvfp_ko_end - dvfp_ko_start;
+    return dvfp_ko_start;
+  }
+#endif
+  return nullptr;
+}
 constexpr const char* DVFEL_DEV = "/dev/dvfel";
 // the Dune firmware's switch for su (its sud daemon): "" (default) or "1" on
 constexpr const char* ROOT_PROP = "persist.vendor.root_access";
@@ -142,13 +185,29 @@ std::string ReadLine(const std::string& path)
   return s;
 }
 
-// the bundled module or a newer one is loaded and usable
+/*
+ * The Dune HD firmware brings the module itself (r25 on) as the plugin
+ * s928x_dvfel: at every boot it removes our boot script and loads its own
+ * module, unloading any other version. A module installed here would be
+ * replaced at the next boot (and installed again, with the root question,
+ * at every start): the firmware's module is used as it is.
+ */
+constexpr const char* FW_PLUGIN = "/system/dunehd/firmware_ext/plugins/s928x_dvfel/dune_plugin.xml";
+
+bool FirmwareModule()
+{
+  return !IsSc2() && access(FW_PLUGIN, F_OK) == 0;
+}
+
+// the bundled module or a newer one (the firmware's: any) is loaded and usable
 bool Ready()
 {
   const std::string loaded = ReadLine("/sys/module/dvfel/version");
-  // versions are dates (YYYY.MM.DD[.n]): compare as strings
-  return !loaded.empty() && loaded >= std::string(DVFEL_VERSION) &&
-         access(DVFEL_DEV, R_OK | W_OK) == 0;
+  if (loaded.empty() || access(DVFEL_DEV, R_OK | W_OK) != 0)
+    return false;
+  // versions are dates (YYYY.MM.DD[.n]): compare as strings; the library
+  // checks its own minimum (dvfp_available)
+  return FirmwareModule() || loaded >= std::string(BundledVersion());
 }
 
 // the app's private directory: /data/data/<package>/files
@@ -179,15 +238,36 @@ int dvfp_module_install(const char* dir, dvfp_ask_fn ask, void* opaque, char* ms
 {
   static std::mutex lock;
   static int result = 1; // > 0: not tried in this process
+  static bool fw_logged = false;
   std::lock_guard<std::mutex> l(lock);
 
   SetMsg(msg, msg_size, "");
   if (Ready())
+  {
+    if (FirmwareModule() && !fw_logged)
+    {
+      const std::string loaded = ReadLine("/sys/module/dvfel/version");
+      Log(ANDROID_LOG_INFO, "kernel module %s of the firmware (plugin s928x_dvfel)%s",
+          loaded.c_str(), loaded < std::string(BundledVersion()) ? ", older than the bundled one" : "");
+      fw_logged = true;
+    }
     return DVFP_MODULE_READY;
-#ifndef DVFP_HAVE_KO
-  SetMsg(msg, msg_size, "no kernel module in this build");
-  return DVFP_MODULE_FAILED;
-#else
+  }
+  if (FirmwareModule())
+  {
+    Log(ANDROID_LOG_WARN, "the firmware's plugin s928x_dvfel provides the kernel module, "
+                          "but none is usable: not installed here");
+    SetMsg(msg, msg_size, "the kernel module of the firmware (plugin S928X DV FEL) is not loaded");
+    return DVFP_MODULE_FAILED;
+  }
+  size_t koSize = 0;
+  const unsigned char* koData = BundledKo(koSize);
+  if (!koData || !koSize)
+  {
+    SetMsg(msg, msg_size, "no kernel module for this player in this build");
+    return DVFP_MODULE_FAILED;
+  }
+  const char* version = BundledVersion();
   if (result <= 0)
   {
     // once per process
@@ -205,7 +285,7 @@ int dvfp_module_install(const char* dir, dvfp_ask_fn ask, void* opaque, char* ms
                     declined = d + "/dvfel_root_declined";
   {
     std::ofstream f(ko, std::ios::binary | std::ios::trunc);
-    f.write(reinterpret_cast<const char*>(dvfp_ko_start), dvfp_ko_end - dvfp_ko_start);
+    f.write(reinterpret_cast<const char*>(koData), static_cast<std::streamsize>(koSize));
     std::ofstream s(script, std::ios::trunc);
     s << INSTALL_SCRIPT;
     if (!f || !s)
@@ -228,7 +308,7 @@ int dvfp_module_install(const char* dir, dvfp_ask_fn ask, void* opaque, char* ms
   bool switched = false;
   if (!SuWorks())
   {
-    if (ReadLine(declined) == DVFEL_VERSION)
+    if (ReadLine(declined) == version)
     {
       Log(ANDROID_LOG_INFO, "root access off, the module installation was declined earlier");
       SetMsg(msg, msg_size, "installation declined");
@@ -242,7 +322,7 @@ int dvfp_module_install(const char* dir, dvfp_ask_fn ask, void* opaque, char* ms
                    "again afterwards.") > 0;
     if (!yes)
     {
-      std::ofstream(declined, std::ios::trunc) << DVFEL_VERSION << '\n';
+      std::ofstream(declined, std::ios::trunc) << version << '\n';
       Log(ANDROID_LOG_INFO, "root access off, the module installation declined");
       SetMsg(msg, msg_size, "not installed: FEL plays without the enhancement layer");
       return result = DVFP_MODULE_DECLINED;
@@ -280,19 +360,15 @@ int dvfp_module_install(const char* dir, dvfp_ask_fn ask, void* opaque, char* ms
     return result = DVFP_MODULE_FAILED;
   }
   unlink(declined.c_str());
-  Log(ANDROID_LOG_INFO, "kernel module %s installed", DVFEL_VERSION);
+  Log(ANDROID_LOG_INFO, "kernel module %s installed", version);
   SetMsg(msg, msg_size, "kernel module installed");
   return result = DVFP_MODULE_INSTALLED;
-#endif
 }
 
 const char* dvfp_bundled_module_version(void)
 {
-#ifdef DVFP_HAVE_KO
-  return DVFEL_VERSION;
-#else
-  return "";
-#endif
+  size_t size;
+  return BundledKo(size) ? BundledVersion() : "";
 }
 
 } // extern "C"

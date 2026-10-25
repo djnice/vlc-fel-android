@@ -20,6 +20,13 @@ vsync, leaving the GPU about one frame period. The library asks the module for a
 (`DVFEL_IOC_SET_LEAD`, `out_lead_ms`, 125 ms): the player presents every frame `dvfp_present_lead_ns()` early
 and the module holds the composed frame back to its vsync.
 
+Amlogic S905X4 (SC2, `ro.board.platform` `sc2`, Dune HD 5.4.125 firmware): the SoC's Dolby Vision core
+composes. The RPU goes to the decoder as it is (profile 7), every BL access unit is reported to the SC2 module
+(`DVFEL_IOC_SC2_BL_HINT`: pts + RPU CRC), each EL picture is queued there (`DVFEL_IOC_SC2_EL_QUEUE`) and its
+image goes back to the reader at once with the module's release fence; no GPU thread, no demo mode (`dvfp_fel`
+holds `sc2=1`). Module `2026.10.25.2` or newer; the SC2 build is bundled with `DVFEL_KO_SC2` and installed by
+`dvfp_module_install()` on that SoC.
+
 ## Layout
 
 | Path | Content |
@@ -27,8 +34,8 @@ and the module holds the composed frame back to its vsync.
 | `include/dvfelplay.h` | public C API |
 | `src/dvfelplay.cpp` | filter (P7 → P8.1, EL extraction), EL decoder, GPU thread, BL/EL pairing by RPU CRC |
 | `src/felgpu.*` | GLES 3.2 composer |
-| `src/dvfel_uapi.h` | kernel interface (from the kernel module) |
-| `src/module_install.cpp`, `src/module_blob.S.in` | the bundled kernel module and its installer |
+| `src/dvfel_uapi.h`, `src/dvfel_sc2_uapi.h` | kernel interfaces (from the kernel modules: S928X, S905X4) |
+| `src/module_install.cpp`, `src/module_blob.S.in`, `src/module_blob_sc2.S.in` | the bundled kernel modules and their installer |
 | `test/` | `dvfp_test`: NativeActivity test player (no audio) for an `.au` file |
 | `tools/mkau.py` | MKV/MP4 → `.au` (Annex-B access units with pts, as a player hands them to MediaCodec) |
 | `build.sh` | library + test APK (WSL/Linux, NDK r28c, libdovi built with cargo-c, `LIBDOVI_DIR`) |

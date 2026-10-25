@@ -16,19 +16,20 @@
  @SuppressLint("ShowToast")
  class PlayerOptionsDelegate(val activity: FragmentActivity, val service: PlaybackService, private val showABReapeat:Boolean = true)  {
  
-@@ -117,6 +119,11 @@
+@@ -117,6 +119,12 @@
                  options.add(PlayerOption(ID_REPEAT, R.drawable.ic_repeat, res.getString(R.string.repeat_title)))
              if (service.canShuffle()) options.add(PlayerOption(ID_SHUFFLE, R.drawable.ic_player_shuffle, res.getString(R.string.shuffle_title)))
              options.add(PlayerOption(ID_VIDEO_STATS, R.drawable.ic_video_stats, res.getString(R.string.video_information)))
 +            // Dolby Vision FEL demo mode (libdvfelplay): while the FEL composition runs
 +            doviDemoState()?.let { on ->
 +                options.add(PlayerOption(ID_DOVI_DEMO, R.drawable.ic_video_stats,
-+                        if (on) "Dolby Vision demo: on" else "Dolby Vision demo: off"))
++                        if (doviDemoSc2()) "Dolby Vision demo: not available"
++                        else if (on) "Dolby Vision demo: on" else "Dolby Vision demo: off"))
 +            }
          } else {
              if (service.videoTracksCount > 0) options.add(PlayerOption(ID_PLAY_AS_VIDEO, R.drawable.ic_playasaudio_off, res.getString(R.string.play_as_video)))
          }
-@@ -200,6 +207,17 @@
+@@ -200,6 +208,27 @@
          this.bookmarkClickedListener = listener
      }
  
@@ -43,21 +44,35 @@
 +        null
 +    }
 +
++    /**
++     * an S905X4 (SC2): the SoC's Dolby Vision core composes the FEL picture,
++     * there is no demo mode (files/dvfp_fel holds "sc2=1")
++     */
++    private fun doviDemoSc2(): Boolean = try {
++        File(activity.filesDir, "dvfp_fel").readText().contains("sc2=1")
++    } catch (e: Exception) {
++        false
++    }
++
      fun onClick(option: PlayerOption) {
          when (option.id) {
              ID_SLEEP -> {
-@@ -237,6 +255,15 @@
+@@ -237,6 +266,19 @@
                  hide()
                  service.playlistManager.toggleStats()
              }
 +            ID_DOVI_DEMO -> {
 +                hide()
-+                val on = doviDemoState() != true
-+                try {
-+                    File(activity.filesDir, "dvfp_demo").writeText(if (on) "1\n" else "0\n")
-+                } catch (e: Exception) {
++                if (doviDemoSc2()) {
++                    UiTools.snacker(activity, "Not available on the S905X4: the SoC's Dolby Vision core composes the FEL picture")
++                } else {
++                    val on = doviDemoState() != true
++                    try {
++                        File(activity.filesDir, "dvfp_demo").writeText(if (on) "1\n" else "0\n")
++                    } catch (e: Exception) {
++                    }
++                    UiTools.snacker(activity, if (on) "Dolby Vision demo: on" else "Dolby Vision demo: off")
 +                }
-+                UiTools.snacker(activity, if (on) "Dolby Vision demo: on" else "Dolby Vision demo: off")
 +            }
              ID_SHOW_VIDEO_TIPS -> {
                  hide()

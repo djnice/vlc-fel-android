@@ -94,7 +94,10 @@ DVFP_EXPORT const char* dvfp_module_version(char* buf, size_t size);
  * version. Blocks for the installation (a few seconds) and the question; the
  * result is kept for the process (one try). dir: a writable directory of
  * the app (NULL: /data/data/<package>/files). msg (optional): a line about
- * the outcome for the user. Optional symbol.
+ * the outcome for the user. A firmware that brings the module itself (Dune HD
+ * r25 on, plugin s928x_dvfel) keeps its own: its module, of any version, is
+ * READY, and nothing is installed there (FAILED when it is not loaded).
+ * Optional symbol.
  */
 enum dvfp_module_status
 {
