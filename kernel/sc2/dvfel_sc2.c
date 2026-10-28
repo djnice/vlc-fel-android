@@ -395,6 +395,228 @@ static int parse_pre(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
+/*
+ * --- driver fixes ---
+ *
+ * The SC2 aml_media of the Dune firmwares (r24 260303, r25 261021) lacks four
+ * changes FEL needs (the .101 test box ran a binary-patched r24 aml_media,
+ * dune-p7-fel/kernel):
+ *
+ *   omx:    dolby_vision_update_metadata() clears its BL/EL table without
+ *           putting the EL when vf->omx_index == 0, which it is for every
+ *           MediaCodec frame: no EL is ever put back, the EL decoder runs dry.
+ *           Patched: "cbnz w8" (omx_index) -> "b" (never clear).
+ *   core1a: apply_stb_core_settings(): vd2 to core1a (DOLBY_PATH_CTRL bit 1 =
+ *           0) for cpu 3..4 only; patched "cmp w10, #1" -> "#2" (cpu 3..5, SC2).
+ *   bl:     apply_stb_core_settings(): the run_mode_delay BL disable written
+ *           for G12 (cpu 2) only; patched "cmp w8, #2" -> "#5" (SC2).
+ *   vd2:    dvel_swap_frame() (inlined twice into vsync_isr_in) passes
+ *           &vd_layer[0] / &glayer_info[0] to set_layer_display_canvas(): the
+ *           EL AFBC addresses go into VD1, the EL shows as noise. Patched: the
+ *           relocation addends to index 1 (vd_layer stride 0x5c8, glayer_info
+ *           0x8c); here the call's arguments.
+ *
+ * The omx one acts during a session only, the others always (as the patched
+ * binary; the core is set up before a session starts). Done with kprobes on
+ * those instructions, found by their surroundings; a firmware with the fixes
+ * in place, or another build, has no match and is left alone.
+ */
+#define FIX_SCAN_UPDATE	0x100
+#define FIX_SCAN_APPLY	0x2000
+#define FIX_SCAN_VSYNC	0x8000
+#define VD_LAYER_STRIDE	0x5c8	/* struct video_layer_s */
+#define GLAYER_STRIDE	0x8c	/* struct disp_info_s */
+
+#define BCOND	0xff00001f	/* b.cond / cbz / cbnz: the opcode and the cond or register */
+#define ADRP	0x9f00001f	/* adrp: the opcode and the register */
+#define ADDIMM	0xffc003ff	/* add/ldr immediate: all but the (relocated) imm12 */
+
+struct insn_pat {
+	s8 off;			/* in instructions from the probe; the list ends with mask 0 */
+	u32 val, mask;
+};
+
+enum fix_kind { FIX_OMX, FIX_CORE1A, FIX_BL, FIX_VD2 };
+
+struct dv_fix {
+	const char *name, *func;
+	enum fix_kind kind;
+	u32 scan;
+	u8 matches, nth;	/* expected matches (0: 1), the one probed */
+	struct insn_pat pat[7];
+	struct kprobe kp;
+	unsigned long target;	/* the branch target the handler uses */
+	unsigned long x0, x3;	/* vd2: &vd_layer[0], &glayer_info[0] at the call */
+	u32 frame_par_off;	/* vd2: offsetof(struct video_layer_s, cur_frame_par) */
+	bool ok;
+	u64 hits;
+};
+
+/* adrp x0; add x0, x0, #lo12; ldr x2, [x0, #cur_frame_par]; adrp x3; add x3, x3, #lo12;
+ * mov x1, x22; >bl set_layer_display_canvas */
+#define VD2_PAT { { -6, 0x90000000, ADRP }, { -5, 0x91000000, ADDIMM }, \
+		  { -4, 0xf9400002, ADDIMM }, { -3, 0x90000003, ADRP }, \
+		  { -2, 0x91000063, ADDIMM }, { -1, 0xaa1603e1, ~0u }, { 0, 0x94000000, 0xfc000000 } }
+
+static struct dv_fix dv_fixes[] = {
+	/* ldr w8, [x19, #8]; >cbnz w8 */
+	{ "omx", "dolby_vision_update_metadata", FIX_OMX, FIX_SCAN_UPDATE, 0, 0,
+	  { { -1, 0xb9400a68, ~0u }, { 0, 0x35000008, BCOND } } },
+	/* ldrb w9, [x9, #:lo12:var] (relocated at load); sub w10, w8, #3; >cmp w10, #1;
+	 * b.hi; cbnz w9; mov w0, #0x1a0c (DOLBY_PATH_CTRL); mov w2, #1 (bit 1) */
+	{ "core1a", "apply_stb_core_settings", FIX_CORE1A, FIX_SCAN_APPLY, 0, 0,
+	  { { -2, 0x39400129, ADDIMM }, { -1, 0x51000d0a, ~0u }, { 0, 0x7100055f, ~0u },
+	    { 1, 0x54000008, BCOND }, { 3, 0x52834180, ~0u }, { 4, 0x52800022, ~0u } } },
+	/* ldr w21, [sp, #28]; >cmp w8, #2; b.eq */
+	{ "bl", "apply_stb_core_settings", FIX_BL, FIX_SCAN_APPLY, 0, 0,
+	  { { -1, 0xb9401ff5, ~0u }, { 0, 0x7100091f, ~0u }, { 1, 0x54000000, BCOND } } },
+	{ "vd2a", "vsync_isr_in", FIX_VD2, FIX_SCAN_VSYNC, 2, 0, VD2_PAT },
+	{ "vd2b", "vsync_isr_in", FIX_VD2, FIX_SCAN_VSYNC, 2, 1, VD2_PAT },
+};
+
+static long insn_imm19(u32 insn)
+{
+	return (long)((s32)(((insn >> 5) & 0x7ffff) << 13) >> 11);
+}
+
+/* the address an adrp + add pair (relocated) computes */
+static unsigned long adrp_add(unsigned long pc, u32 adrp, u32 add)
+{
+	s64 imm = (s64)((((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3)) << 43 >> 31;
+
+	return (pc & ~0xfffUL) + imm + ((add >> 10) & 0xfff);
+}
+
+static int fix_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct dv_fix *f = container_of(p, struct dv_fix, kp);
+
+	switch (f->kind) {
+	case FIX_OMX:
+		if (!READ_ONCE(g.active))
+			return 0;
+		break;
+	case FIX_CORE1A:
+		/* w10 = cpu_id - 3; SC2 (5) passes as "ls": on to the next condition */
+		if ((u32)regs->regs[10] != 2)
+			return 0;
+		break;
+	case FIX_BL:
+		/* w8 = cpu_id; SC2 (5) takes the G12 branch */
+		if ((u32)regs->regs[8] != 5)
+			return 0;
+		break;
+	case FIX_VD2:
+		/* the EL to VD2: layer 1, its frame parameters, display info 1 */
+		if (regs->regs[0] != f->x0 || regs->regs[3] != f->x3)
+			return 0;
+		regs->regs[0] += VD_LAYER_STRIDE;
+		regs->regs[2] = *(u64 *)(regs->regs[0] + f->frame_par_off);
+		regs->regs[3] += GLAYER_STRIDE;
+		f->hits++;
+		return 0;	/* the bl runs, with these arguments */
+	}
+	f->hits++;
+	regs->pc = f->target;
+	return 1;
+}
+
+static unsigned long func_addr(const char *name)
+{
+	struct kprobe kp = { .symbol_name = name };
+	unsigned long a;
+
+	if (register_kprobe(&kp))
+		return 0;
+	a = (unsigned long)kp.addr;
+	unregister_kprobe(&kp);
+	return a;
+}
+
+/* all sites are looked up before any probe goes in (a probe changes the code) */
+static void fixes_register(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dv_fixes); i++) {
+		struct dv_fix *f = &dv_fixes[i];
+		unsigned long base = func_addr(f->func), at = 0;
+		u32 k, n = 0, want = f->matches ? f->matches : 1;
+		const u32 *w;
+
+		if (!base) {
+			pr_info(DRV_NAME ": fix %s: %s not found\n", f->name, f->func);
+			continue;
+		}
+		w = (const u32 *)base;
+		for (k = 6; k + 4 < f->scan / 4; k++) {
+			const struct insn_pat *p;
+
+			for (p = f->pat; p < f->pat + ARRAY_SIZE(f->pat) && p->mask; p++)
+				if ((w[k + p->off] & p->mask) != p->val)
+					break;
+			if (p < f->pat + ARRAY_SIZE(f->pat) && p->mask)
+				continue;
+			if (n == f->nth)
+				at = base + k * 4;
+			n++;
+		}
+		if (n != want) {
+			pr_info(DRV_NAME ": fix %s: %u matches in %s (fixed or other build): off\n",
+				f->name, n, f->func);
+			continue;
+		}
+		w = (const u32 *)at;
+		switch (f->kind) {
+		case FIX_OMX:		/* the cbnz's own target */
+			f->target = at + insn_imm19(w[0]);
+			break;
+		case FIX_CORE1A:	/* past cmp + b.hi */
+			f->target = at + 8;
+			break;
+		case FIX_BL:		/* the b.eq target */
+			f->target = at + 4 + insn_imm19(w[1]);
+			break;
+		case FIX_VD2:
+			f->x0 = adrp_add(at - 24, w[-6], w[-5]);
+			f->x3 = adrp_add(at - 12, w[-3], w[-2]);
+			f->frame_par_off = ((w[-4] >> 10) & 0xfff) * 8;
+			break;
+		}
+		f->kp.addr = (kprobe_opcode_t *)at;
+		f->kp.pre_handler = fix_pre;
+		pr_info(DRV_NAME ": fix %s at %s+%#lx\n", f->name, f->func, at - base);
+	}
+	for (i = 0; i < ARRAY_SIZE(dv_fixes); i++) {
+		struct dv_fix *f = &dv_fixes[i];
+
+		if (!f->kp.addr)
+			continue;
+		/* the vd2 call looks the same with the patched addends: only with the
+		 * omx one unfixed too (an unpatched module) */
+		if (f->kind == FIX_VD2 && !dv_fixes[0].ok) {
+			pr_info(DRV_NAME ": fix %s: module not the stock one: off\n", f->name);
+			continue;
+		}
+		if (register_kprobe(&f->kp)) {
+			pr_info(DRV_NAME ": fix %s: kprobe failed\n", f->name);
+			continue;
+		}
+		f->ok = true;
+	}
+}
+
+static void fixes_unregister(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dv_fixes); i++)
+		if (dv_fixes[i].ok) {
+			unregister_kprobe(&dv_fixes[i].kp);
+			dv_fixes[i].ok = false;
+		}
+}
+
 /* --- the "dveldec" provider, called by the Dolby Vision driver --- */
 
 static struct vframe_s *prov_peek(void *op_arg)
@@ -968,6 +1190,10 @@ static int stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "session %u vf_changed %llu get_other %llu disp_long %llu orphans %llu max_ms queued %u on_display %u\n",
 		   g.sess, g.el_vf_changed, g.el_get_other, g.el_disp_long, g.el_orphans, g.q_max_ms,
 		   g.disp_max_ms);
+	seq_puts(m, "fixes");
+	for (i = 0; i < ARRAY_SIZE(dv_fixes); i++)
+		seq_printf(m, " %s %d/%llu", dv_fixes[i].name, dv_fixes[i].ok, dv_fixes[i].hits);
+	seq_putc(m, '\n');
 	spin_unlock_irqrestore(&g.lock, flags);
 	return 0;
 }
@@ -1009,6 +1235,7 @@ static int __init dvfel_init(void)
 		goto err_krp;
 	}
 	kp_parse_ok = true;
+	fixes_register();
 	ret = misc_register(&dvfel_misc);
 	if (ret)
 		goto err_kp;
@@ -1025,6 +1252,7 @@ static int __init dvfel_init(void)
 	return 0;
 
 err_kp:
+	fixes_unregister();
 	unregister_kprobe(&kp_parse);
 err_krp:
 	unregister_kretprobe(&krp_dual);
@@ -1037,6 +1265,7 @@ static void __exit dvfel_exit(void)
 
 	debugfs_remove_recursive(dbg_dir);
 	misc_deregister(&dvfel_misc);
+	fixes_unregister();
 	unregister_kprobe(&kp_parse);
 	unregister_kretprobe(&krp_dual);
 	mutex_lock(&g.sess_lock);

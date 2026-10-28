@@ -42,8 +42,7 @@ Pro 8K Plus (R22, MMR chroma; without the lead time: ~25 a minute) and on a Dune
 ## Amlogic S905X4 (SC2, Dune HD)
 
 The S905X4's Dolby Vision core takes an enhancement layer itself (as in the stream mode dual layer decoder),
-and the Dune HD S905X4 firmware's Dolby Vision driver already has the FEL fixes; but an Android player decodes
-with MediaCodec, which outputs the base layer only. VLC FEL decodes the EL with a second MediaCodec and the
+but an Android player decodes with MediaCodec, which outputs the base layer only. VLC FEL decodes the EL with a second MediaCodec and the
 `dvfel` SC2 kernel module (`kernel/sc2/`) hands each EL picture to the driver as its `dveldec` provider. No GPU
 work, the RPU stays profile 7:
 
@@ -54,21 +53,36 @@ VLC demux ─ mediacodec module ─ libdvfelplay: EL NAL units taken out, the pr
            back to the decoder at once with a release fence (the decoder has 12 output buffers in all)
 dvfel (SC2): kprobes on the driver's is_dovi_dual_layer_frame() / dolby_vision_parse_metadata(): the
   frame's RPU CRC names its pts, the EL picture of that pts goes to the head of the dveldec queue, the frame
-  is marked dual layer; FEL switched on in the driver (enable_fel)
+  is marked dual layer; FEL switched on in the driver (enable_fel); the driver's missing FEL fixes applied
   → Dolby Vision core: BL + EL + RPU composed by the SoC
 ```
 
-- The `dvfel` SC2 module (`2026.10.28.2`) is bundled next to the S928X one; the installer picks it by the SoC
-  (`ro.board.platform` `sc2`) and installs it the same way (R24: `binit.sh` runs `config/boot`).
-- Tested on a Dune HD Pro Vision 4K, firmware `260303_1721_r24`, on the TV: playback (all frames paired with
-  their EL once the first EL key picture is in), pause, seeks, the installation with the root question, the
-  update of an installed module and the load at boot.
+- **Driver fixes.** The Dolby Vision driver in the Dune S905X4 firmware's `aml_media.ko` (stock R24
+  `260303_1721` and r25 `261021_0117`) lacks four fixes dual-layer FEL needs; since `2026.10.28.3` the module
+  applies them at run time with kprobes on the driver's instructions, each found by the code around it:
+  - `dolby_vision_update_metadata()` clears its BL/EL pairing table (`dolby_vision_clear_buf`) whenever
+    `vf->omx_index == 0`, which it is on every frame, without putting the EL back: the EL decoder runs dry
+    after a few pictures. The clear is skipped during a FEL playback.
+  - two `DOLBY_PATH_CTRL` guards in the core1 setup (`apply_stb_core_settings()`: "vd2 to core1a", and the
+    run-mode delay) leave out the S905X4 (the SC2 part of the known Amlogic FEL fix);
+  - `dvel_swap_frame()` (inlined twice into `vsync_isr_in`) programs `vd_layer[0]` / `glayer_info[0]` (VD1)
+    instead of `[1]` (VD2): the EL shows as a distorted strip over noise. The call gets layer 1.
+
+  A driver that already has the fixes, or an unknown build, has no match: that fix stays off (the kernel log
+  lists the ones applied, `dvfel: fix … at …`, and `/sys/kernel/debug/dvfel/stats` counts them). The proper
+  place for these fixes is the firmware's driver.
+- The `dvfel` SC2 module (`2026.10.28.3`) is bundled next to the S928X one; the installer picks it by the SoC
+  (`ro.board.platform` `sc2`) and installs it the same way (R24, r25: `binit.sh` runs `config/boot`).
+- Tested on a Dune HD Pro Vision 4K with the stock firmware `261021_0117_r25`, on the TV: playback of mp4, mkv
+  and m2ts (all frames paired with their EL once the first EL key picture is in), pause, seeks, the update of an
+  installed module with the root question and the load at boot. (0.2.10–0.2.11 were tested on a unit with a
+  patched driver, which hid the missing fixes.)
 - After a seek 1–4 frames show without the EL. During a pause the EL decoder logs a few fence wait timeouts.
 - No [demo mode](#demo-mode-fel-vs-base-layer) there: the SoC composes, nothing to compare in the player (the
   menu item says *not available*).
 - 3D MVC: S928X only. The `mvc3d` module is built for the S928X kernel and does not load on the S905X4: with
   a 3D display the module installation may ask for root once and then report a failure; MVC plays in 2D.
-- R22 on the S905X4 is not tested; the r25 firmware is not out for the S905X4 yet.
+- R22 on the S905X4 is not tested.
 
 ## Demo mode (FEL vs. base layer)
 
@@ -272,6 +286,13 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.12-poc** (libdvfelplay `2026.10.28.3`, kernel module `dvfel 2026.10.28.3` (S905X4); the S928X module,
+  the VLC and app patches and 3D MVC unchanged): **S905X4: FEL with the stock Dune firmware (R24, r25).** The
+  Dolby Vision driver of the stock firmware lacks four FEL fixes (see
+  [Amlogic S905X4](#amlogic-s905x4-sc2-dune-hd)); the module now applies them at run time. Without them the EL
+  decoder ran out of buffers after a few pictures and the EL was missing (black, green or distorted picture).
+  0.2.10–0.2.11 were tested on a unit that ran our own patched driver, which hid this. Tested on r25
+  (`261021_0117`); the module binary interface needed no change for r25.
 - **v0.2.11-poc** (libdvfelplay `2026.10.28.2`, kernel module `dvfel 2026.10.28.2` (S905X4); the S928X module,
   the VLC and app patches and 3D MVC unchanged): **S905X4: no green picture / missing EL after the player was
   killed** (force-stop, crash). When the player process died during FEL playback, the release fences of the EL
