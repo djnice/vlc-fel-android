@@ -75,6 +75,11 @@
 
 /* src_fmt in the struct vframe_s of the Dune r24 SC2 aml_media (measured at load, see below) */
 #define SC2_VF_SRC_FMT_OFF	1480
+/* diagnostics: the bytes of an EL vframe compared between its queueing and the
+ * driver's get (the decoder's own vframe: changed = the buffer reused) */
+#define VF_SNAP		256
+/* an EL picture on display longer than this is counted */
+#define DISP_LONG_MS	200
 
 static int debug;
 module_param(debug, int, 0644);
@@ -94,6 +99,10 @@ struct el_ent {
 	u32 id;
 	s64 pts_us;
 	unsigned long out_jiffies;
+	/* diagnostics */
+	u32 sess;			/* the session that queued it */
+	unsigned long q_jiffies;
+	u8 snap[VF_SNAP];		/* the vframe as queued */
 };
 
 struct bl_hint {
@@ -130,6 +139,19 @@ static struct dvfel_sc2 {
 	/* stats */
 	u64 el_in, el_out, el_put, el_dropped, el_flushed, bl_paired, bl_no_el, bl_no_crc, bl_no_hint;
 	u64 hints_in, hints_skipped, hints_overflow;
+	/* diagnostics */
+	u32 sess;			/* the current session (counts up) */
+	u32 mark_id;			/* the EL picture of the last frame marked dual layer */
+	u64 el_vf_changed;		/* vframe changed between queueing and get */
+	u64 el_get_other;		/* the driver got another EL picture than the marked one */
+	u64 el_disp_long;		/* on display longer than DISP_LONG_MS */
+	u64 el_orphans;			/* released after the driver kept them past their session */
+	u32 q_max_ms, disp_max_ms;	/* longest time queued / on display (this session) */
+	bool vf_logged, change_logged;
+	struct dvfel_sc2_totals {
+		u64 el_in, el_out, el_put, el_dropped, el_flushed, bl_paired, bl_no_el, bl_no_hint;
+		u64 hints_in, hints_skipped, vf_changed, get_other, disp_long, orphans;
+	} at_start;			/* the counters at the session start */
 } g;
 
 static struct kretprobe krp_dual;
@@ -338,9 +360,10 @@ static bool pair_bl(struct vframe_s *vf)
 			ent_release_locked(e);
 		}
 		found = g.nq && g.q[0]->pts_us == pts;
-		if (found)
+		if (found) {
 			g.bl_paired++;
-		else
+			g.mark_id = g.q[0]->id;
+		} else
 			g.bl_no_el++;
 		g.bl_vf = vf;
 		g.bl_found = found;
@@ -394,11 +417,28 @@ static struct vframe_s *prov_get(void *op_arg)
 	spin_lock_irqsave(&g.lock, flags);
 	if (g.active && g.nq) {
 		struct el_ent *e = q_remove(0);
+		u32 q_ms;
+		int k;
 
 		e->state = EL_OUT;
 		e->out_jiffies = jiffies;
 		vf = e->vf;
 		g.el_out++;
+		q_ms = jiffies_to_msecs(e->out_jiffies - e->q_jiffies);
+		g.q_max_ms = max(g.q_max_ms, q_ms);
+		if (e->id != g.mark_id)
+			g.el_get_other++;
+		/* the decoder's vframe changed since the queueing: buffer reused */
+		if (memcmp(e->snap, vf, VF_SNAP)) {
+			g.el_vf_changed++;
+			if (!g.change_logged) {
+				g.change_logged = true;
+				for (k = 0; k < VF_SNAP && e->snap[k] == ((u8 *)vf)[k]; k++)
+					;
+				pr_info(DRV_NAME ": EL id %u vframe changed after queueing (first byte %d, %u ms queued)\n",
+					e->id, k, q_ms);
+			}
+		}
 		dbg(2, "EL id %u crc %08x to display\n", e->id, e->crc);
 	}
 	spin_unlock_irqrestore(&g.lock, flags);
@@ -415,7 +455,13 @@ static void prov_put(struct vframe_s *vf, void *op_arg)
 		struct el_ent *e = &g.ent[i];
 
 		if (e->state == EL_OUT && e->vf == vf) {
+			u32 d_ms = jiffies_to_msecs(jiffies - e->out_jiffies);
+
 			g.el_put++;
+			if (e->sess == g.sess)
+				g.disp_max_ms = max(g.disp_max_ms, d_ms);
+			if (d_ms > DISP_LONG_MS)
+				g.el_disp_long++;
 			ent_release_locked(e);
 			break;
 		}
@@ -476,6 +522,39 @@ static void fel_on(void)
 {
 	schedule_work(&fel_on_work);
 	flush_work(&fel_on_work);
+}
+
+/*
+ * The session ended (also when the player died): the release fences of the EL
+ * pictures still on display are signalled now. The decoder is torn down at
+ * once; with a fence still pending its buffers stay with the media codec
+ * service for good (9 of them per such stop measured, until the codec memory
+ * runs out: no EL any more). The dma-buf stays referenced here until the
+ * driver puts the picture back (or the orphan timeout), so the memory the
+ * display reads stays valid.
+ */
+static void signal_out_fences(void)
+{
+	struct dma_fence *sig[MAX_EL];
+	unsigned long flags;
+	int i, n = 0;
+
+	spin_lock_irqsave(&g.lock, flags);
+	for (i = 0; i < MAX_EL; i++) {
+		struct el_ent *e = &g.ent[i];
+
+		if (e->state == EL_OUT && e->fence) {
+			sig[n++] = e->fence;
+			e->fence = NULL;
+		}
+	}
+	spin_unlock_irqrestore(&g.lock, flags);
+	for (i = 0; i < n; i++) {
+		dma_fence_signal(sig[i]);
+		dma_fence_put(sig[i]);
+	}
+	if (n)
+		dbg(1, "%d EL fences of pictures on display signalled at the session end\n", n);
 }
 
 /* drop the queued EL pictures (not the ones on display) and / or the hints */
@@ -541,7 +620,10 @@ static const struct dma_fence_ops el_fence_ops = {
 	.get_timeline_name = fence_timeline_name,
 };
 
-/* EL pictures the driver kept after the provider went away */
+/*
+ * EL pictures the driver kept after the provider went away (their session
+ * ended; a new session may run already: they are not its pictures)
+ */
 static void orphan_work_fn(struct work_struct *work)
 {
 	unsigned long flags;
@@ -552,10 +634,11 @@ static void orphan_work_fn(struct work_struct *work)
 	for (i = 0; i < MAX_EL; i++) {
 		struct el_ent *e = &g.ent[i];
 
-		if (e->state != EL_OUT || g.active)
+		if (e->state != EL_OUT || (g.active && e->sess == g.sess))
 			continue;
 		if (time_after(jiffies, e->out_jiffies + msecs_to_jiffies(ORPHAN_MS))) {
 			dbg(1, "EL id %u not returned by the driver, released\n", e->id);
+			g.el_orphans++;
 			ent_release_locked(e);
 		} else {
 			more = true;
@@ -566,8 +649,56 @@ static void orphan_work_fn(struct work_struct *work)
 		schedule_delayed_work(&g.orphan_work, msecs_to_jiffies(ORPHAN_MS / 4));
 }
 
+/* (g.lock held) the counters now */
+static void totals_locked(struct dvfel_sc2_totals *t)
+{
+	t->el_in = g.el_in;
+	t->el_out = g.el_out;
+	t->el_put = g.el_put;
+	t->el_dropped = g.el_dropped;
+	t->el_flushed = g.el_flushed;
+	t->bl_paired = g.bl_paired;
+	t->bl_no_el = g.bl_no_el;
+	t->bl_no_hint = g.bl_no_hint;
+	t->hints_in = g.hints_in;
+	t->hints_skipped = g.hints_skipped;
+	t->vf_changed = g.el_vf_changed;
+	t->get_other = g.el_get_other;
+	t->disp_long = g.el_disp_long;
+	t->orphans = g.el_orphans;
+}
+
+/* a line per session in the kernel log: what it did */
+static void sess_summary(void)
+{
+	struct dvfel_sc2_totals t, *s = &g.at_start;
+	unsigned long flags;
+	int i, out = 0, old = 0;
+
+	spin_lock_irqsave(&g.lock, flags);
+	totals_locked(&t);
+	for (i = 0; i < MAX_EL; i++) {
+		if (g.ent[i].state != EL_OUT)
+			continue;
+		out++;
+		old += g.ent[i].sess != g.sess;
+	}
+	spin_unlock_irqrestore(&g.lock, flags);
+	pr_info(DRV_NAME ": session %u: el in %llu out %llu put %llu dropped %llu flushed %llu, "
+		"bl paired %llu no_el %llu no_hint %llu, hints %llu skipped %llu, "
+		"vf_changed %llu get_other %llu disp_long %llu orphans %llu, max ms queued %u on display %u, "
+		"on display %d (older sessions %d)\n", g.sess,
+		t.el_in - s->el_in, t.el_out - s->el_out, t.el_put - s->el_put,
+		t.el_dropped - s->el_dropped, t.el_flushed - s->el_flushed,
+		t.bl_paired - s->bl_paired, t.bl_no_el - s->bl_no_el, t.bl_no_hint - s->bl_no_hint,
+		t.hints_in - s->hints_in, t.hints_skipped - s->hints_skipped,
+		t.vf_changed - s->vf_changed, t.get_other - s->get_other, t.disp_long - s->disp_long,
+		t.orphans - s->orphans, g.q_max_ms, g.disp_max_ms, out, old);
+}
+
 static long sess_start(struct file *f)
 {
+	unsigned long flags;
 	long ret = 0;
 
 	mutex_lock(&g.sess_lock);
@@ -590,8 +721,17 @@ static long sess_start(struct file *f)
 	}
 	g.owner = f;
 	fel_on();
+	spin_lock_irqsave(&g.lock, flags);
+	g.sess++;
+	totals_locked(&g.at_start);
+	g.q_max_ms = g.disp_max_ms = 0;
+	g.vf_logged = g.change_logged = false;
+	g.mark_id = 0;
+	spin_unlock_irqrestore(&g.lock, flags);
 	WRITE_ONCE(g.active, true);
-	dbg(1, "session start\n");
+	/* pictures an earlier session left with the driver go back now */
+	schedule_delayed_work(&g.orphan_work, msecs_to_jiffies(ORPHAN_MS / 4));
+	dbg(1, "session %u start\n", g.sess);
 out:
 	mutex_unlock(&g.sess_lock);
 	return ret;
@@ -606,13 +746,14 @@ static void sess_stop(struct file *f)
 	}
 	WRITE_ONCE(g.active, false);
 	flush_queue(DVFEL_SC2_FLUSH_EL | DVFEL_SC2_FLUSH_HINTS);
+	signal_out_fences();
 	if (g.prov_reg) {
 		vf_unreg_provider(&g.prov);
 		g.prov_reg = false;
 	}
 	g.owner = NULL;
 	schedule_delayed_work(&g.orphan_work, msecs_to_jiffies(ORPHAN_MS / 4));
-	dbg(1, "session stop\n");
+	sess_summary();
 	mutex_unlock(&g.sess_lock);
 }
 
@@ -678,6 +819,9 @@ static long ioc_el_queue(struct file *f, void __user *arg)
 		e->crc = r.rpu_crc;
 		e->pts_us = r.pts_us;
 		e->id = ++g.next_id;
+		e->sess = g.sess;
+		e->q_jiffies = jiffies;
+		memcpy(e->snap, vf, VF_SNAP);
 		/* in pts order (the EL decoder's output is in display order) */
 		for (i = g.nq; i > 0 && g.q[i - 1]->pts_us > r.pts_us; i--)
 			;
@@ -699,6 +843,11 @@ static long ioc_el_queue(struct file *f, void __user *arg)
 		return -EBUSY;
 	}
 	r.fence_fd = fd;
+	if (!g.vf_logged) {
+		/* the first EL vframe of a session, for the log (its layout is the firmware's) */
+		g.vf_logged = true;
+		pr_info(DRV_NAME ": session %u first EL vframe: %*ph\n", g.sess, 64, vf);
+	}
 	dbg(2, "EL id %u crc %08x pts %lld queued (%u)\n", r.id, r.rpu_crc, r.pts_us, r.queued);
 	if (copy_to_user(arg, &r, sizeof(r))) {
 		/* the entry stays (released with the session); the fence with it */
@@ -816,6 +965,9 @@ static int stats_show(struct seq_file *m, void *v)
 		   g.bl_no_hint, g.bl_no_crc);
 	seq_printf(m, "hints in %llu pending %d skipped %llu overflow %llu\n", g.hints_in, g.nh,
 		   g.hints_skipped, g.hints_overflow);
+	seq_printf(m, "session %u vf_changed %llu get_other %llu disp_long %llu orphans %llu max_ms queued %u on_display %u\n",
+		   g.sess, g.el_vf_changed, g.el_get_other, g.el_disp_long, g.el_orphans, g.q_max_ms,
+		   g.disp_max_ms);
 	spin_unlock_irqrestore(&g.lock, flags);
 	return 0;
 }

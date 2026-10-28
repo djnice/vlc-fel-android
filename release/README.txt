@@ -71,7 +71,7 @@ S905X4 (DUNE HD)
 - Az S905X4 Dolby Vision magja maga is fogad EL-t, és a Dune S905X4-es firmware-ének Dolby Vision
   meghajtójában a FEL-hibák már javítva vannak; az Android-lejátszók MediaCodec-dekódere viszont csak
   az alapréteget adja ki. A VLC FEL az EL-t egy második dekóderrel dekódolja, és a dvfel kernelmodul
-  S905X4-es változata (2026.10.25.4) képenként átadja a Dolby Vision meghajtónak, a hozzá tartozó
+  S905X4-es változata (2026.10.28.2) képenként átadja a Dolby Vision meghajtónak, a hozzá tartozó
   alapréteg-képpel párosítva. GPU-munka nincs, az RPU marad profile 7.
 - A modult a VLC FEL ugyanúgy telepíti, mint S928X-en (a lejátszó típusa szerint választja ki).
 - Tesztelve Dune HD Pro Vision 4K-n (R24), TV-n nézve: lejátszás, szünet, tekerés, a telepítés
@@ -134,7 +134,7 @@ TELEPÍTÉS
 ---------
 1. Az APK telepítése (pendrive + fájlkezelő, „Downloader” app, vagy: adb install VLC-FEL-*.apk).
 2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.23.3;
-   S905X4-en 2026.10.25.4) a
+   S905X4-en 2026.10.28.2) a
    firmware boot-könyvtárába (<app>/config/boot/dvfel.sh), és be is tölti; ha kell, előtte
    rákérdez a root-hozzáférésre. Ezután minden bekapcsoláskor magától betöltődik.
    Régebbi modulra a telepítő sosem cserél.
@@ -157,6 +157,14 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.11-poc (libdvfelplay 2026.10.28.2, S905X4-re dvfel 2026.10.28.2; az S928X-modul, a VLC- és
+          app-javítások és a 3D változatlanok) – S905X4-en nincs zöld kép / hiányzó EL, miután a
+          lejátszót leállították (force-stop) vagy összeomlott: ilyenkor a kijelzőn lévő EL-képek
+          kiadási jelzése késve ment ki, és az Android dekóderszolgáltatása leállásonként 9 EL-puffert
+          (~28 MB) bent tartott. Néhány ilyen leállás után elfogyott a dekódermemória, a FEL-fájlok zöld
+          képpel (üres EL) vagy EL nélkül mentek, újraindításig. A jelzés most a lejátszás végén azonnal
+          kimegy. Minden lejátszás egy összegző sort ír a kernelnaplóba (dvfel: session N: ...), a
+          libdvfelplay 5 másodpercenként egy sort a hibajelentésekhez.
 0.2.10-poc (libdvfelplay 2026.10.25.2, dvfel 2026.10.23.3 és S905X4-re 2026.10.25.4, VLC- és
           app-javítás; a 3D változatlan) – Amlogic S905X4-es Dune HD lejátszók: a P7 FEL-t a SoC
           Dolby Vision magja rakja össze, az EL-t a VLC FEL dekódolja, és az új S905X4-es modul adja át
@@ -293,7 +301,7 @@ S905X4 (DUNE HD)
 - The S905X4's Dolby Vision core takes an EL itself, and the Dolby Vision driver of the Dune S905X4
   firmware already has the FEL fixes; but the MediaCodec decoder of Android players outputs the base
   layer only. VLC FEL decodes the EL with a second decoder, and the S905X4 build of the dvfel kernel
-  module (2026.10.25.4) hands each EL picture to the Dolby Vision driver, paired with its base layer
+  module (2026.10.28.2) hands each EL picture to the Dolby Vision driver, paired with its base layer
   picture. No GPU work, the RPU stays profile 7.
 - VLC FEL installs the module as on the S928X (it picks the build by the player's SoC).
 - Tested on a Dune HD Pro Vision 4K (R24), watched on the TV: playback, pause, seeks, the installation
@@ -355,7 +363,7 @@ INSTALLATION
 ------------
 1. Install the APK (USB stick + file manager, the "Downloader" app, or adb install VLC-FEL-*.apk).
 2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.23.3; on
-   the S905X4 2026.10.25.4) into
+   the S905X4 2026.10.28.2) into
    the firmware's boot hook directory (<app>/config/boot/dvfel.sh) and loads it, asking for root
    access first if needed. It then loads at every boot.
    The installer never replaces a newer module with an older one.
@@ -377,6 +385,14 @@ NOTES
 
 CHANGES
 -------
+0.2.11-poc (libdvfelplay 2026.10.28.2, dvfel 2026.10.28.2 for the S905X4; the S928X module, the VLC
+          and app patches and 3D unchanged) – S905X4: no green picture / missing EL after the player was
+          stopped by force or crashed: the release of the EL pictures on display was signalled late, and
+          the Android media codec service kept 9 EL buffers (~28 MB) per such stop. After a few of them
+          the codec memory ran out and FEL files played with a green picture (an empty EL) or without the
+          EL, until a reboot. The release is now signalled at the end of the playback at once. Each
+          playback writes a summary line to the kernel log (dvfel: session N: ...), libdvfelplay a line
+          every 5 s, for reports.
 0.2.10-poc (libdvfelplay 2026.10.25.2, dvfel 2026.10.23.3 and for the S905X4 2026.10.25.4, VLC and
           app fixes; 3D unchanged) – Amlogic S905X4 Dune HD players: P7 FEL composed by the SoC's
           Dolby Vision core, the EL decoded by VLC FEL and handed to the driver by the new S905X4 module

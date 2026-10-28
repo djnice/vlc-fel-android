@@ -26,6 +26,14 @@
  * the RPU the decoder got with the frame instead; each access unit's sent RPU
  * CRC is filed with its pts, and a frame takes the earliest pending pts with
  * its CRC (frames arrive in display order).
+ *
+ * Amlogic S905X4 (SC2, the dvfel SC2 module): the SoC's Dolby Vision core
+ * composes BL + EL itself. The base layer keeps its profile 7 RPU, there is no
+ * GPU work; every EL picture goes to the kernel (DVFEL_IOC_SC2_EL_QUEUE) with
+ * the pts of its frame and its image back to the reader at once with a release
+ * fence, and every base layer access unit is reported (DVFEL_IOC_SC2_BL_HINT):
+ * the kernel pairs the frames the Dolby Vision driver processes (see
+ * dvfel_sc2_uapi.h).
  */
 
 #include "dvfelplay.h"
@@ -79,7 +87,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.25.2"
+#define DVFP_VERSION "2026.10.28.2"
 
 namespace
 {
@@ -248,6 +256,13 @@ bool IsSc2()
     return __system_property_get("ro.board.platform", v) > 0 && !strcmp(v, "sc2");
   }();
   return sc2;
+}
+
+int64_t NowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 int PropInt(const char* name, int fallback)
@@ -821,6 +836,10 @@ private:
   int m_sc2Buffers{SC2_EL_BUFFERS};        // pictures in the decoder + with the kernel
   std::thread m_sc2DoneThread;
   uint64_t m_sc2QueueErrors{0};
+  // SC2 diagnostics (Sc2DoneThread logs them every 5 s)
+  std::atomic<uint64_t> m_sc2Queued{0}, m_sc2QueueFailed{0}, m_sc2Done{0};
+  std::atomic<int64_t> m_sc2LastOutNs{0};
+  std::atomic<int> m_sc2MaxGapMs{0};
   std::atomic<bool> m_stop{false};
   std::atomic<int> m_leadUs{0}; // the kernel holds the frames back by this (DVFEL_IOC_SET_LEAD)
   std::atomic<int> m_demo{0};   // dvfp_set_demo (debug.dvfp.demo 1 turns it on too)
@@ -1410,7 +1429,11 @@ bool dvfp::Sc2Queue(AImage* image, int64_t pts)
   // decodes into the buffer again (the display shows it until then)
   AImage_deleteAsync(image, queued ? el.fence_fd : -1);
   if (!queued)
+  {
+    m_sc2QueueFailed++;
     return false;
+  }
+  m_sc2Queued++;
   std::lock_guard<std::mutex> lock(m_lock);
   m_sc2Ids.insert(el.id);
   m_sc2Held = static_cast<int>(m_sc2Ids.size());
@@ -1420,8 +1443,26 @@ bool dvfp::Sc2Queue(AImage* image, int64_t pts)
 void dvfp::Sc2DoneThread()
 {
   pthread_setname_np(pthread_self(), "dvfp-sc2");
+  // diagnostics: a line every 5 s (EL decoder, pictures with the kernel)
+  int64_t statsAt = NowNs() + 5000000000LL;
+  uint64_t inLast = 0, outLast = 0, queuedLast = 0, doneLast = 0;
   while (!m_stop)
   {
+    if (NowNs() >= statsAt)
+    {
+      statsAt += 5000000000LL;
+      const uint64_t in = m_elInputs, out = m_elOutputs, queued = m_sc2Queued, doneN = m_sc2Done;
+      LOGI("SC2 5 s: EL in %llu out %llu queued %llu (failed %llu) returned %llu, with the kernel %d, "
+           "in the decoder %d, longest output gap %d ms",
+           (unsigned long long)(in - inLast), (unsigned long long)(out - outLast),
+           (unsigned long long)(queued - queuedLast), (unsigned long long)m_sc2QueueFailed.load(),
+           (unsigned long long)(doneN - doneLast), m_sc2Held.load(), m_elInFlight.load(),
+           m_sc2MaxGapMs.exchange(0));
+      inLast = in;
+      outLast = out;
+      queuedLast = queued;
+      doneLast = doneN;
+    }
     dvfel_sc2_done done{};
     done.timeout_ms = 100;
     if (ioctl(m_elDev, DVFEL_IOC_SC2_WAIT_DONE, &done) < 0)
@@ -1430,6 +1471,7 @@ void dvfp::Sc2DoneThread()
         usleep(10000);
       continue;
     }
+    m_sc2Done += done.count;
     std::lock_guard<std::mutex> lock(m_lock);
     for (uint32_t i = 0; i < done.count && i < DVFEL_SC2_MAX_DONE; i++)
       m_sc2Ids.erase(done.id[i]);
@@ -1575,6 +1617,14 @@ void dvfp::ElThread()
       AMediaCodec_releaseOutputBuffer(codec, o, buf >= 0);
       m_elOutputs++;
       m_elLastOut = info.presentationTimeUs;
+      if (m_sc2)
+      {
+        // diagnostics: the longest pause between EL outputs (fence waits)
+        const int64_t now = NowNs();
+        const int64_t last = m_sc2LastOutNs.exchange(now);
+        if (last)
+          m_sc2MaxGapMs = std::max<int>(m_sc2MaxGapMs, static_cast<int>((now - last) / 1000000));
+      }
       outOfDecoder(info.presentationTimeUs);
       if (buf < 0 && m_elOverflow++ < 10)
       {

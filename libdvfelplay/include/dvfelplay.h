@@ -33,6 +33,10 @@
  *   seek / flush:       dvfp_flush() (with the MediaCodec flush)
  *   end:                dvfp_close()
  *
+ * On an Amlogic S905X4 (SC2) the SoC's Dolby Vision core composes the EL
+ * itself (the dvfel SC2 module): the RPU stays profile 7 in DVFP_MODE_FEL, the
+ * same API, no GPU and no demo mode.
+ *
  * Input is Annex-B (start codes); one call per access unit (the BL picture
  * with its NAL 62 RPU and NAL 63 EL units). Codec config data (VPS/SPS/PPS
  * only) may be passed through unfiltered.

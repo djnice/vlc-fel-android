@@ -28,7 +28,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define DVFEL_SC2_VERSION	"2026.10.25.4"
+#define DVFEL_SC2_VERSION	"2026.10.28.2"
 
 #define DVFEL_SC2_MAX_EL	12	/* EL pictures queued + on display */
 #define DVFEL_SC2_MAX_DONE	16

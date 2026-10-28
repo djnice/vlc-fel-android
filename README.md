@@ -58,7 +58,7 @@ dvfel (SC2): kprobes on the driver's is_dovi_dual_layer_frame() / dolby_vision_p
   → Dolby Vision core: BL + EL + RPU composed by the SoC
 ```
 
-- The `dvfel` SC2 module (`2026.10.25.4`) is bundled next to the S928X one; the installer picks it by the SoC
+- The `dvfel` SC2 module (`2026.10.28.2`) is bundled next to the S928X one; the installer picks it by the SoC
   (`ro.board.platform` `sc2`) and installs it the same way (R24: `binit.sh` runs `config/boot`).
 - Tested on a Dune HD Pro Vision 4K, firmware `260303_1721_r24`, on the TV: playback (all frames paired with
   their EL once the first EL key picture is in), pause, seeks, the installation with the root question, the
@@ -272,6 +272,18 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.11-poc** (libdvfelplay `2026.10.28.2`, kernel module `dvfel 2026.10.28.2` (S905X4); the S928X module,
+  the VLC and app patches and 3D MVC unchanged): **S905X4: no green picture / missing EL after the player was
+  killed** (force-stop, crash). When the player process died during FEL playback, the release fences of the EL
+  pictures still on display were signalled only a second later (never when the next playback started within
+  that second); by then the media codec service had torn the EL decoder down and kept 9 of its buffers (~28 MB)
+  for good. After a few such stops the codec memory ran out, the EL decoder got no buffers, and FEL files showed
+  a green picture (an empty EL) or no EL at all, until a reboot. The fences are now signalled at the end of the
+  playback (the memory stays referenced until the display gives the picture back), and pictures an earlier
+  playback left with the display go back after a second in any case. Each playback writes a summary line to
+  the kernel log (`dvfel: session N: …`) and libdvfelplay a line every 5 s (`SC2 5 s: …`) for reports.
+  With it the Dune HD plugin `dune_plugin_s928x_dvfel-2026.10.28.1-0.2.11.zip` (this libdvfelplay for the r25
+  firmware; the module stays `dvfel 2026.10.23.3`).
 - **Dune HD plugin `2026.10.25.1-0.2.10`** (libdvfelplay only; the module stays `dvfel 2026.10.23.3`): the
   firmware's copy of libdvfelplay is the one of v0.2.10-poc (`2026.10.25.2`), as the plugin
   `dune_plugin_s928x_dvfel-2026.10.25.1-0.2.10.zip`. Playback on the S928X as with the plugin before; restart the
