@@ -70,7 +70,7 @@ S905X4 (DUNE HD)
 ----------------
 - Az S905X4 Dolby Vision magja maga is fogad EL-t; az Android-lejátszók MediaCodec-dekódere viszont
   csak az alapréteget adja ki. A VLC FEL az EL-t egy második dekóderrel dekódolja, és a dvfel
-  kernelmodul S905X4-es változata (2026.10.28.3) képenként átadja a Dolby Vision meghajtónak, a hozzá
+  kernelmodul S905X4-es változata (2026.10.28.4) képenként átadja a Dolby Vision meghajtónak, a hozzá
   tartozó alapréteg-képpel párosítva. GPU-munka nincs, az RPU marad profile 7.
 - A Dune S905X4-es firmware-ének (R24 és r25) Dolby Vision meghajtójából (aml_media.ko) hiányzik négy
   FEL-javítás: a meghajtó minden képkockánál eldobja az EL-párosítást (az EL-dekóder kifogy a
@@ -81,6 +81,8 @@ S905X4 (DUNE HD)
 - A modult a VLC FEL ugyanúgy telepíti, mint S928X-en (a lejátszó típusa szerint választja ki).
 - Tesztelve Dune HD Pro Vision 4K-n (r25, a gyári firmware-rel), TV-n nézve: lejátszás (mp4, mkv,
   m2ts), szünet, tekerés, a modul frissítése root-kérdéssel és a betöltés bekapcsoláskor.
+- A lejátszás elején a kép fekete marad az első EL-lel párosított képkockáig (0,3–4 s, legfeljebb 8 s):
+  az alapréteg első képkockái az EL-dekóder első képe előtt jönnek, és EL nélkül egy FEL-kép zöld lenne.
 - Tekerés után 1–4 képkocka EL nélkül jelenik meg. Szünet közben az EL-dekóder néhány
   „wait fence” időtúllépést ír a naplóba.
 - Demó mód nincs (lásd fent). 3D MVC csak S928X-en: az mvc3d modul S905X4-en nem töltődik be;
@@ -139,7 +141,7 @@ TELEPÍTÉS
 ---------
 1. Az APK telepítése (pendrive + fájlkezelő, „Downloader” app, vagy: adb install VLC-FEL-*.apk).
 2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.23.3;
-   S905X4-en 2026.10.28.3) a
+   S905X4-en 2026.10.28.4) a
    firmware boot-könyvtárába (<app>/config/boot/dvfel.sh), és be is tölti; ha kell, előtte
    rákérdez a root-hozzáférésre. Ezután minden bekapcsoláskor magától betöltődik.
    Régebbi modulra a telepítő sosem cserél.
@@ -162,6 +164,13 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.13-poc (libdvfelplay 2026.10.28.4, S905X4-re dvfel 2026.10.28.4; az S928X-modul, a VLC- és
+          app-javítások és a 3D változatlanok) – S905X4-en nincs zöld kép a FEL-lejátszás elején: az
+          alapréteg első képkockái 0,3–4 s-mal az EL-dekóder első képe előtt jönnek, és ezeket a Dolby
+          Vision mag EL nélkül zöldnek mutatta. A modul most a lejátszás elejétől az első EL-lel
+          párosított képkockáig (legfeljebb 8 s) elnémítja a videót; a lejátszás vége (vagy a modul
+          eltávolítása) mindig visszakapcsolja. Tekerés és szünet változatlan. HDR10, SDR és Dolby Vision
+          kimenettel is.
 0.2.12-poc (libdvfelplay 2026.10.28.3, S905X4-re dvfel 2026.10.28.3; az S928X-modul, a VLC- és
           app-javítások és a 3D változatlanok) – S905X4-en a gyári Dune firmware-rel (R24, r25) is megy
           a FEL: a firmware Dolby Vision meghajtójából hiányzó négy FEL-javítást a modul futás közben
@@ -311,7 +320,7 @@ S905X4 (DUNE HD)
 ----------------
 - The S905X4's Dolby Vision core takes an EL itself, but the MediaCodec decoder of Android players
   outputs the base layer only. VLC FEL decodes the EL with a second decoder, and the S905X4 build of
-  the dvfel kernel module (2026.10.28.3) hands each EL picture to the Dolby Vision driver, paired with
+  the dvfel kernel module (2026.10.28.4) hands each EL picture to the Dolby Vision driver, paired with
   its base layer picture. No GPU work, the RPU stays profile 7.
 - The Dolby Vision driver (aml_media.ko) of the Dune S905X4 firmware (R24 and r25) lacks four FEL
   fixes: the driver drops its BL/EL pairing on every frame (the EL decoder runs out of buffers), two
@@ -322,6 +331,9 @@ S905X4 (DUNE HD)
 - VLC FEL installs the module as on the S928X (it picks the build by the player's SoC).
 - Tested on a Dune HD Pro Vision 4K (r25, the stock firmware), watched on the TV: playback (mp4, mkv,
   m2ts), pause, seeks, the module update with the root question and the load at boot.
+- At the start of a playback the picture stays black until the first frame with its EL (0.3–4 s, at
+  most 8 s): the base layer's first frames come before the EL decoder's first picture, and a FEL frame
+  without its EL would show green.
 - After a seek 1–4 frames show without the EL. During a pause the EL decoder logs a few "wait fence"
   timeouts.
 - No demo mode (see above). 3D MVC on the S928X only: the mvc3d module does not load on the S905X4;
@@ -379,7 +391,7 @@ INSTALLATION
 ------------
 1. Install the APK (USB stick + file manager, the "Downloader" app, or adb install VLC-FEL-*.apk).
 2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.23.3; on
-   the S905X4 2026.10.28.3) into
+   the S905X4 2026.10.28.4) into
    the firmware's boot hook directory (<app>/config/boot/dvfel.sh) and loads it, asking for root
    access first if needed. It then loads at every boot.
    The installer never replaces a newer module with an older one.
@@ -401,6 +413,13 @@ NOTES
 
 CHANGES
 -------
+0.2.13-poc (libdvfelplay 2026.10.28.4, dvfel 2026.10.28.4 for the S905X4; the S928X module, the VLC
+          and app patches and 3D unchanged) – S905X4: no green picture at the start of a FEL playback:
+          the base layer's first frames come 0.3–4 s before the EL decoder's first picture, and the Dolby
+          Vision core showed them without their EL as a green picture. The module now mutes the video
+          from the start of a playback until its first frame paired with its EL (at most 8 s); the end
+          of a playback (or unloading the module) always unmutes. Seeks and pause unchanged. Also with
+          HDR10, SDR and Dolby Vision output.
 0.2.12-poc (libdvfelplay 2026.10.28.3, dvfel 2026.10.28.3 for the S905X4; the S928X module, the VLC
           and app patches and 3D unchanged) – S905X4: FEL also with the stock Dune firmware (R24, r25):
           the module applies the four FEL fixes the firmware's Dolby Vision driver lacks at run time.

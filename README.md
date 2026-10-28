@@ -71,12 +71,15 @@ dvfel (SC2): kprobes on the driver's is_dovi_dual_layer_frame() / dolby_vision_p
   A driver that already has the fixes, or an unknown build, has no match: that fix stays off (the kernel log
   lists the ones applied, `dvfel: fix … at …`, and `/sys/kernel/debug/dvfel/stats` counts them). The proper
   place for these fixes is the firmware's driver.
-- The `dvfel` SC2 module (`2026.10.28.3`) is bundled next to the S928X one; the installer picks it by the SoC
+- The `dvfel` SC2 module (`2026.10.28.4`) is bundled next to the S928X one; the installer picks it by the SoC
   (`ro.board.platform` `sc2`) and installs it the same way (R24, r25: `binit.sh` runs `config/boot`).
 - Tested on a Dune HD Pro Vision 4K with the stock firmware `261021_0117_r25`, on the TV: playback of mp4, mkv
   and m2ts (all frames paired with their EL once the first EL key picture is in), pause, seeks, the update of an
   installed module with the root question and the load at boot. (0.2.10–0.2.11 were tested on a unit with a
   patched driver, which hid the missing fixes.)
+- At the start of a playback the picture stays black until the first frame with its EL (0.3–4 s, at most 8 s):
+  the base layer's first frames come before the EL decoder's first picture, and a FEL frame without its EL
+  would show green.
 - After a seek 1–4 frames show without the EL. During a pause the EL decoder logs a few fence wait timeouts.
 - No [demo mode](#demo-mode-fel-vs-base-layer) there: the SoC composes, nothing to compare in the player (the
   menu item says *not available*).
@@ -286,6 +289,12 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.13-poc** (libdvfelplay `2026.10.28.4`, kernel module `dvfel 2026.10.28.4` (S905X4); the S928X module,
+  the VLC and app patches and 3D MVC unchanged): **S905X4: no green picture at the start of a FEL playback.** The
+  player's first base layer frames come 0.3–4 s before the EL decoder's first picture, and the Dolby Vision core
+  showed those FEL frames without their EL as a green picture. The module now keeps the video muted from the
+  start of a playback until its first frame paired with its EL (at most 8 s); the end of a playback (or unloading
+  the module) always unmutes. Seeks and pause are unchanged. Also with HDR10, SDR and Dolby Vision output.
 - **v0.2.12-poc** (libdvfelplay `2026.10.28.3`, kernel module `dvfel 2026.10.28.3` (S905X4); the S928X module,
   the VLC and app patches and 3D MVC unchanged): **S905X4: FEL with the stock Dune firmware (R24, r25).** The
   Dolby Vision driver of the stock firmware lacks four FEL fixes (see

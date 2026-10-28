@@ -87,7 +87,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.28.3"
+#define DVFP_VERSION "2026.10.28.4"
 
 namespace
 {
