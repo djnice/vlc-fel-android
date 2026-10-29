@@ -71,16 +71,16 @@ dvfel (SC2): kprobes on the driver's is_dovi_dual_layer_frame() / dolby_vision_p
   A driver that already has the fixes, or an unknown build, has no match: that fix stays off (the kernel log
   lists the ones applied, `dvfel: fix … at …`, and `/sys/kernel/debug/dvfel/stats` counts them). The proper
   place for these fixes is the firmware's driver.
-- The `dvfel` SC2 module (`2026.10.28.4`) is bundled next to the S928X one; the installer picks it by the SoC
+- The `dvfel` SC2 module (`2026.10.29.1`) is bundled next to the S928X one; the installer picks it by the SoC
   (`ro.board.platform` `sc2`) and installs it the same way (R24, r25: `binit.sh` runs `config/boot`).
 - Tested on a Dune HD Pro Vision 4K with the stock firmware `261021_0117_r25`, on the TV: playback of mp4, mkv
   and m2ts (all frames paired with their EL once the first EL key picture is in), pause, seeks, the update of an
   installed module with the root question and the load at boot. (0.2.10–0.2.11 were tested on a unit with a
   patched driver, which hid the missing fixes.)
-- At the start of a playback the picture stays black until the first frame with its EL (0.3–4 s, at most 8 s):
-  the base layer's first frames come before the EL decoder's first picture, and a FEL frame without its EL
-  would show green.
-- After a seek 1–4 frames show without the EL. During a pause the EL decoder logs a few fence wait timeouts.
+- At the start of a playback the picture stays black until the EL comes steadily (0.3–4 s, at most 10 s): the
+  base layer's first frames come before the EL decoder's pictures, and a FEL frame without its EL would show
+  green.
+- After a seek a few frames (up to about a second, until the EL's next key picture) show without the EL. During a pause the EL decoder logs a few fence wait timeouts.
 - No [demo mode](#demo-mode-fel-vs-base-layer) there: the SoC composes, nothing to compare in the player (the
   menu item says *not available*).
 - 3D MVC: S928X only. The `mvc3d` module is built for the S928X kernel and does not load on the S905X4: with
@@ -289,6 +289,13 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.14-poc** (libdvfelplay `2026.10.29.1`, kernel module `dvfel 2026.10.29.1` (S905X4); the S928X module,
+  the VLC and app patches and 3D MVC unchanged): **S905X4: no green picture at the start of a FEL playback, also
+  after the first EL picture.** 0.2.13 unmuted the video at the first frame paired with its EL, but the EL
+  decoder then pauses once more (its resolution change), and 1–2 s of frames without the EL still showed green
+  (reported by Dune HD with their `fel_test.mp4`). The module now keeps the video muted until 6 frames in a row
+  had their EL, and mutes it again if one is missing within the first 48 (at most 10 s in all). Seeks and pause
+  are unchanged.
 - **v0.2.13-poc** (libdvfelplay `2026.10.28.4`, kernel module `dvfel 2026.10.28.4` (S905X4); the S928X module,
   the VLC and app patches and 3D MVC unchanged): **S905X4: no green picture at the start of a FEL playback.** The
   player's first base layer frames come 0.3–4 s before the EL decoder's first picture, and the Dolby Vision core

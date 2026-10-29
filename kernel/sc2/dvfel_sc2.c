@@ -22,8 +22,8 @@
  *     (it asks a "dvbldec" provider, which frame mode does not have); the
  *     driver then peeks/gets the head of the dveldec queue, that picture;
  *   - Dolby Vision FEL is switched on in the driver (debug "enable_fel 1");
- *   - the video is muted (black) from the start of a session until its first
- *     frame with its EL (see start_mute()).
+ *   - the video is muted (black) at the start of a session until its EL
+ *     comes steadily (see start_mute()).
  *
  * The decoder keeps an EL picture's buffer until the display is done with it:
  * each queued picture gets a release fence (sync file) that the player gives
@@ -137,10 +137,13 @@ static struct dvfel_sc2 {
 
 	struct vframe_s *bl_vf;		/* last base layer frame paired */
 	bool bl_found;
-	bool paired_once;		/* a frame of this session had its EL */
-	bool muted;			/* video muted until then (start_mute()) */
+	/* the start of a session (start_mute()) */
+	bool start_done;		/* the EL came steadily (or the time is up) */
+	bool muted;			/* video muted */
+	u32 paired_run;			/* frames in a row with their EL */
+	unsigned long start_jiffies;	/* the session's first frame, 0: none yet */
 	unsigned long mute_jiffies;
-	u64 start_muted;		/* sessions that started muted */
+	u64 start_muted;		/* times muted at a start */
 
 	/* stats */
 	u64 el_in, el_out, el_put, el_dropped, el_flushed, bl_paired, bl_no_el, bl_no_crc, bl_no_hint;
@@ -179,43 +182,55 @@ static inline struct vframe_src_fmt_s *sc2_src_fmt(struct vframe_s *vf)
  * mapping of the RPU is made for BL + EL. At a start the base layer decoder
  * (the player's) gives its first frames before the EL decoder (here, 0.3 to
  * 4 s: its output buffers come late after its resolution change), and the
- * player shows them at once. So the video is muted (black, the driver's own
- * set_video_mute(), which it uses from the vsync too) from the start of a
- * session until its first paired frame, at most START_MUTE_MS (no EL comes).
- * The stream mode dual layer decoder (CoreELEC) has no such frames.
+ * player shows them at once. The first EL picture often comes alone (from
+ * the decoder's buffers before its resolution change), the next ones 1 to 2 s
+ * later. So the video is muted (black, the driver's own set_video_mute(),
+ * which it uses from the vsync too) during the start of a session: from its
+ * first frame without EL until START_STEADY frames in a row had theirs; a
+ * frame without EL mutes it again until START_DONE frames in a row had
+ * theirs, all of it for at most START_MUTE_MS (no EL comes). The stream mode
+ * dual layer decoder (CoreELEC) has no such frames.
  */
-#define START_MUTE_MS	8000
+#define START_STEADY	6
+#define START_DONE	48
+#define START_MUTE_MS	10000
 
 /* aml_media (video_sink/video.h) */
 void set_video_mute(bool on);
 
-/* (g.lock held) */
+/* (g.lock held) a new base layer frame of the session: with its EL or not */
 static void start_mute(bool found)
 {
-	if (!READ_ONCE(g.active))
+	if (!READ_ONCE(g.active) || g.start_done)
 		return;
-	if (found) {
-		g.paired_once = true;
+	if (!g.start_jiffies)
+		g.start_jiffies = jiffies ? jiffies : 1;
+	if (time_after(jiffies, g.start_jiffies + msecs_to_jiffies(START_MUTE_MS))) {
+		g.start_done = true;
 		if (g.muted) {
 			set_video_mute(false);
 			g.muted = false;
-			dbg(1, "first frame with its EL: unmuted after %u ms\n",
-			    jiffies_to_msecs(jiffies - g.mute_jiffies));
+			pr_info(DRV_NAME ": no steady EL for %d ms: unmuted\n", START_MUTE_MS);
 		}
 		return;
 	}
-	if (g.paired_once)
+	if (found) {
+		g.paired_run++;
+		if (g.muted && g.paired_run >= START_STEADY) {
+			set_video_mute(false);
+			g.muted = false;
+			dbg(1, "EL steady: unmuted after %u ms\n", jiffies_to_msecs(jiffies - g.mute_jiffies));
+		}
+		if (g.paired_run >= START_DONE)
+			g.start_done = true;
 		return;
+	}
+	g.paired_run = 0;
 	if (!g.muted) {
 		set_video_mute(true);
 		g.muted = true;
 		g.mute_jiffies = jiffies;
 		g.start_muted++;
-	} else if (time_after(jiffies, g.mute_jiffies + msecs_to_jiffies(START_MUTE_MS))) {
-		set_video_mute(false);
-		g.muted = false;
-		g.paired_once = true;
-		pr_info(DRV_NAME ": no frame with its EL for %d ms: unmuted\n", START_MUTE_MS);
 	}
 }
 
@@ -390,7 +405,7 @@ static bool pts_of_crc(u32 crc, s64 *pts)
 static bool pair_bl(struct vframe_s *vf)
 {
 	unsigned long flags;
-	bool found = false;
+	bool found = false, fresh = true;
 	s64 pts;
 	u32 crc;
 
@@ -406,6 +421,7 @@ static bool pair_bl(struct vframe_s *vf)
 	if (g.bl_vf == vf) {
 		/* asked again for the same frame (wait, then parse) */
 		found = g.bl_found && g.nq;
+		fresh = false;
 	} else if (!pts_of_crc(crc, &pts)) {
 		/* decoded before a seek, or not reported */
 		g.bl_no_hint++;
@@ -431,7 +447,8 @@ static bool pair_bl(struct vframe_s *vf)
 	}
 	if (found)
 		sc2_src_fmt(vf)->dual_layer = true;
-	start_mute(found);
+	if (fresh)
+		start_mute(found);
 	spin_unlock_irqrestore(&g.lock, flags);
 	return found;
 }
@@ -1011,7 +1028,9 @@ static long sess_start(struct file *f)
 	g.q_max_ms = g.disp_max_ms = 0;
 	g.vf_logged = g.change_logged = false;
 	g.mark_id = 0;
-	g.paired_once = false;
+	g.start_done = false;
+	g.paired_run = 0;
+	g.start_jiffies = 0;
 	spin_unlock_irqrestore(&g.lock, flags);
 	WRITE_ONCE(g.active, true);
 	/* pictures an earlier session left with the driver go back now */
