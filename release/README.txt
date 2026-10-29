@@ -142,7 +142,7 @@ HANG BITSTREAMKÉNT (PASSTHROUGH)
 TELEPÍTÉS
 ---------
 1. Az APK telepítése (pendrive + fájlkezelő, „Downloader” app, vagy: adb install VLC-FEL-*.apk).
-2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.23.3;
+2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.29.2;
    S905X4-en 2026.10.29.1) a
    firmware boot-könyvtárába (<app>/config/boot/dvfel.sh), és be is tölti; ha kell, előtte
    rákérdez a root-hozzáférésre. Ezután minden bekapcsoláskor magától betöltődik.
@@ -166,6 +166,16 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.15-poc (libdvfelplay 2026.10.29.2, S928X-re dvfel 2026.10.29.2; az S905X4-modul, a VLC- és
+          app-javítások és a 3D változatlanok) – S928X-en egy gyors váltás után nem veszhet el a FEL az
+          egész lejátszásra: ha egy FEL-lejátszás egy-két másodpercen belül követett egy másikat (Blu-ray
+          lemez átadása a Dune HD menüs lejátszójától egy másik lejátszónak, vagy gyors újraindítás), a
+          modul az előző kompozitor puffereinek újrafoglalása előtt megvárta, hogy kiürüljenek a sorai,
+          közben viszont minden képkocka kompozíció nélkül ezekbe a sorokba került (a 125 ms-os előfutás
+          1–3 képkockát tart ott), így sosem ürültek ki, és az egész film EL nélkül (demó mód nélkül is)
+          ment. Most csak a saját puffereinek sorban álló képkockái számítanak. A demó mód sem jelenik meg
+          egy másodpercre az indításkor, ha az előző lejátszás bekapcsolt demóval ért véget. Dune HD r25-ön
+          a firmware modulja megy: azt a Dune HD plugin 2026.10.29.2-0.2.15 frissíti.
 0.2.14-poc (libdvfelplay 2026.10.29.1, S905X4-re dvfel 2026.10.29.1; az S928X-modul, a VLC- és
           app-javítások és a 3D változatlanok) – S905X4-en az első EL-kép után sincs zöld kép a
           FEL-lejátszás elején: a 0.2.13 az első EL-lel párosított képkockánál visszakapcsolta a videót,
@@ -400,7 +410,7 @@ AUDIO BITSTREAM (PASSTHROUGH)
 INSTALLATION
 ------------
 1. Install the APK (USB stick + file manager, the "Downloader" app, or adb install VLC-FEL-*.apk).
-2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.23.3; on
+2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.29.2; on
    the S905X4 2026.10.29.1) into
    the firmware's boot hook directory (<app>/config/boot/dvfel.sh) and loads it, asking for root
    access first if needed. It then loads at every boot.
@@ -423,6 +433,16 @@ NOTES
 
 CHANGES
 -------
+0.2.15-poc (libdvfelplay 2026.10.29.2, dvfel 2026.10.29.2 for the S928X; the S905X4 module, the VLC
+          and app patches and 3D unchanged) – S928X: FEL is no longer lost for a whole playback after a
+          quick change: when a FEL playback followed another within a second or two (a Blu-ray disc
+          handed over from the Dune HD menu player to another player, or a quick restart), the module
+          waited for its queues to empty before it reallocated the former compositor's buffers, while
+          every frame passed through into those queues (the 125 ms lead keeps 1–3 there): they never
+          emptied, and the whole film played without the EL (and without the demo mode). Now only the
+          queued frames of its own buffers count. The demo mode no longer shows for a second at a start
+          when the previous playback ended with it on. On Dune HD r25 the firmware's module is used: the
+          Dune HD plugin 2026.10.29.2-0.2.15 updates it.
 0.2.14-poc (libdvfelplay 2026.10.29.1, dvfel 2026.10.29.1 for the S905X4; the S928X module, the VLC
           and app patches and 3D unchanged) – S905X4: no green picture at the start of a FEL playback,
           also after the first EL picture: 0.2.13 unmuted the video at the first frame paired with its

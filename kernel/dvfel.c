@@ -543,6 +543,30 @@ static bool slots_busy_locked(struct dvfel_dev *d, struct dvfel_slot *own)
 	return false;
 }
 
+/* a frame of our slots, or a job, waits in the pending or the out queue (d->lock held) */
+static bool slots_queued_locked(struct dvfel_dev *d)
+{
+	int i, k;
+
+	for (i = 0; i < d->pend_cnt; i++) {
+		const struct dvfel_pend *p = &d->pendq[(d->pend_head + i) % QUEUE_LEN];
+
+		if (p->job >= 0)
+			return true;
+		for (k = 0; k < d->nslots; k++)
+			if (p->vf == &d->slots[k].out_vf)
+				return true;
+	}
+	for (i = 0; i < d->outq_cnt; i++) {
+		const struct vframe_s *vf = d->outq[(d->outq_head + i) % QUEUE_LEN];
+
+		for (k = 0; k < d->nslots; k++)
+			if (vf == &d->slots[k].out_vf)
+				return true;
+	}
+	return false;
+}
+
 /*
  * A SLOT_BUSY slot stays reserved: its owner (stage A or a job of stage B)
  * still fills it and makes it SLOT_OUT. Freeing it here let stage A take it
@@ -1769,9 +1793,15 @@ static bool ensure_bufs(struct dvfel_dev *d, struct dvfel_slot *own, u32 w, u32 
 		unsigned long flags;
 		bool idle;
 
-		/* stage B may be finishing a job (popped already) into its slot */
+		/*
+		 * stage B may be finishing a job (popped already) into its slot.
+		 * Only queued frames of our buffers count: passthrough frames
+		 * (a former compositor's buffers bound, so every frame passes)
+		 * keep the queues busy for as long as the lead time, and waiting
+		 * for empty queues never ended (FEL lost for the whole playback)
+		 */
 		spin_lock_irqsave(&d->lock, flags);
-		idle = !d->outq_cnt && !d->pend_cnt && !slots_shown_locked(d) &&
+		idle = !slots_queued_locked(d) && !slots_shown_locked(d) &&
 		       !slots_busy_locked(d, own);
 		spin_unlock_irqrestore(&d->lock, flags);
 		if (idle)

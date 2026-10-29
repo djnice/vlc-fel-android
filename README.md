@@ -289,6 +289,15 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.15-poc** (libdvfelplay `2026.10.29.2`, kernel module `dvfel 2026.10.29.2` (S928X); the S905X4 module,
+  the VLC and app patches and 3D MVC unchanged): **S928X: FEL could be lost for a whole playback after a quick
+  compositor change.** When one FEL playback followed another within a second or two (a Blu-ray disc handed over
+  from the Dune HD menu player to another player, or a quick restart), the module waited for its queues to empty
+  before it reallocated the buffers of the former compositor, while every frame passed through into those queues
+  (the 125 ms lead keeps 1–3 there): they never emptied, and the whole film played without the enhancement layer
+  (also no demo mode). Now only the queued frames of its own buffers count. The demo mode also no longer shows
+  for a second at a start when the previous playback ended with it on. On Dune HD r25 the firmware's module is
+  used: update it with the **Dune HD plugin `2026.10.29.2-0.2.15`**.
 - **v0.2.14-poc** (libdvfelplay `2026.10.29.1`, kernel module `dvfel 2026.10.29.1` (S905X4); the S928X module,
   the VLC and app patches and 3D MVC unchanged): **S905X4: no green picture at the start of a FEL playback, also
   after the first EL picture.** 0.2.13 unmuted the video at the first frame paired with its EL, but the EL

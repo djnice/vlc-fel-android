@@ -87,7 +87,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.29.1"
+#define DVFP_VERSION "2026.10.29.2"
 
 namespace
 {
@@ -1215,6 +1215,10 @@ bool dvfp::Start(int width, int height)
     return true;
   }
 
+  // the menu's switch is for one playback: every file starts with the demo
+  // mode as dvfp_set_demo (default: off). Before the GPU thread: it read the
+  // last playback's "1" first, the demo mode showed for a second, then went off
+  unlink(AppFile("dvfp_demo").c_str());
   std::promise<bool> ready;
   std::future<bool> ok = ready.get_future();
   m_gpuThread = std::thread(&dvfp::GpuThread, this, std::move(ready));
@@ -1244,9 +1248,6 @@ bool dvfp::Start(int width, int height)
   }
   m_elThread = std::thread(&dvfp::ElThread, this);
   m_started = true;
-  // the menu's switch is for one playback: every file starts with the demo
-  // mode as dvfp_set_demo (default: off)
-  unlink(AppFile("dvfp_demo").c_str());
   // (unless the GPU thread has written its state already)
   const int sfd = open(AppFile("dvfp_fel").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (sfd >= 0)
