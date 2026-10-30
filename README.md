@@ -289,6 +289,14 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.16-poc** (libdvfelplay `2026.10.30.1`; the kernel modules, the VLC and app patches and 3D MVC unchanged):
+  **no more Dolby Vision stutter for a whole playback.** At some starts every 3rd–4th frame was lost until the end
+  of the playback (about 15 of 24 frames per second); a restart cleared it. Profile 8, MEL and FEL alike. Every
+  picture's display time is snapped to a vsync; the phase of the desired times to the vsync grid is random per
+  start, and when it fell at the border between two vsync slots, the ~1 ms timestamp jitter of the file put frame
+  after frame now in one slot, now in the other, so two frames shared a vsync. Near the border a frame now keeps
+  the previous frame's cadence. The Dune HD player times its Dolby Vision pictures with the same library: on
+  Dune HD r25 install the **Dune HD plugin `2026.10.30.1-0.2.16`**.
 - **v0.2.15-poc** (libdvfelplay `2026.10.29.2`, kernel module `dvfel 2026.10.29.2` (S928X); the S905X4 module,
   the VLC and app patches and 3D MVC unchanged): **S928X: FEL could be lost for a whole playback after a quick
   compositor change.** When one FEL playback followed another within a second or two (a Blu-ray disc handed over

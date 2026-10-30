@@ -192,7 +192,9 @@ DVFP_EXPORT void dvfp_get_stats(const dvfp* h, struct dvfp_stats* stats);
  * CLOCK_MONOTONIC) for a frame meant for desired_ns: the middle between the
  * display's vsyncs before the one nearest to desired_ns, so that jitter never
  * moves two frames into one vsync (a drop) and none into the next (a repeat).
- * Tracks the vsyncs with AChoreographer (started at the first call; returns
+ * A frame meant for about the middle between two vsyncs keeps the cadence of
+ * the previous call (process wide: one playback at a time; a jump of more
+ * than 0.5 s starts anew). Tracks the vsyncs with AChoreographer (started at the first call; returns
  * desired_ns unchanged until the period is known). Optional symbol (newer
  * than the first API version 1 libraries).
  */

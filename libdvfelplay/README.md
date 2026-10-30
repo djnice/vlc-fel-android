@@ -55,7 +55,10 @@ Switches (`adb shell setprop`): `debug.dvfp.test.fel` (0: conversion only), `deb
 `debug.dvfp.test.seek` (seconds jumped every 10 s), `debug.dvfp.test.codec`; library: `debug.dvfp.dither`
 (0/1/2), `debug.dvfp.pattern`, `debug.dvfp.demo`, `debug.dvfp.nogpu`, `debug.dvfp.profile` (1: GPU pass
 times, 2: frame times and the player's release lead, every 5 s), `debug.dvfp.lead_ms` (lead time override, 0:
-off), `debug.dvfp.dump` (frames for `tools/felbench`).
+off), `debug.dvfp.dump` (frames for `tools/felbench`), `debug.dvfp.vsync` (1: render time snapping and the
+video composer's counters every second: `dvfelplay: vsync P ...`; `slots 0:` counts two frames given one vsync),
+`debug.dvfp.snap_chain` (0: the nearest vsync only, as before 2026.10.30.1), `debug.dvfp.snap_phase` (µs: the
+frames moved this far from the middle between two vsyncs, 0 the worst case; read at a playback's start or seek).
 
 `test/au_check.sh dvfptest.apk test.au [seek s]` plays the file to its end and fails on frames shown without
 their RPU, a stalled EL decoder or late frames (e.g. Dune HD's `MP4_P7_FEL_STDL.mp4`, whose access units from

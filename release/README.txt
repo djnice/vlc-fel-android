@@ -166,6 +166,15 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.16-poc (libdvfelplay 2026.10.30.1; a kernelmodulok, a VLC- és app-javítások és a 3D változatlanok)
+          – nincs többé végig akadozó Dolby Vision-lejátszás: egyes indításoknál a lejátszás végéig
+          minden 3–4. képkocka kiesett (24 helyett kb. 15 kocka/s), újraindítás után rendben ment;
+          Profile 8-at, MEL-t és FEL-t egyaránt érintett. Minden kép megjelenítési ideje egy vsync-hez
+          igazodik; az indításonként véletlen fázis ha két vsync határára esett, a fájl ~1 ms-os
+          időbélyeg-ingadozása miatt képkockánként hol az egyik, hol a másik vsync jött ki, és két
+          képkocka jutott egy vsyncre. A határ közelében most az előző képkocka ütemét követi. A Dune HD
+          lejátszója is ezzel a könyvtárral időzít: Dune HD r25-ön a Dune HD plugin 2026.10.30.1-0.2.16
+          frissíti.
 0.2.15-poc (libdvfelplay 2026.10.29.2, S928X-re dvfel 2026.10.29.2; az S905X4-modul, a VLC- és
           app-javítások és a 3D változatlanok) – S928X-en egy gyors váltás után nem veszhet el a FEL az
           egész lejátszásra: ha egy FEL-lejátszás egy-két másodpercen belül követett egy másikat (Blu-ray
@@ -433,6 +442,15 @@ NOTES
 
 CHANGES
 -------
+0.2.16-poc (libdvfelplay 2026.10.30.1; the kernel modules, the VLC and app patches and 3D unchanged)
+          – no more Dolby Vision stutter for a whole playback: at some starts every 3rd–4th frame was
+          lost until the end of the playback (about 15 of 24 frames per second); a restart cleared it.
+          Profile 8, MEL and FEL alike. Every picture's display time is snapped to a vsync; when the
+          phase, random per start, fell at the border between two vsync slots, the ~1 ms timestamp
+          jitter of the file put frame after frame now in one slot, now in the other, and two frames
+          shared a vsync. Near the border a frame now keeps the previous frame's cadence. The Dune HD
+          player times its pictures with the same library: on Dune HD r25 update it with the Dune HD
+          plugin 2026.10.30.1-0.2.16.
 0.2.15-poc (libdvfelplay 2026.10.29.2, dvfel 2026.10.29.2 for the S928X; the S905X4 module, the VLC
           and app patches and 3D unchanged) – S928X: FEL is no longer lost for a whole playback after a
           quick change: when a FEL playback followed another within a second or two (a Blu-ray disc

@@ -87,7 +87,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.29.2"
+#define DVFP_VERSION "2026.10.30.1"
 
 namespace
 {
@@ -135,6 +135,10 @@ constexpr int HW_EL_IMAGE_WAIT_MS = 40;
 constexpr int64_t EL_LOST_US = 1000000;
 // no input buffer and no output for this long: the EL decoder is stuck, it is flushed
 constexpr int EL_STALL_MS = 1500;
+// render time snapping: a frame this close (in vsync periods) to the middle
+// between two vsyncs keeps the cadence of the previous frame (1 ms jitter of
+// the desired times is 0.024 period at 24 Hz, 0.06 at 60 Hz)
+constexpr double SNAP_CHAIN_ZONE = 0.15;
 
 // test switches (adb shell setprop ...), read once a second while composing
 constexpr const char* PROP_DITHER = "debug.dvfp.dither";   // 0 round, 1 dither (default), 2 half
@@ -145,6 +149,9 @@ constexpr const char* PROP_PROFILE = "debug.dvfp.profile"; // 1: GPU pass times 
 constexpr const char* PROP_NICE = "debug.dvfp.nice";       // nice value of the GPU and EL threads (test)
 constexpr const char* PROP_DUMP = "debug.dvfp.dump";       // n: dump n composed frames for tools/felbench
 constexpr const char* PROP_LEAD = "debug.dvfp.lead_ms";    // lead time (test), default: the module's out_lead_ms
+constexpr const char* PROP_VSYNC = "debug.dvfp.vsync";     // 1: render time snapping statistics every second
+constexpr const char* PROP_SNAP_CHAIN = "debug.dvfp.snap_chain"; // 0: the nearest vsync only (test)
+constexpr const char* PROP_SNAP_PHASE = "debug.dvfp.snap_phase"; // us: frames put this far after a slot border (test)
 
 // ---------------------------------------------------------------------------
 // logging
@@ -684,9 +691,75 @@ public:
     }
     if (!last || period <= 0)
       return desired;
+    std::lock_guard<std::mutex> lk(m_snapLock);
+    if (!m_prevD || desired - m_prevD > 500000000 || desired < m_prevD - 500000000)
+    {
+      // a new playback or a seek
+      m_prevV = 0;
+      m_chain = PropInt(PROP_SNAP_CHAIN, 1) != 0;
+      m_phase = PropInt(PROP_SNAP_PHASE, INT_MIN);
+      m_off = m_offPeriod = 0;
+      m_stats = PropInt(PROP_VSYNC, 0) == 1;
+      m_d = {};
+      m_cbN = 0;
+      m_cbDMin = INT64_MAX;
+      m_cbDMax = m_cbLateMax = 0;
+      if (m_stats || m_phase != INT_MIN || !m_chain)
+        LOGI("vsync snapping: chain %d, phase %d us", m_chain, m_phase);
+    }
+    if (m_phase != INT_MIN)
+    {
+      // test: the desired times moved to the given phase, from their mean
+      // phase over 24 frames (again after a display mode change); 0 is the
+      // worst one, the border between two slots
+      if (std::llabs(period - m_offPeriod) > period / 100)
+      {
+        m_offPeriod = period;
+        m_phN = 0;
+        m_phSin = m_phCos = 0;
+      }
+      if (m_phN < 24)
+      {
+        const double a = 2 * M_PI * double(desired - last) / double(period);
+        m_phSin += std::sin(a);
+        m_phCos += std::cos(a);
+        if (++m_phN == 24)
+        {
+          const double mean = std::atan2(m_phSin, m_phCos) / (2 * M_PI); // vsyncs after `last`
+          const double f = 0.5 + m_phase * 1000.0 / double(period) - mean;
+          m_off = int64_t((f - std::floor(f)) * double(period));
+          LOGI("vsync snapping test: desired times moved %.3f ms", m_off / 1e6);
+        }
+      }
+    }
+    desired += m_off;
     // the vsync nearest to the desired time, half a period before it
-    const double k = std::floor(double(desired - last) / double(period) + 0.5);
-    return last + int64_t(k * double(period)) - period / 2;
+    const double x = double(desired - last) / double(period);
+    int64_t k = int64_t(std::floor(x + 0.5));
+    if (m_chain && m_prevV && desired > m_prevD && desired - m_prevD < 4 * period)
+    {
+      // Near the middle between two vsyncs the jitter of the desired times
+      // (1 ms container timestamps, the player's clock) picked one or the
+      // other vsync frame by frame: two frames in one vsync (one of them
+      // dropped) and none in the next, for the whole playback when its
+      // phase to the display stayed there. There the frame's vsync follows
+      // the previous frame's by the desired times' distance.
+      const int64_t n = std::llround(double(desired - m_prevD) / double(period));
+      if (std::fabs(x - std::floor(x) - 0.5) < SNAP_CHAIN_ZONE && n >= 1)
+      {
+        const int64_t lo = int64_t(std::floor(x));
+        const int64_t kc = int64_t(std::floor(double(m_prevV + n * period - last) / double(period) + 0.5));
+        if (kc == lo || kc == lo + 1)
+          k = kc;
+      }
+    }
+    const int64_t vsync = last + k * period;
+    m_prevV = vsync;
+    m_prevD = desired;
+    const int64_t snapped = vsync - period / 2;
+    if (m_stats)
+      Stats(desired, snapped, last, period);
+    return snapped;
   }
 
   int64_t Period() const { return m_period; }
@@ -713,6 +786,97 @@ private:
   std::atomic<int64_t> m_snapN{0}, m_snapLate{0}, m_snapSum{0}, m_snapMin{INT64_MAX};
   int64_t m_deltas[32] = {};
   int m_nDeltas = 0;
+  // the previous release (Snap): its desired time and vsync; the switches
+  // (read at a playback's start or a seek)
+  std::mutex m_snapLock;
+  int64_t m_prevD = 0, m_prevV = 0, m_off = 0, m_offPeriod = 0;
+  int m_phase = INT_MIN, m_phN = 0;
+  double m_phSin = 0, m_phCos = 0;
+  bool m_chain = true, m_stats = false;
+
+  // debug.dvfp.vsync: snapping statistics every second (Choreographer side
+  // written by the tracker thread, release side under m_snapLock)
+  std::atomic<int64_t> m_cbN{0}, m_cbDMin{INT64_MAX}, m_cbDMax{0}, m_cbLateMax{0};
+  struct
+  {
+    int64_t t0 = 0, n = 0, late = 0, aheadMin = INT64_MAX, aheadSum = 0, shiftMin = INT64_MAX, shiftMax = INT64_MIN;
+    int64_t prevSnap = 0, prevDesired = 0, gap[5] = {}, dDesMin = INT64_MAX, dDesMax = INT64_MIN;
+    long long omx = -1, rec = -1, pdrop = -1;
+  } m_d;
+
+  // the video composer: decoded, received and dropped frames
+  static bool ReadComposer(long long& omx, long long& rec, long long& pdrop)
+  {
+    char b[256] = {};
+    const int fd = open("/sys/class/video_composer/drop_cnt", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+      return false;
+    const ssize_t n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    return n > 0 && sscanf(b, "rec_cnt: %lld, omx_index: %lld, valid_cnt: %*lld, player_drop_cnt: %lld", &rec, &omx,
+                           &pdrop) == 3;
+  }
+
+  // one release into the statistics, logged every second
+  void Stats(int64_t desired, int64_t snapped, int64_t last, int64_t period)
+  {
+    const int64_t now = NowNs();
+    auto& d = m_d;
+    d.n++;
+    const int64_t ahead = snapped - now;
+    if (ahead < 0)
+      d.late++;
+    d.aheadMin = std::min(d.aheadMin, ahead);
+    d.aheadSum += ahead;
+    d.shiftMin = std::min(d.shiftMin, snapped - desired);
+    d.shiftMax = std::max(d.shiftMax, snapped - desired);
+    if (d.prevSnap)
+    {
+      // vsync slots from the previous release: 0 = the same vsync (a drop)
+      const int64_t g = snapped - d.prevSnap;
+      d.gap[g < 0 ? 4 : std::min<int64_t>((g + period / 2) / period, 3)]++;
+      const int64_t dd = desired - d.prevDesired;
+      d.dDesMin = std::min(d.dDesMin, dd);
+      d.dDesMax = std::max(d.dDesMax, dd);
+    }
+    d.prevSnap = snapped;
+    d.prevDesired = desired;
+    if (!d.t0)
+    {
+      d.t0 = now;
+      ReadComposer(d.omx, d.rec, d.pdrop);
+      return;
+    }
+    if (now - d.t0 < 1000000000)
+      return;
+    long long omx = -1, rec = -1, pdrop = -1;
+    ReadComposer(omx, rec, pdrop);
+    const double s = (now - d.t0) / 1e9;
+    const int64_t cbN = m_cbN.exchange(0), cbMin = m_cbDMin.exchange(INT64_MAX), cbMax = m_cbDMax.exchange(0),
+                  cbLate = m_cbLateMax.exchange(0);
+    // period, phase of the last vsync, its age; Choreographer callbacks and
+    // their intervals; releases, late ones, ms ahead of now, snapped - desired,
+    // vsyncs from the previous release (0: two frames in one vsync), desired
+    // time intervals; the composer's counters per second (norender: decoded
+    // but not released for rendering)
+    LOGI("vsync P %.3f phase %.3f age %.1f | cb %.1f/s d %.2f..%.2f late<=%.2f | rel %.1f/s late %lld ahead "
+         "min %.1f avg %.1f shift %.1f..%.1f slots 0:%lld 1:%lld 2:%lld 3+:%lld back:%lld dDes %.2f..%.2f | dec "
+         "%.1f/s norender %.1f/s comp %.1f/s pdrop %.1f/s",
+         period / 1e6, double(last % period) / 1e6, (now - last) / 1e6, cbN / s, cbN ? cbMin / 1e6 : 0.0,
+         cbMax / 1e6, cbLate / 1e6, d.n / s, (long long)d.late, d.aheadMin / 1e6, d.aheadSum / 1e6 / d.n,
+         d.shiftMin / 1e6, d.shiftMax / 1e6, (long long)d.gap[0], (long long)d.gap[1], (long long)d.gap[2],
+         (long long)d.gap[3], (long long)d.gap[4], d.dDesMin == INT64_MAX ? 0.0 : d.dDesMin / 1e6,
+         d.dDesMax == INT64_MIN ? 0.0 : d.dDesMax / 1e6, (omx - d.omx) / s, (omx - d.omx - d.n) / s,
+         (rec - d.rec) / s, (pdrop - d.pdrop) / s);
+    const int64_t ps = d.prevSnap, pd = d.prevDesired;
+    d = {};
+    d.prevSnap = ps;
+    d.prevDesired = pd;
+    d.t0 = now;
+    d.omx = omx;
+    d.rec = rec;
+    d.pdrop = pdrop;
+  }
 
   VsyncTracker() { std::thread(&VsyncTracker::Run, this).detach(); }
 
@@ -740,6 +904,21 @@ private:
   {
     auto* t = static_cast<VsyncTracker*>(data);
     const int64_t last = t->m_last;
+    {
+      // statistics (debug.dvfp.vsync): the callbacks and their intervals
+      t->m_cbN++;
+      const int64_t late = NowNs() - frameTimeNanos;
+      if (late > t->m_cbLateMax)
+        t->m_cbLateMax = late;
+      if (last)
+      {
+        const int64_t d = frameTimeNanos - last;
+        if (d < t->m_cbDMin)
+          t->m_cbDMin = d;
+        if (d > t->m_cbDMax)
+          t->m_cbDMax = d;
+      }
+    }
     if (last)
     {
       // the period: median of the recent intervals (a skipped vsync is an
