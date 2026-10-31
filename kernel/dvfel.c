@@ -116,7 +116,7 @@ static int lin_endian;
 module_param(lin_endian, int, 0644);
 MODULE_PARM_DESC(test422, "debug: static 12-bit 4:2:2 linear test frame in mode 1 (1: Y high, 2: Y low)");
 
-static int el_wait_ms = 20;
+static int el_wait_ms = 45;
 module_param(el_wait_ms, int, 0644);
 MODULE_PARM_DESC(el_wait_ms, "max wait for the hardware decoded EL picture of a frame");
 
@@ -913,8 +913,8 @@ static bool outq_visible_locked(struct dvfel_dev *d, int i)
 	if (!d->outq_hold[i] || p <= 0)
 		return true;
 	now = ktime_get();
-	if (ktime_to_ns(ktime_sub(now, d->vs_ts)) > 200 * NSEC_PER_MSEC)
-		return true;	/* no vsync interrupts: do not stall */
+	if (ktime_to_ns(ktime_sub(now, d->vs_ts)) > 800 * NSEC_PER_MSEC)
+		return true;	/* no vsync interrupts (AFR mode switch): do not stall */
 	ahead = (s32)(d->outq_due[i] - d->vs_seq);
 	if (ahead > 2 + (s32)d->lead_vs)
 		return true;	/* cannot be right */

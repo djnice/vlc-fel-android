@@ -97,7 +97,7 @@ constexpr const char* MIN_MODULE = "2026.10.06.2";
 // 4: with the lead time (DVFEL_IOC_SET_LEAD) more frames are in the chain
 constexpr int GPU_BUFFERS = 4;
 constexpr int EL_TAPS = 6;             // Lanczos-3, see felgpu.h
-constexpr int EL_WAIT_MS = 80;         // wait for the EL frame of a job (the kernel waits 150)
+constexpr int EL_WAIT_MS = 80;         // wait for the EL frame of a job (kernel el_wait_ms default: 45)
 // packets are fed well ahead of display; EL decoding is paced to stay at most
 // EL_LEAD_US ahead of the frame the kernel asked for last
 constexpr int64_t EL_LEAD_US = 350000;
