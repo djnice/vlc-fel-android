@@ -70,7 +70,7 @@ S905X4 (DUNE HD)
 ----------------
 - Az S905X4 Dolby Vision magja maga is fogad EL-t; az Android-lejátszók MediaCodec-dekódere viszont
   csak az alapréteget adja ki. A VLC FEL az EL-t egy második dekóderrel dekódolja, és a dvfel
-  kernelmodul S905X4-es változata (2026.10.29.1) képenként átadja a Dolby Vision meghajtónak, a hozzá
+  kernelmodul S905X4-es változata (2026.10.31.1) képenként átadja a Dolby Vision meghajtónak, a hozzá
   tartozó alapréteg-képpel párosítva. GPU-munka nincs, az RPU marad profile 7.
 - A Dune S905X4-es firmware-ének (R24 és r25) Dolby Vision meghajtójából (aml_media.ko) hiányzik négy
   FEL-javítás: a meghajtó minden képkockánál eldobja az EL-párosítást (az EL-dekóder kifogy a
@@ -143,7 +143,7 @@ TELEPÍTÉS
 ---------
 1. Az APK telepítése (pendrive + fájlkezelő, „Downloader” app, vagy: adb install VLC-FEL-*.apk).
 2. Az első FEL-fájl lejátszásakor a VLC FEL telepíti a kernelmodult (dvfel.ko, 2026.10.29.2;
-   S905X4-en 2026.10.29.1) a
+   S905X4-en 2026.10.31.1) a
    firmware boot-könyvtárába (<app>/config/boot/dvfel.sh), és be is tölti; ha kell, előtte
    rákérdez a root-hozzáférésre. Ezután minden bekapcsoláskor magától betöltődik.
    Régebbi modulra a telepítő sosem cserél.
@@ -166,6 +166,14 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.17-poc (libdvfelplay 2026.10.31.1, S905X4-re dvfel 2026.10.31.1; az S928X-modul, a VLC- és
+          app-javítások és a 3D változatlanok) – S905X4-en nincs zöld vagy hibás kép a FEL-lejátszás
+          elején. A lejátszás eleje feketén marad, amíg az EL egyenletesen nem jön, de a videómeghajtó
+          csak egy vsync-kel a kérés után némít. Így az első EL nélküli kép, amelynél a némítás
+          kezdődött, egy-két vsyncre megjelent, zölden vagy más hibás színekkel. Nem látszott, ha a TV a
+          lejátszás elején módot váltott, pl. képfrissítés-igazításnál. A némítás most az első
+          alapréteg-csomagnál kezdődik, mielőtt bármely kép dekódolódna, és legfeljebb 10 s múlva akkor
+          is véget ér, ha egy kép sem jut el a Dolby Vision meghajtóig.
 0.2.16-poc (libdvfelplay 2026.10.30.1; a kernelmodulok, a VLC- és app-javítások és a 3D változatlanok)
           – nincs többé végig akadozó Dolby Vision-lejátszás: egyes indításoknál a lejátszás végéig
           minden 3–4. képkocka kiesett (24 helyett kb. 15 kocka/s), újraindítás után rendben ment;
@@ -348,7 +356,7 @@ S905X4 (DUNE HD)
 ----------------
 - The S905X4's Dolby Vision core takes an EL itself, but the MediaCodec decoder of Android players
   outputs the base layer only. VLC FEL decodes the EL with a second decoder, and the S905X4 build of
-  the dvfel kernel module (2026.10.29.1) hands each EL picture to the Dolby Vision driver, paired with
+  the dvfel kernel module (2026.10.31.1) hands each EL picture to the Dolby Vision driver, paired with
   its base layer picture. No GPU work, the RPU stays profile 7.
 - The Dolby Vision driver (aml_media.ko) of the Dune S905X4 firmware (R24 and r25) lacks four FEL
   fixes: the driver drops its BL/EL pairing on every frame (the EL decoder runs out of buffers), two
@@ -420,7 +428,7 @@ INSTALLATION
 ------------
 1. Install the APK (USB stick + file manager, the "Downloader" app, or adb install VLC-FEL-*.apk).
 2. When it plays the first FEL file, VLC FEL installs the kernel module (dvfel.ko, 2026.10.29.2; on
-   the S905X4 2026.10.29.1) into
+   the S905X4 2026.10.31.1) into
    the firmware's boot hook directory (<app>/config/boot/dvfel.sh) and loads it, asking for root
    access first if needed. It then loads at every boot.
    The installer never replaces a newer module with an older one.
@@ -442,6 +450,14 @@ NOTES
 
 CHANGES
 -------
+0.2.17-poc (libdvfelplay 2026.10.31.1, dvfel 2026.10.31.1 for the S905X4; the S928X module, the VLC
+          and app patches and 3D unchanged) – S905X4: no green or wrong picture at the start of a FEL
+          playback. The start stays black until the EL comes steadily, but the video driver mutes only
+          a vsync after it is asked to. So the first picture without its EL, where the mute began, was
+          on the screen for a vsync or two, green or in other wrong colours. It was not seen when the
+          TV changed mode at the start, e.g. with frame rate matching. The mute now begins at the first
+          base layer access unit, before any picture is decoded, and ends at most 10 s later even when
+          no picture reaches the Dolby Vision driver.
 0.2.16-poc (libdvfelplay 2026.10.30.1; the kernel modules, the VLC and app patches and 3D unchanged)
           – no more Dolby Vision stutter for a whole playback: at some starts every 3rd–4th frame was
           lost until the end of the playback (about 15 of 24 frames per second); a restart cleared it.

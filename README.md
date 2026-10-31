@@ -71,7 +71,7 @@ dvfel (SC2): kprobes on the driver's is_dovi_dual_layer_frame() / dolby_vision_p
   A driver that already has the fixes, or an unknown build, has no match: that fix stays off (the kernel log
   lists the ones applied, `dvfel: fix … at …`, and `/sys/kernel/debug/dvfel/stats` counts them). The proper
   place for these fixes is the firmware's driver.
-- The `dvfel` SC2 module (`2026.10.29.1`) is bundled next to the S928X one; the installer picks it by the SoC
+- The `dvfel` SC2 module (`2026.10.31.1`) is bundled next to the S928X one; the installer picks it by the SoC
   (`ro.board.platform` `sc2`) and installs it the same way (R24, r25: `binit.sh` runs `config/boot`).
 - Tested on a Dune HD Pro Vision 4K with the stock firmware `261021_0117_r25`, on the TV: playback of mp4, mkv
   and m2ts (all frames paired with their EL once the first EL key picture is in), pause, seeks, the update of an
@@ -289,6 +289,13 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.17-poc** (libdvfelplay `2026.10.31.1`, kernel module `dvfel 2026.10.31.1` (S905X4); the S928X module,
+  the VLC and app patches and 3D MVC unchanged): **S905X4: no green or wrong picture at the start of a FEL
+  playback.** The start of a FEL playback stays black until the EL comes steadily, but the video driver applies a
+  mute one vsync after it is asked for. So the first picture without its EL, where the mute began, was on the screen
+  for a vsync or two: green, or other wrong colours. It was hidden when the TV changed mode at the start, e.g. with
+  frame rate matching. The mute now begins at the first base layer access unit, before any picture is decoded, and
+  ends at most 10 s later even when no picture reaches the Dolby Vision driver.
 - **v0.2.16-poc** (libdvfelplay `2026.10.30.1`; the kernel modules, the VLC and app patches and 3D MVC unchanged):
   **no more Dolby Vision stutter for a whole playback.** At some starts every 3rd–4th frame was lost until the end
   of the playback (about 15 of 24 frames per second); a restart cleared it. Profile 8, MEL and FEL alike. Every

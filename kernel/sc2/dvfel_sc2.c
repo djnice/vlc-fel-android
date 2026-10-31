@@ -22,8 +22,8 @@
  *     (it asks a "dvbldec" provider, which frame mode does not have); the
  *     driver then peeks/gets the head of the dveldec queue, that picture;
  *   - Dolby Vision FEL is switched on in the driver (debug "enable_fel 1");
- *   - the video is muted (black) at the start of a session until its EL
- *     comes steadily (see start_mute()).
+ *   - the video is muted (black) at the start of a session, from before its
+ *     first frame until its EL comes steadily (see start_mute()).
  *
  * The decoder keeps an EL picture's buffer until the display is done with it:
  * each queued picture gets a release fence (sync file) that the player gives
@@ -87,6 +87,11 @@ static int debug;
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "1: session events, 2: every EL picture");
 
+static int early_mute = 2;
+module_param(early_mute, int, 0644);
+MODULE_PARM_DESC(early_mute, "start mute from 0: the first frame without EL, 1: the session start, "
+		 "2: the first base layer access unit (default)");
+
 #define dbg(lvl, fmt, ...) \
 	do { if (debug >= (lvl)) pr_info(DRV_NAME ": " fmt, ##__VA_ARGS__); } while (0)
 
@@ -140,10 +145,12 @@ static struct dvfel_sc2 {
 	/* the start of a session (start_mute()) */
 	bool start_done;		/* the EL came steadily (or the time is up) */
 	bool muted;			/* video muted */
+	bool first_frame;		/* the session's first frame came */
 	u32 paired_run;			/* frames in a row with their EL */
-	unsigned long start_jiffies;	/* the session's first frame, 0: none yet */
+	unsigned long start_jiffies;	/* the start began (muted early, or the first frame), 0: not yet */
 	unsigned long mute_jiffies;
 	u64 start_muted;		/* times muted at a start */
+	struct delayed_work start_work;	/* the end of the start without frames */
 
 	/* stats */
 	u64 el_in, el_out, el_put, el_dropped, el_flushed, bl_paired, bl_no_el, bl_no_crc, bl_no_hint;
@@ -190,28 +197,83 @@ static inline struct vframe_src_fmt_s *sc2_src_fmt(struct vframe_s *vf)
  * frame without EL mutes it again until START_DONE frames in a row had
  * theirs, all of it for at most START_MUTE_MS (no EL comes). The stream mode
  * dual layer decoder (CoreELEC) has no such frames.
+ *
+ * The driver applies the mute a vsync after it is asked for (its
+ * check_video_mute() runs after the frame's Dolby Vision settings, then the
+ * core 3 black comes with the next settings): muted at the first frame
+ * without EL, that frame is on the screen for a vsync or two. So the mute
+ * starts before the first frame (early_mute): at the first base layer access
+ * unit the player reports (default; the decoder has it then, the display not
+ * yet), or at the session start. It ends as above, or START_MUTE_MS after it
+ * began also when no frame reaches the Dolby Vision driver (start_work). Only
+ * the start of a session: a seek is not muted.
  */
 #define START_STEADY	6
 #define START_DONE	48
 #define START_MUTE_MS	10000
 
-/* aml_media (video_sink/video.h) */
+/* aml_media (video_sink/video.h): sets a flag the vsync reads, callable in any context */
 void set_video_mute(bool on);
+
+/* (g.lock held) the start ends START_MUTE_MS after it began, frames or not */
+static void start_timeout_arm(void)
+{
+	unsigned long end = g.start_jiffies + msecs_to_jiffies(START_MUTE_MS);
+
+	schedule_delayed_work(&g.start_work, time_after(end, jiffies) ? end - jiffies : 0);
+}
+
+/* (g.lock held) */
+static void start_unmute_timeout(void)
+{
+	g.start_done = true;
+	if (g.muted) {
+		set_video_mute(false);
+		g.muted = false;
+		pr_info(DRV_NAME ": session %u: no steady EL for %d ms: unmuted\n", g.sess, START_MUTE_MS);
+	}
+}
+
+/* (g.lock held) the session's video muted before its first frame */
+static void start_mute_early(const char *at)
+{
+	if (g.start_done || g.muted || g.first_frame)
+		return;
+	set_video_mute(true);
+	g.muted = true;
+	g.mute_jiffies = jiffies;
+	g.start_jiffies = jiffies ? jiffies : 1;
+	g.start_muted++;
+	start_timeout_arm();
+	pr_info(DRV_NAME ": session %u: muted at the %s\n", g.sess, at);
+}
+
+static void start_work_fn(struct work_struct *work)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&g.lock, flags);
+	if (READ_ONCE(g.active) && !g.start_done && g.start_jiffies &&
+	    !time_before(jiffies, g.start_jiffies + msecs_to_jiffies(START_MUTE_MS)))
+		start_unmute_timeout();
+	spin_unlock_irqrestore(&g.lock, flags);
+}
 
 /* (g.lock held) a new base layer frame of the session: with its EL or not */
 static void start_mute(bool found)
 {
 	if (!READ_ONCE(g.active) || g.start_done)
 		return;
+	if (!g.first_frame) {
+		g.first_frame = true;
+		if (g.muted)
+			pr_info(DRV_NAME ": session %u: first frame %u ms after the mute, %s EL\n", g.sess,
+				jiffies_to_msecs(jiffies - g.mute_jiffies), found ? "with" : "without");
+	}
 	if (!g.start_jiffies)
 		g.start_jiffies = jiffies ? jiffies : 1;
 	if (time_after(jiffies, g.start_jiffies + msecs_to_jiffies(START_MUTE_MS))) {
-		g.start_done = true;
-		if (g.muted) {
-			set_video_mute(false);
-			g.muted = false;
-			pr_info(DRV_NAME ": no steady EL for %d ms: unmuted\n", START_MUTE_MS);
-		}
+		start_unmute_timeout();
 		return;
 	}
 	if (found) {
@@ -219,7 +281,8 @@ static void start_mute(bool found)
 		if (g.muted && g.paired_run >= START_STEADY) {
 			set_video_mute(false);
 			g.muted = false;
-			dbg(1, "EL steady: unmuted after %u ms\n", jiffies_to_msecs(jiffies - g.mute_jiffies));
+			pr_info(DRV_NAME ": session %u: EL steady: unmuted after %u ms\n", g.sess,
+				jiffies_to_msecs(jiffies - g.mute_jiffies));
 		}
 		if (g.paired_run >= START_DONE)
 			g.start_done = true;
@@ -231,6 +294,7 @@ static void start_mute(bool found)
 		g.muted = true;
 		g.mute_jiffies = jiffies;
 		g.start_muted++;
+		start_timeout_arm();
 	}
 }
 
@@ -888,6 +952,9 @@ static long ioc_bl_hint(struct file *f, void __user *arg)
 	if (g.owner != f)
 		return -EINVAL;
 	spin_lock_irqsave(&g.lock, flags);
+	/* the first access unit of the session: in the decoder now, not yet displayed */
+	if (early_mute == 2 && g.hints_in == g.at_start.hints_in)
+		start_mute_early("first base layer access unit");
 	g.hints_in++;
 	if (g.nh == MAX_HINTS) {
 		/* frames that never reached the display: the oldest goes */
@@ -1029,8 +1096,11 @@ static long sess_start(struct file *f)
 	g.vf_logged = g.change_logged = false;
 	g.mark_id = 0;
 	g.start_done = false;
+	g.first_frame = false;
 	g.paired_run = 0;
 	g.start_jiffies = 0;
+	if (early_mute == 1)
+		start_mute_early("session start");
 	spin_unlock_irqrestore(&g.lock, flags);
 	WRITE_ONCE(g.active, true);
 	/* pictures an earlier session left with the driver go back now */
@@ -1055,6 +1125,7 @@ static void sess_stop(struct file *f)
 	spin_lock_irqsave(&g.lock, flags);
 	unmute_locked();
 	spin_unlock_irqrestore(&g.lock, flags);
+	cancel_delayed_work(&g.start_work);
 	flush_queue(DVFEL_SC2_FLUSH_EL | DVFEL_SC2_FLUSH_HINTS);
 	signal_out_fences();
 	if (g.prov_reg) {
@@ -1273,8 +1344,8 @@ static int stats_show(struct seq_file *m, void *v)
 		   g.el_in, g.el_out, g.el_put, g.el_dropped, g.el_flushed, g.nq, out);
 	seq_printf(m, "bl paired %llu no_el %llu no_hint %llu no_crc %llu\n", g.bl_paired, g.bl_no_el,
 		   g.bl_no_hint, g.bl_no_crc);
-	seq_printf(m, "hints in %llu pending %d skipped %llu overflow %llu start_muted %llu muted %d\n",
-		   g.hints_in, g.nh, g.hints_skipped, g.hints_overflow, g.start_muted, g.muted);
+	seq_printf(m, "hints in %llu pending %d skipped %llu overflow %llu start_muted %llu muted %d early_mute %d\n",
+		   g.hints_in, g.nh, g.hints_skipped, g.hints_overflow, g.start_muted, g.muted, early_mute);
 	seq_printf(m, "session %u vf_changed %llu get_other %llu disp_long %llu orphans %llu max_ms queued %u on_display %u\n",
 		   g.sess, g.el_vf_changed, g.el_get_other, g.el_disp_long, g.el_orphans, g.q_max_ms,
 		   g.disp_max_ms);
@@ -1303,6 +1374,7 @@ static int __init dvfel_init(void)
 	init_waitqueue_head(&g.done_wq);
 	INIT_WORK(&g.rel_work, rel_work_fn);
 	INIT_DELAYED_WORK(&g.orphan_work, orphan_work_fn);
+	INIT_DELAYED_WORK(&g.start_work, start_work_fn);
 
 	krp_dual.kp.symbol_name = "is_dovi_dual_layer_frame";
 	krp_dual.entry_handler = dual_entry;
@@ -1357,11 +1429,12 @@ static void __exit dvfel_exit(void)
 	fixes_unregister();
 	unregister_kprobe(&kp_parse);
 	unregister_kretprobe(&krp_dual);
+	WRITE_ONCE(g.active, false);
+	cancel_delayed_work_sync(&g.start_work);
 	spin_lock_irqsave(&g.lock, flags);
 	unmute_locked();
 	spin_unlock_irqrestore(&g.lock, flags);
 	mutex_lock(&g.sess_lock);
-	WRITE_ONCE(g.active, false);
 	flush_queue(DVFEL_SC2_FLUSH_EL | DVFEL_SC2_FLUSH_HINTS);
 	if (g.prov_reg) {
 		vf_unreg_provider(&g.prov);
