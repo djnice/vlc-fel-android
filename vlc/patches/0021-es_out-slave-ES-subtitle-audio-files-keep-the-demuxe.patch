@@ -1,0 +1,124 @@
+From 7656a4cc04bb53d41605b9f20f3e477a82a1d533 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sat, 31 Oct 2026 15:47:11 +0100
+Subject: [PATCH] es_out: slave ES (subtitle, audio files) keep the demuxer's
+ program
+
+A slave input's ES has no group (0). EsOutAddSlave looked up program 0 for
+it, and EsOutProgramAdd selected any new program 0 while --program is not
+set (i_group_id 0). An .srt or audio file added during the playback of a
+TS or Blu-ray source therefore made a program 0, which took the selection:
+the disc's video and audio decoders were closed, the picture went black and
+the position ran ahead.
+
+An ES without a group now goes to the selected program. And without
+--program a new program 0 is selected only if there is none yet. A slave
+added before the start can still come before the demuxer's first program
+(TS: its ES come with the PMT); the program 0 made for it gets no PCR, so
+when the demuxer's first program comes, it takes the selection and the
+slave ES (their decoders made again on its clock), and program 0 is
+deleted.
+
+Reported in djnice/vlc-fel-android#3.
+
+Message-Id: <20261031-dvfel-es-out-slave-program@djnice>
+---
+ src/input/es_out.c | 59 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index d64ce58ec2..595f23ef56 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -199,6 +199,7 @@ static void EsDeleteInfo( es_out_t *, es_out_id_t *es );
+ static void EsUnselect( es_out_t *out, es_out_id_t *es, bool b_update );
+ static void EsOutDecoderChangeDelay( es_out_t *out, es_out_id_t *p_es );
+ static void EsOutDecodersChangePause( es_out_t *out, bool b_paused, vlc_tick_t i_date );
++static int EsOutProgramDel( es_out_t *out, int i_group );
+ static void EsOutChangePosition( es_out_t *out );
+ static void EsOutProgramChangePause( es_out_t *out, bool b_paused, vlc_tick_t i_date );
+ static void EsOutProgramsChangeRate( es_out_t *out );
+@@ -1102,9 +1103,55 @@ static es_out_pgrm_t *EsOutProgramAdd( es_out_t *out, int i_group )
+     if( EsOutIsProgramVisible( out, i_group ) )
+         input_SendEventProgramAdd( p_input, i_group, NULL );
+ 
+-    if( i_group == p_sys->i_group_id || ( !p_sys->p_pgrm && p_sys->i_group_id == 0 ) )
++    /* Without --program, a program 0 never selects itself over another one:
++     * slave inputs (subtitle and audio files) have their ES in group 0 and
++     * would take the selection from the demuxer's program (TS, Blu-ray). The
++     * program 0 made for slave ES before the demuxer's first program (no PCR
++     * comes for it) gives the selection to that program, with its ES. */
++    es_out_pgrm_t *p_slaves = NULL;
++    if( p_sys->i_group_id == 0 && i_group != 0 && p_sys->p_pgrm &&
++        p_sys->p_pgrm->i_id == 0 && p_sys->p_pgrm->i_last_pcr == VLC_TICK_INVALID )
++        p_slaves = p_sys->p_pgrm;
++
++    if( p_sys->i_group_id != 0 ? i_group == p_sys->i_group_id
++                               : ( !p_sys->p_pgrm || p_slaves ) )
++    {
++        es_out_id_t **pp_resel = NULL;
++        int i_resel = 0;
++
++        if( p_slaves )
++        {
++            pp_resel = vlc_alloc( p_sys->i_es, sizeof( *pp_resel ) );
++            for( int i = 0; i < p_sys->i_es; i++ )
++            {
++                es_out_id_t *es = p_sys->es[i];
++                if( es->p_pgrm != p_slaves )
++                    continue;
++                /* its decoder runs on the program's clock: a new one */
++                if( EsIsSelected( es ) )
++                {
++                    EsUnselect( out, es, true );
++                    if( pp_resel )
++                        pp_resel[i_resel++] = es;
++                }
++                es->p_pgrm = p_pgrm;
++                es->fmt.i_group = i_group;
++                p_slaves->i_es--;
++                p_pgrm->i_es++;
++            }
++            msg_Dbg( p_input, "program %d takes the slave ES of program 0", i_group );
++        }
++
+         EsOutProgramSelect( out, p_pgrm );
+ 
++        for( int i = 0; i < i_resel; i++ )
++            if( !EsIsSelected( pp_resel[i] ) )
++                EsOutSelect( out, pp_resel[i], true );
++        free( pp_resel );
++        if( p_slaves )
++            EsOutProgramDel( out, 0 );
++    }
++
+     return p_pgrm;
+ }
+ 
+@@ -1541,8 +1588,13 @@ static es_out_id_t *EsOutAddSlave( es_out_t *out, const es_format_t *fmt, es_out
+ 
+     vlc_mutex_lock( &p_sys->lock );
+ 
+-    /* Search the program */
+-    p_pgrm = EsOutProgramFind( out, fmt->i_group );
++    /* Search the program: an ES without a group (a slave input's: subtitle
++     * or audio file) goes to the selected program, so that a program 0 of
++     * its own does not take the selection from the demuxer's (TS, Blu-ray) */
++    if( fmt->i_group == 0 && p_sys->p_pgrm )
++        p_pgrm = p_sys->p_pgrm;
++    else
++        p_pgrm = EsOutProgramFind( out, fmt->i_group );
+     if( !p_pgrm )
+     {
+         vlc_mutex_unlock( &p_sys->lock );
+@@ -1556,6 +1608,7 @@ static es_out_id_t *EsOutAddSlave( es_out_t *out, const es_format_t *fmt, es_out
+     /* Set up ES */
+     es->p_pgrm = p_pgrm;
+     es_format_Copy( &es->fmt, fmt );
++    es->fmt.i_group = p_pgrm->i_id;
+     if( es->fmt.i_id < 0 )
+         es->fmt.i_id = p_sys->i_id;
+     if( !es->fmt.i_original_fourcc )
+-- 
+2.55.0.windows.3
+

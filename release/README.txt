@@ -166,6 +166,14 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.18-poc (0021-es és 0022-es VLC-javítás; a libdvfelplay, a kernelmodulok, az app-javítások és a
+          3D változatlanok) – külső felirat TS-en és Blu-ray-en. A TS-fájlhoz vagy Blu-ray-mappához
+          indításkor vagy lejátszás közben adott .srt (vagy külső hangfájl) saját 0-s programot kapott,
+          amely elvette a kiválasztást a lemez programjától: a kép elfeketedett, a pozíció elszaladt.
+          Most a lemez programjához csatlakozik (0021), az időbélyegei pedig a program sajátjaihoz
+          igazodnak (0022): eddig a felirat nem jelent meg, ahol a stream időbélyegei nem 0 körül
+          kezdődnek (egy Blu-ray-klip 4200 s-tól), más TS-eknél pedig korán jött. Az MKV, MP4 és a többi
+          egyprogramos fájl nem változik.
 0.2.17-poc (libdvfelplay 2026.10.31.1, S905X4-re dvfel 2026.10.31.1; az S928X-modul, a VLC- és
           app-javítások és a 3D változatlanok) – S905X4-en nincs zöld vagy hibás kép a FEL-lejátszás
           elején. A lejátszás eleje feketén marad, amíg az EL egyenletesen nem jön, de a videómeghajtó
@@ -450,6 +458,14 @@ NOTES
 
 CHANGES
 -------
+0.2.18-poc (VLC patches 0021 and 0022; libdvfelplay, the kernel modules, the app patches and 3D
+          unchanged) – external subtitles on TS and Blu-ray. An .srt (or an external audio file) added to
+          a TS file or a Blu-ray folder, at the start or during playback, got a program 0 of its own that
+          took the selection from the disc's program: the picture went black and the position ran
+          ahead. It now joins the disc's program (0021), and its timestamps are put on the program's own
+          (0022): before, the subtitles never showed where the stream's timestamps do not start near 0
+          (a Blu-ray clip from 4200 s), and came early on other TS files. MKV, MP4 and the other
+          single-program files are not changed.
 0.2.17-poc (libdvfelplay 2026.10.31.1, dvfel 2026.10.31.1 for the S905X4; the S928X module, the VLC
           and app patches and 3D unchanged) – S905X4: no green or wrong picture at the start of a FEL
           playback. The start stays black until the EL comes steadily, but the video driver mutes only

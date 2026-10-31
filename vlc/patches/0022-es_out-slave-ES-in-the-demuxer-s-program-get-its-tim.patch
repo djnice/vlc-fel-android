@@ -1,0 +1,247 @@
+From a020cc844c7d345b7f6f5b345605ec435fae4e2e Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sat, 31 Oct 2026 16:01:50 +0100
+Subject: [PATCH] es_out: slave ES in the demuxer's program get its timestamps
+
+A subtitle file's demuxer stamps its blocks VLC_TICK_0 + their time, in
+the master demuxer's time (counted from 0), while TS and Blu-ray ES carry
+the stream's own timestamps: a Blu-ray clip from 4200 s, broadcast TS from
+anywhere. On such sources an .srt was never shown (its pictures were far
+too late).
+
+Slave ES in a program other than 0 (attached to the demuxer's program, see
+the previous patch) are moved by an offset: the first timestamp of the
+program's main video ES (audio without video) after the start is time 0,
+as in an MKV or MP4. The master's time (ES_OUT_SET_SLAVE_TIME, given by
+SlaveDemux, and by the main loop while there is no slave, so that a slave
+added later finds the offset of the start) is coarse: a Blu-ray's moves by
+GOPs, a TS's is its PCR's, ahead of the pictures. So it only checks the
+offset after a seek: kept within 2 s (a TS, the same clip of a Blu-ray),
+taken from it otherwise (another clip). A jump of that ES's dts without a
+seek (the next clip of a Blu-ray) moves the offset by the jump less a
+frame. Until the offset is known the slaves are not demuxed. Sources with
+one program 0 (MKV, MP4, AVI...) are not changed.
+
+Reported in djnice/vlc-fel-android#3.
+
+Message-Id: <20261031-dvfel-es-out-slave-timestamps@djnice>
+---
+ src/input/es_out.c | 106 +++++++++++++++++++++++++++++++++++++++++++++
+ src/input/es_out.h |   4 ++
+ src/input/input.c  |  12 +++++
+ 3 files changed, 122 insertions(+)
+
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index 595f23ef56..3111d014e9 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -81,6 +81,9 @@ struct es_out_id_t
+     /* ES ID */
+     int       i_id;
+     es_out_pgrm_t *p_pgrm;
++    /* a slave input's ES in the demuxer's program: its timestamps count
++     * from 0, they get the program's (i_slave_offset) */
++    bool      b_slave_ts;
+ 
+     /* */
+     bool b_scrambled;
+@@ -150,6 +153,17 @@ struct es_out_sys_t
+ 
+     /* es/group to select */
+     int         i_group_id;
++    /* What the timestamps of slave ES are moved by: the selected program's
++     * timestamps minus the master demuxer's time (ES_OUT_SET_SLAVE_TIME).
++     * Anchored on the first timestamp of the program's main video (or
++     * audio) ES after a start or a seek, then kept: a jump of that ES's
++     * dts without a seek (the next clip of a Blu-ray) moves it by the jump */
++    vlc_tick_t  i_slave_offset;
++    bool        b_slave_offset;     /* i_slave_offset known */
++    bool        b_slave_anchored;   /* checked since the last start or seek */
++    vlc_tick_t  i_slave_pending;    /* first anchor ES timestamp to check */
++    vlc_tick_t  i_slave_last_dts;   /* the anchor ES's last dts */
++    vlc_tick_t  i_slave_dur;        /* and its frame duration */
+ 
+     /* delay */
+     int64_t i_audio_delay;
+@@ -653,6 +667,11 @@ static void EsOutChangePosition( es_out_t *out )
+     p_sys->i_buffering_extra_system = 0;
+     p_sys->i_preroll_end = -1;
+     p_sys->i_prev_stream_level = -1;
++
++    /* the slave offset is checked again at the new position */
++    p_sys->b_slave_anchored = false;
++    p_sys->i_slave_pending = VLC_TICK_INVALID;
++    p_sys->i_slave_last_dts = VLC_TICK_INVALID;
+ }
+ 
+ 
+@@ -1023,6 +1042,13 @@ static void EsOutProgramSelect( es_out_t *out, es_out_pgrm_t *p_pgrm )
+     /* Mark it selected */
+     p_pgrm->b_selected = true;
+ 
++    /* its timestamps: the slave offset is anchored again */
++    p_sys->b_slave_offset = false;
++    p_sys->b_slave_anchored = false;
++    p_sys->i_slave_pending = VLC_TICK_INVALID;
++    p_sys->i_slave_last_dts = VLC_TICK_INVALID;
++    p_sys->i_slave_dur = 0;
++
+     /* Switch master stream */
+     p_sys->p_pgrm = p_pgrm;
+ 
+@@ -1136,6 +1162,7 @@ static es_out_pgrm_t *EsOutProgramAdd( es_out_t *out, int i_group )
+                 }
+                 es->p_pgrm = p_pgrm;
+                 es->fmt.i_group = i_group;
++                es->b_slave_ts = true;
+                 p_slaves->i_es--;
+                 p_pgrm->i_es++;
+             }
+@@ -1607,6 +1634,7 @@ static es_out_id_t *EsOutAddSlave( es_out_t *out, const es_format_t *fmt, es_out
+ 
+     /* Set up ES */
+     es->p_pgrm = p_pgrm;
++    es->b_slave_ts = fmt->i_group == 0 && p_pgrm->i_id != 0;
+     es_format_Copy( &es->fmt, fmt );
+     es->fmt.i_group = p_pgrm->i_id;
+     if( es->fmt.i_id < 0 )
+@@ -2128,6 +2156,49 @@ static int EsOutSend( es_out_t *out, es_out_id_t *es, block_t *p_block )
+         return VLC_SUCCESS;
+     }
+ 
++    /* The anchor of the slave offset: the selected program's main video ES,
++     * its main audio ES without video */
++    if( !es->b_slave_ts && es->p_pgrm == p_sys->p_pgrm && es->p_pgrm->i_id != 0 &&
++        ( es == p_sys->video.p_main_es ||
++          ( !p_sys->video.p_main_es && es == p_sys->audio.p_main_es ) ) &&
++        p_block->i_dts > VLC_TICK_INVALID )
++    {
++        const vlc_tick_t i_dts = p_block->i_dts;
++
++        if( !p_sys->b_slave_anchored )
++        {
++            if( p_sys->i_slave_pending == VLC_TICK_INVALID )
++                p_sys->i_slave_pending = p_block->i_pts > VLC_TICK_INVALID ?
++                                         p_block->i_pts : i_dts;
++        }
++        else if( p_sys->i_slave_last_dts > VLC_TICK_INVALID )
++        {
++            const vlc_tick_t i_step = i_dts - p_sys->i_slave_last_dts;
++            if( i_step > 0 && i_step < VLC_TICK_FROM_MS(200) )
++            {
++                if( p_sys->i_slave_dur <= 0 || i_step < p_sys->i_slave_dur )
++                    p_sys->i_slave_dur = i_step;
++            }
++            else if( i_step > CLOCK_FREQ || i_step < -CLOCK_FREQ )
++            {
++                /* the stream's timestamps jumped, its time went on */
++                p_sys->i_slave_offset += i_step - __MAX( p_sys->i_slave_dur, 0 );
++                msg_Dbg( p_sys->p_input, "slave offset %"PRId64" after a %"PRId64
++                         " us jump", p_sys->i_slave_offset, i_step );
++            }
++        }
++        p_sys->i_slave_last_dts = i_dts;
++    }
++
++    /* A slave's ES in the demuxer's program (TS, Blu-ray): to its timestamps */
++    if( es->b_slave_ts && p_sys->b_slave_offset )
++    {
++        if( p_block->i_pts > VLC_TICK_INVALID )
++            p_block->i_pts += p_sys->i_slave_offset;
++        if( p_block->i_dts > VLC_TICK_INVALID )
++            p_block->i_dts += p_sys->i_slave_offset;
++    }
++
+     /* Mark preroll blocks */
+     if( p_sys->i_preroll_end >= 0 )
+     {
+@@ -2362,6 +2433,41 @@ static int EsOutControlLocked( es_out_t *out, int i_query, va_list args )
+         return VLC_SUCCESS;
+     }
+ 
++    case ES_OUT_SET_SLAVE_TIME:
++    {
++        /* the master's time (from 0, slaves' timestamps are VLC_TICK_0 +
++         * their time), coarse (a Blu-ray's moves by GOPs, a TS's is its
++         * PCR's, ahead of the pictures): only to check the anchor ES's first
++         * timestamp after a start or a seek. At the start that timestamp is
++         * time 0; after a seek the offset is kept (a TS, the same clip of a
++         * Blu-ray) unless it is 2 s off (another clip) */
++        vlc_tick_t i_time = va_arg( args, vlc_tick_t );
++        vlc_tick_t i_ts = p_sys->i_slave_pending;
++
++        if( !p_sys->p_pgrm || p_sys->p_pgrm->i_id == 0 )
++            return VLC_SUCCESS;
++        if( p_sys->b_slave_anchored )
++            return VLC_SUCCESS;
++        if( i_ts == VLC_TICK_INVALID )
++            /* no offset yet: the slaves wait (their blocks would be lost) */
++            return p_sys->b_slave_offset ? VLC_SUCCESS : VLC_EGENERIC;
++        p_sys->b_slave_anchored = true;
++        p_sys->i_slave_pending = VLC_TICK_INVALID;
++        if( !p_sys->b_slave_offset )
++        {
++            p_sys->i_slave_offset = i_ts - VLC_TICK_0 -
++                                    ( i_time < 2 * CLOCK_FREQ ? 0 : i_time );
++            p_sys->b_slave_offset = true;
++        }
++        else if( llabs( i_ts - VLC_TICK_0 - p_sys->i_slave_offset - i_time ) > 2 * CLOCK_FREQ )
++            p_sys->i_slave_offset = i_ts - VLC_TICK_0 - i_time;
++        else
++            return VLC_SUCCESS;
++        msg_Dbg( p_sys->p_input, "slave offset %"PRId64" (timestamp %"PRId64
++                 ", time %"PRId64")", p_sys->i_slave_offset, i_ts, i_time );
++        return VLC_SUCCESS;
++    }
++
+     case ES_OUT_SET_MODE:
+     {
+         const int i_mode = va_arg( args, int );
+diff --git a/src/input/es_out.h b/src/input/es_out.h
+index f37f8945ed..2e0b6f8c29 100644
+--- a/src/input/es_out.h
++++ b/src/input/es_out.h
+@@ -88,6 +88,10 @@ enum es_out_query_private_e
+ 
+     /* Set End Of Stream */
+     ES_OUT_SET_EOS,                                 /* res=cannot fail */
++
++    /* The master demuxer's time when the slaves are demuxed: their ES in the
++     * demuxer's program get its timestamps (TS, Blu-ray) */
++    ES_OUT_SET_SLAVE_TIME,                          /* arg1=vlc_tick_t i_time   res=cannot fail */
+ };
+ 
+ static inline void es_out_SetMode( es_out_t *p_out, int i_mode )
+diff --git a/src/input/input.c b/src/input/input.c
+index 8d5c10b073..147a501037 100644
+--- a/src/input/input.c
++++ b/src/input/input.c
+@@ -605,6 +605,14 @@ static void MainLoopDemux( input_thread_t *p_input, bool *pb_changed )
+     }
+     else if( p_priv->i_slave > 0 )
+         SlaveDemux( p_input );
++    else
++    {
++        /* es_out anchors the offset for slaves at the start, also before
++         * one is added (ES_OUT_SET_SLAVE_TIME) */
++        int64_t i_time;
++        if( !demux_Control( p_priv->master->p_demux, DEMUX_GET_TIME, &i_time ) )
++            es_out_Control( p_priv->p_es_out_display, ES_OUT_SET_SLAVE_TIME, i_time );
++    }
+ }
+ 
+ static int MainLoopTryRepeat( input_thread_t *p_input )
+@@ -2965,6 +2973,10 @@ static void SlaveDemux( input_thread_t *p_input )
+         msg_Err( p_input, "demux doesn't like DEMUX_GET_TIME" );
+         return;
+     }
++    /* the slaves' timestamps count from 0, the master's program's may not:
++     * until es_out has the offset, the slaves wait */
++    if( es_out_Control( input_priv(p_input)->p_es_out_display, ES_OUT_SET_SLAVE_TIME, i_time ) )
++        return;
+ 
+     for( i = 0; i < input_priv(p_input)->i_slave; i++ )
+     {
+-- 
+2.55.0.windows.3
+
