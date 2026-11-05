@@ -166,6 +166,16 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.19-poc (0023–0032-es VLC-javítások; a libdvfelplay, a kernelmodulok, az app-javítások és a 3D
+          változatlanok) – zajmentes VC-1 Blu-ray-remuxok, a képfrekvencia már az indulástól. A
+          Matroskába tett VC-1-es filmek (Blu-ray-remuxok) képkockáiban benne marad a kezdőkód; a VLC
+          mindegyik elé tett még egyet, és az Amlogic dekódere zajt és zöld kockákat mutatott (0031).
+          Minden videódekóder megkapja a stream képfrekvenciáját (0030, 0032): enélkül az Amlogic
+          dekódere becsülte, és az automatikus frekvenciaváltás az időzítés nélküli filmeknél kétszer
+          váltott az elején (23,976 fps-es film előbb 24 Hz-re; iPhone-os 60 fps-es Dolby Vision-videó
+          S905X4-en 24 Hz-re). A Dolby Vision-dekóder a stream profilját is megkapja (0029, Android 12+
+          Codec2-dekóderek). Egy kapcsoló a TrueHD-t változatlanul adja az audio HAL-nak (0023,
+          --audiotrack-truehd-raw, alapból ki), és öt javítás a VLC 3.0.x-ből (0024–0028).
 0.2.18-poc (0021-es és 0022-es VLC-javítás; a libdvfelplay, a kernelmodulok, az app-javítások és a
           3D változatlanok) – külső felirat TS-en és Blu-ray-en. A TS-fájlhoz vagy Blu-ray-mappához
           indításkor vagy lejátszás közben adott .srt (vagy külső hangfájl) saját 0-s programot kapott,
@@ -458,6 +468,16 @@ NOTES
 
 CHANGES
 -------
+0.2.19-poc (VLC patches 0023–0032; libdvfelplay, the kernel modules, the app patches and 3D
+          unchanged) – VC-1 Blu-ray remuxes without noise, the frame rate from the start. A VC-1 film in
+          Matroska (a Blu-ray remux) keeps its start codes in the frames; VLC added another one to each,
+          and Amlogic's decoder showed noise and green blocks (0031). Every video decoder now gets the
+          stream's frame rate (0030, 0032): without it Amlogic's decoder guessed one, and the automatic
+          frame rate switched the display twice at the start of a film without timing in its stream (a
+          23.976 fps film to 24 Hz first; an iPhone 60 fps Dolby Vision video to 24 Hz on S905X4). The
+          Dolby Vision decoder also gets the stream's profile (0029, Codec2 decoders of Android 12+). An
+          option passes TrueHD to the audio HAL as it is (0023, --audiotrack-truehd-raw, off by default),
+          and five fixes from VLC 3.0.x (0024–0028).
 0.2.18-poc (VLC patches 0021 and 0022; libdvfelplay, the kernel modules, the app patches and 3D
           unchanged) – external subtitles on TS and Blu-ray. An .srt (or an external audio file) added to
           a TS file or a Blu-ray folder, at the start or during playback, got a program 0 of its own that

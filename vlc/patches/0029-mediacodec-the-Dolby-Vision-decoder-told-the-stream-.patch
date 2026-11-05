@@ -1,0 +1,81 @@
+From fc7151f59d56f18fd05692001e59724338ddee19 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 3 Nov 2026 12:54:41 +0100
+Subject: [PATCH] mediacodec: the Dolby Vision decoder told the stream's
+ profile
+
+The profile constant chose the decoder only; the media format had none. Amlogic's
+Codec2 Dolby Vision decoder (Android 12+, e.g. a Dune with Homatics' firmware) then
+kept its default, profile 5 (IPTPQc2), for a profile 8.1 stream too. The Dune app's
+player (libVLC as well) sets the profile; now the same configuration. Only for "c2."
+decoders: the OMX ones (Android 11) stay as they were.
+
+Message-Id: <20261103-dvfel-dovi-c2-profile@djnice>
+---
+ modules/codec/omxil/mediacodec.c     | 3 +++
+ modules/codec/omxil/mediacodec.h     | 3 +++
+ modules/codec/omxil/mediacodec_ndk.c | 6 ++++++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 25c2cc1e69..6a4e89a38e 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -342,6 +342,7 @@ struct decoder_sys_t
+             int i_profile; /* the HEVC profile the decoder was chosen for */
+             dvfp *p_dvfp;
+             bool b_dovi; /* the Dolby Vision decoder is in use */
++            int i_dovi_mc_profile; /* its profile constant for the stream */
+             /* the player's information panel: the live level 1 (DoviInfo) */
+             char *psz_dvinfo; /* <app files>/ */
+             vlc_tick_t i_dvinfo_check, i_dvinfo_write;
+@@ -817,6 +818,7 @@ static int StartMediaCodec(decoder_t *p_dec)
+         if (p_sys->b_adaptive)
+             msg_Dbg(p_dec, "mediacodec configured for adaptative playback");
+         args.video.b_adaptive_playback = p_sys->b_adaptive;
++        args.video.i_dovi_profile = p_sys->video.b_dovi ? p_sys->video.i_dovi_mc_profile : 0;
+     }
+     else
+     {
+@@ -2119,6 +2121,7 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+              psz_mode, p_sys->api.psz_name, dvfp_api.version());
+     p_sys->video.p_dvfp = p_dvfp;
+     p_sys->video.b_dovi = true;
++    p_sys->video.i_dovi_mc_profile = i_mc_profile;
+     p_sys->video.psz_dvinfo = DoviInfoDir();
+     if (p_sys->video.psz_dvinfo)
+         vlc_mutex_init(&p_sys->video.dvinfo_lock);
+diff --git a/modules/codec/omxil/mediacodec.h b/modules/codec/omxil/mediacodec.h
+index 8fc1fcafd2..8da15e8a0e 100644
+--- a/modules/codec/omxil/mediacodec.h
++++ b/modules/codec/omxil/mediacodec.h
+@@ -129,6 +129,9 @@ union mc_api_args
+         enum mc_media_format_color_transfer_t color_transfer;
+         enum mc_media_format_color_range_t color_range;
+         enum mc_media_format_color_standard_t color_standard;
++        /* the Dolby Vision decoder: the stream's profile
++         * (CodecProfileLevel.DolbyVisionProfile*), 0 otherwise */
++        int i_dovi_profile;
+     } video;
+     struct
+     {
+diff --git a/modules/codec/omxil/mediacodec_ndk.c b/modules/codec/omxil/mediacodec_ndk.c
+index c861e81f5a..f317531de8 100644
+--- a/modules/codec/omxil/mediacodec_ndk.c
++++ b/modules/codec/omxil/mediacodec_ndk.c
+@@ -360,6 +360,12 @@ static int Start(mc_api *api, union mc_api_args *p_args)
+         syms.AMediaFormat.setInt32(p_sys->p_format, "color-range", p_args->video.color_range);
+         syms.AMediaFormat.setInt32(p_sys->p_format, "color-standard", p_args->video.color_standard);
+         syms.AMediaFormat.setInt32(p_sys->p_format, "color-transfer", p_args->video.color_transfer);
++        /* the Dolby Vision decoder is told the stream's profile: Amlogic's
++         * Codec2 one (Android 12+) keeps its default otherwise, profile 5
++         * (IPTPQc2), also for a profile 8.1 stream; the Dune app's player
++         * sets it */
++        if (p_args->video.i_dovi_profile > 0 && strncmp(api->psz_name, "c2.", 3) == 0)
++            syms.AMediaFormat.setInt32(p_sys->p_format, "profile", p_args->video.i_dovi_profile);
+ 
+         if (p_args->video.p_surface)
+         {
+-- 
+2.55.0.windows.3
+

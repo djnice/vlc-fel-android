@@ -1,0 +1,162 @@
+From e18a91d22859084612110424aab4934390e27d1d Mon Sep 17 00:00:00 2001
+From: Steve Lhomme <robux4@ycbcr.xyz>
+Date: Mon, 26 Oct 2026 08:47:58 +0100
+Subject: [PATCH] contrib: smb2: update to 6.3.1
+
+(cherry picked from commit 874d229c1896037992f9d10b06ce6c341f77c0eb)
+Signed-off-by: Steve Lhomme <robux4@ycbcr.xyz>
+(cherry picked from commit 7db859b5d70204456147fdbd52cf8a7d35ed5b53)
+
+Message-Id: <20261103-vlc30x-7db859b5d7@djnice>
+---
+ ...LE_LIBKRB5-and-ENABLE_GSSAPI-options.patch | 77 -------------------
+ ...declared-identifier-ENXIO-in-android.patch | 24 ------
+ contrib/src/smb2/SHA512SUMS                   |  2 +-
+ contrib/src/smb2/rules.mak                    |  4 +-
+ 4 files changed, 2 insertions(+), 105 deletions(-)
+ delete mode 100644 contrib/src/smb2/0001-cmake-add-ENABLE_LIBKRB5-and-ENABLE_GSSAPI-options.patch
+ delete mode 100644 contrib/src/smb2/0001-fix-Fixed-undeclared-identifier-ENXIO-in-android.patch
+
+diff --git a/contrib/src/smb2/0001-cmake-add-ENABLE_LIBKRB5-and-ENABLE_GSSAPI-options.patch b/contrib/src/smb2/0001-cmake-add-ENABLE_LIBKRB5-and-ENABLE_GSSAPI-options.patch
+deleted file mode 100644
+index c6d8e32852..0000000000
+--- a/contrib/src/smb2/0001-cmake-add-ENABLE_LIBKRB5-and-ENABLE_GSSAPI-options.patch
++++ /dev/null
+@@ -1,77 +0,0 @@
+-From 3e0f7949c7db82ef427007d8de978fab02703a2f Mon Sep 17 00:00:00 2001
+-From: Thomas Guillem <thomas@gllm.fr>
+-Date: Tue, 17 Dec 2024 08:18:03 +0100
+-Subject: [PATCH] cmake: add ENABLE_LIBKRB5 and ENABLE_GSSAPI options
+-
+-ON by default, but the user can now disable these components (like
+-configure.ac).
+-
+-Fixes #384
+----
+- CMakeLists.txt              | 19 ++++++++++++++-----
+- cmake/ConfigureChecks.cmake |  4 ++++
+- 2 files changed, 18 insertions(+), 5 deletions(-)
+-
+-diff --git a/CMakeLists.txt b/CMakeLists.txt
+-index 0252451..562b8e2 100644
+---- a/CMakeLists.txt
+-+++ b/CMakeLists.txt
+-@@ -57,14 +57,19 @@ endif()
+-       option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+-     endif()
+-       option(ENABLE_EXAMPLES "Build example programs" OFF)
+--    
+-+      option(ENABLE_LIBKRB5 "Enable libkrb5 support" ON)
+-+      option(ENABLE_GSSAPI "Enable gssapi support" ON)
+-       list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
+-   endif()
+- 
+-   if(CMAKE_SYSTEM_NAME MATCHES Linux)
+--    find_package(LibKrb5)
+-+    if (ENABLE_LIBKRB5)
+-+      find_package(LibKrb5)
+-+    endif()
+-   elseif(IOS)
+--    find_package(GSSAPI)  
+-+    if (ENABLE_GSSAPI)
+-+      find_package(GSSAPI)  
+-+    endif()
+-   endif()
+- 
+-   if(NOT ESP_PLATFORM)
+-@@ -95,9 +100,13 @@ endif()
+-     endif()
+-     
+-     if(CMAKE_SYSTEM_NAME MATCHES Linux)
+--      set(core_DEPENDS ${LIBKRB5_LIBRARY} CACHE STRING "" FORCE)  
+-+      if (ENABLE_LIBKRB5)
+-+        set(core_DEPENDS ${LIBKRB5_LIBRARY} CACHE STRING "" FORCE)  
+-+      endif()
+-     elseif(IOS)
+--      set(core_DEPENDS ${GSSAPI_LIBRARIES} CACHE STRING "" FORCE)   
+-+      if (ENABLE_GSSAPI)
+-+        set(core_DEPENDS ${GSSAPI_LIBRARIES} CACHE STRING "" FORCE)   
+-+      endif()
+-     endif()
+- 
+-     if(MSVC AND BUILD_SHARED_LIBS)
+-diff --git a/cmake/ConfigureChecks.cmake b/cmake/ConfigureChecks.cmake
+-index a28846a..d59d890 100644
+---- a/cmake/ConfigureChecks.cmake
+-+++ b/cmake/ConfigureChecks.cmake
+-@@ -6,8 +6,12 @@ endif()
+- check_include_file("arpa/inet.h" HAVE_ARPA_INET_H)
+- check_include_file("dlfcn.h" HAVE_DLFCN_H)
+- check_include_file("fcntl.h" HAVE_FCNTL_H)
+-+if (ENABLE_GSSAPI)
+- check_include_file("gssapi/gssapi.h" HAVE_GSSAPI_GSSAPI_H)
+-+endif()
+-+if (ENABLE_LIBKRB5)
+- check_include_file("krb5/krb5.h" HAVE_LIBKRB5)
+-+endif()
+- check_include_file("inttypes.h" HAVE_INTTYPES_H)
+- check_include_file("netdb.h" HAVE_NETDB_H)
+- check_include_file("netinet/in.h" HAVE_NETINET_IN_H)
+--- 
+-2.45.2
+-
+diff --git a/contrib/src/smb2/0001-fix-Fixed-undeclared-identifier-ENXIO-in-android.patch b/contrib/src/smb2/0001-fix-Fixed-undeclared-identifier-ENXIO-in-android.patch
+deleted file mode 100644
+index de6629c169..0000000000
+--- a/contrib/src/smb2/0001-fix-Fixed-undeclared-identifier-ENXIO-in-android.patch
++++ /dev/null
+@@ -1,24 +0,0 @@
+-From b9f2b29e18c8b28fd97aecef4ceb74d070a067d1 Mon Sep 17 00:00:00 2001
+-From: laxy <laxy@funkore.com>
+-Date: Tue, 17 Dec 2024 10:02:21 +0800
+-Subject: [PATCH] fix: Fixed undeclared identifier 'ENXIO' in android
+-
+----
+- lib/compat.c | 1 +
+- 1 file changed, 1 insertion(+)
+-
+-diff --git a/lib/compat.c b/lib/compat.c
+-index 438e179..b99606b 100644
+---- a/lib/compat.c
+-+++ b/lib/compat.c
+-@@ -181,6 +181,7 @@ int iop_connect(int sockfd, struct sockaddr *addr, socklen_t addrlen)
+- #ifdef __ANDROID__
+- /* getlogin_r() was added in API 28 */
+- #if __ANDROID_API__ < 28
+-+#include <errno.h>
+- #define NEED_GETLOGIN_R
+- #define login_num ENXIO
+- #endif
+--- 
+-2.45.2
+-
+diff --git a/contrib/src/smb2/SHA512SUMS b/contrib/src/smb2/SHA512SUMS
+index 7b9aa9ecbb..bfe1238fcb 100644
+--- a/contrib/src/smb2/SHA512SUMS
++++ b/contrib/src/smb2/SHA512SUMS
+@@ -1 +1 @@
+-7f481b22f90b82d19c6bb29537ef10229b3ff4aff3d46dff5b11ee22c9c0410f1d58f466cf0774507d1d6f03c06dd82b223b1f4be75da239402e57749382fe5f  libsmb2-6.1.tar.gz
++8d6d5253ca8d269ebaff01fbeec63268a630eedf5c04fc96eeb873f5b57f6a59e3069f76f6359c9860a2fade508149a40ef83d2a8711c68e5a7c9a446bbcc02e  libsmb2-6.3.1.tar.gz
+diff --git a/contrib/src/smb2/rules.mak b/contrib/src/smb2/rules.mak
+index d9d832e5ac..46e1a99bcf 100644
+--- a/contrib/src/smb2/rules.mak
++++ b/contrib/src/smb2/rules.mak
+@@ -1,5 +1,5 @@
+ # SMB2
+-SMB2_VERSION := 6.1
++SMB2_VERSION := 6.3.1
+ SMB2_URL := $(GITHUB)/sahlberg/libsmb2/archive/refs/tags/libsmb2-$(SMB2_VERSION).tar.gz
+ 
+ ifeq ($(call need_pkg,"smb2"),)
+@@ -14,8 +14,6 @@ $(TARBALLS)/libsmb2-$(SMB2_VERSION).tar.gz:
+ smb2: UNPACK_DIR=libsmb2-libsmb2-$(SMB2_VERSION)
+ smb2: libsmb2-$(SMB2_VERSION).tar.gz .sum-smb2
+ 	$(UNPACK)
+-	$(APPLY) $(SRC)/smb2/0001-cmake-add-ENABLE_LIBKRB5-and-ENABLE_GSSAPI-options.patch
+-	$(APPLY) $(SRC)/smb2/0001-fix-Fixed-undeclared-identifier-ENXIO-in-android.patch
+ 	$(MOVE)
+ 
+ SMB2_CONF := -DENABLE_LIBKRB5=OFF
+-- 
+2.55.0.windows.3
+

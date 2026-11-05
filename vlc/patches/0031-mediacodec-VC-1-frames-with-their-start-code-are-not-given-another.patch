@@ -1,0 +1,42 @@
+From e0f2b9f8549affe8b067e20eb1fc928e7aff6e76 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 3 Nov 2026 17:18:21 +0100
+Subject: [PATCH] mediacodec: VC-1 frames with their start code are not given
+ another
+
+A Blu-ray remux in Matroska keeps the VC-1 start codes in the frames: 0x0000010D,
+or 0x0000010F with the sequence and entry point headers before a key frame. The
+frame start code added to every frame made an empty picture before each of
+them, and Amlogic's decoder (OMX.amlogic.wvc1) showed noise and green blocks. A
+frame that starts with a start code is now given as it is; the others still get
+0x0000010D in front.
+
+Message-Id: <20261103-dvfel-vc1-start-code@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index af34292a82..acb00be1c8 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -2590,6 +2590,14 @@ static int VideoVC1_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+ {
+     block_t *p_block = *pp_block;
+ 
++    /* a frame that has its start code already (a Blu-ray remux in Matroska:
++     * 0x0000010D, or 0x0000010F with the sequence header before a key frame)
++     * is given as it is: one more start code in front made an empty picture
++     * before each frame, and Amlogic's decoder showed garbage and green */
++    if (p_block->i_buffer >= 4 && p_block->p_buffer[0] == 0x00
++     && p_block->p_buffer[1] == 0x00 && p_block->p_buffer[2] == 0x01)
++        return Video_OnNewBlock(p_dec, pp_block);
++
+     /* Adding frame start code */
+     p_block = *pp_block = block_Realloc(p_block, 4, p_block->i_buffer);
+     if (p_block == NULL)
+-- 
+2.55.0.windows.3
+

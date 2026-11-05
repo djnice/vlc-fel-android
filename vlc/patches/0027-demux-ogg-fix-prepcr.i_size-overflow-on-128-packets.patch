@@ -1,0 +1,54 @@
+From eb86b986cb7582936ec86b31f3508494990d9f76 Mon Sep 17 00:00:00 2001
+From: sheikhayaan <sheikhayaan408@gmail.com>
+Date: Wed, 28 Oct 2026 07:33:33 +0000
+Subject: [PATCH] demux/ogg: fix prepcr.i_size overflow on 128 packets
+
+prepcr.i_size is a uint8_t, but the demuxer can store up to 510
+(2 * 255) in it. When the first audio page has exactly 128 packets,
+__MAX(128 << 1, 255) evaluates to 256, which wraps to 0 in a uint8_t
+and triggers an assertion later in Ogg_SendOrQueueBlocks.
+
+Widen i_size and i_used to unsigned to prevent the wrap.
+
+Fixes #30223
+
+Signed-off-by: sheikhayaan <sheikhayaan408@gmail.com>
+(cherry picked from commit f5ce82b534097145d087de3ff4e5cc4b807df33f)
+
+Message-Id: <20261103-vlc30x-f5ce82b534@djnice>
+---
+ modules/demux/ogg.c | 2 ++
+ modules/demux/ogg.h | 4 ++--
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/modules/demux/ogg.c b/modules/demux/ogg.c
+index d4af57ff7f..75f9ab607c 100644
+--- a/modules/demux/ogg.c
++++ b/modules/demux/ogg.c
+@@ -471,6 +471,8 @@ static int Demux( demux_t * p_demux )
+             if ( b_doprepcr && p_stream->prepcr.i_size < i_max_packets )
+             {
+                 /* always double alloc for performance */
++                if ( i_max_packets < 0 )
++                     i_max_packets = 0;
+                 i_max_packets = __MAX( i_max_packets << 1, 255 );
+                 /* alloc or realloc */
+                 block_t **pp_realloc = realloc( p_stream->prepcr.pp_blocks,
+diff --git a/modules/demux/ogg.h b/modules/demux/ogg.h
+index fef2ed5b6b..3faf9c2a1e 100644
+--- a/modules/demux/ogg.h
++++ b/modules/demux/ogg.h
+@@ -119,8 +119,8 @@ typedef struct logical_stream_s
+     struct
+     {
+         block_t **pp_blocks;
+-        uint8_t i_size; /* max 255 */
+-        uint8_t i_used;
++        int i_size; 
++        int i_used;
+     } prepcr;
+     /* All blocks that are queued because ES isn't created yet */
+     block_t *p_preparse_block;
+-- 
+2.55.0.windows.3
+

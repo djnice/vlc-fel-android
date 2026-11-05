@@ -1,0 +1,111 @@
+From ce125ff73d9616fea2455fe075aa5419c4da7baf Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 3 Nov 2026 16:48:21 +0100
+Subject: [PATCH] mediacodec: the Dolby Vision decoder told the stream's frame
+ rate
+
+Amlogic's decoder estimates the frame rate when the stream has none: an iPhone
+60 fps HEVC (Dolby Vision 8.4) carries no VUI timing, the kernel's frame rate
+hint said ~27 fps, and the Dune firmware (S905X4, Android 11) put the Dolby
+Vision output on 2160p24hz for it: 24 of 60 pictures a second. The container's
+frame rate on the media format ("frame-rate") gives the decoder the right one
+(hint 1600 = 60 fps, the output stays at 60 Hz). Only for the Dolby Vision
+decoder: the others' output mode is not chosen by it.
+
+Message-Id: <20261103-dvfel-dovi-frame-rate@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c     | 12 ++++++++++++
+ modules/codec/omxil/mediacodec.h     |  2 ++
+ modules/codec/omxil/mediacodec_ndk.c | 10 ++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 6a4e89a38e..af34292a82 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -137,6 +137,17 @@ static vlc_tick_t DoviReleaseAhead(const decoder_t *p_dec, bool b_dovi)
+         ? DOVI_RELEASE_AHEAD_SLOW : DOVI_RELEASE_AHEAD;
+ }
+ 
++/* the stream's frame rate for the Dolby Vision decoder, 0 if unknown */
++static float DoviFrameRate(const decoder_t *p_dec)
++{
++    const video_format_t *fmt = &p_dec->fmt_out.video;
++    if (fmt->i_frame_rate == 0 || fmt->i_frame_rate_base == 0)
++        fmt = &p_dec->fmt_in.video;
++    if (fmt->i_frame_rate == 0 || fmt->i_frame_rate_base == 0)
++        return 0.f;
++    return (float)fmt->i_frame_rate / fmt->i_frame_rate_base;
++}
++
+ static void DoviLoadOnce(void)
+ {
+     void *lib = dlopen("libdvfelplay.so", RTLD_NOW);
+@@ -819,6 +830,7 @@ static int StartMediaCodec(decoder_t *p_dec)
+             msg_Dbg(p_dec, "mediacodec configured for adaptative playback");
+         args.video.b_adaptive_playback = p_sys->b_adaptive;
+         args.video.i_dovi_profile = p_sys->video.b_dovi ? p_sys->video.i_dovi_mc_profile : 0;
++        args.video.f_frame_rate = p_sys->video.b_dovi ? DoviFrameRate(p_dec) : 0.f;
+     }
+     else
+     {
+diff --git a/modules/codec/omxil/mediacodec.h b/modules/codec/omxil/mediacodec.h
+index 8da15e8a0e..36f4720dcc 100644
+--- a/modules/codec/omxil/mediacodec.h
++++ b/modules/codec/omxil/mediacodec.h
+@@ -132,6 +132,8 @@ union mc_api_args
+         /* the Dolby Vision decoder: the stream's profile
+          * (CodecProfileLevel.DolbyVisionProfile*), 0 otherwise */
+         int i_dovi_profile;
++        /* the Dolby Vision decoder: the stream's frame rate, 0 if unknown */
++        float f_frame_rate;
+     } video;
+     struct
+     {
+diff --git a/modules/codec/omxil/mediacodec_ndk.c b/modules/codec/omxil/mediacodec_ndk.c
+index f317531de8..24982a2b6f 100644
+--- a/modules/codec/omxil/mediacodec_ndk.c
++++ b/modules/codec/omxil/mediacodec_ndk.c
+@@ -172,6 +172,9 @@ typedef void (*pf_AMediaFormat_setString)(AMediaFormat*,
+ typedef void (*pf_AMediaFormat_setInt32)(AMediaFormat*,
+         const char* name, int32_t value);
+ 
++typedef void (*pf_AMediaFormat_setFloat)(AMediaFormat*,
++        const char* name, float value);
++
+ typedef bool (*pf_AMediaFormat_getInt32)(AMediaFormat*,
+         const char *name, int32_t *out);
+ 
+@@ -199,6 +202,7 @@ struct syms
+         pf_AMediaFormat_delete delete;
+         pf_AMediaFormat_setString setString;
+         pf_AMediaFormat_setInt32 setInt32;
++        pf_AMediaFormat_setFloat setFloat;
+         pf_AMediaFormat_getInt32 getInt32;
+     } AMediaFormat;
+ };
+@@ -234,6 +238,7 @@ static struct members members[] =
+     { "AMediaFormat_delete", OFF(delete), true },
+     { "AMediaFormat_setString", OFF(setString), true },
+     { "AMediaFormat_setInt32", OFF(setInt32), true },
++    { "AMediaFormat_setFloat", OFF(setFloat), false },
+     { "AMediaFormat_getInt32", OFF(getInt32), true },
+ #undef OFF
+     { NULL, 0, false }
+@@ -366,6 +371,11 @@ static int Start(mc_api *api, union mc_api_args *p_args)
+          * sets it */
+         if (p_args->video.i_dovi_profile > 0 && strncmp(api->psz_name, "c2.", 3) == 0)
+             syms.AMediaFormat.setInt32(p_sys->p_format, "profile", p_args->video.i_dovi_profile);
++        /* the stream's frame rate: Amlogic's decoder estimates it otherwise
++         * (an iPhone 60 fps HEVC has no VUI timing: ~27 fps), and the
++         * firmware picks the Dolby Vision output's display mode by it */
++        if (p_args->video.f_frame_rate > 0.f && syms.AMediaFormat.setFloat)
++            syms.AMediaFormat.setFloat(p_sys->p_format, "frame-rate", p_args->video.f_frame_rate);
+ 
+         if (p_args->video.p_surface)
+         {
+-- 
+2.55.0.windows.3
+

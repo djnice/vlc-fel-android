@@ -1,0 +1,343 @@
+From a06348fe78e83ac32c9a0dc9c288c2b86478d41c Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 3 Nov 2026 08:04:51 +0100
+Subject: [PATCH] audiotrack: TrueHD to the audio HAL as it is (option
+ audiotrack-truehd-raw)
+
+With --audiotrack-truehd-raw (off by default) TrueHD is passed through as
+ENCODING_DOLBY_TRUEHD, the packetizer's access units as they are, and the
+audio HAL wraps them in MAT for the HDMI sink or decodes them, as
+ExoPlayer and the Dune's own player do. On Homatics' firmware the HDMI
+output lists TrueHD only as such (its compress offload output), and its
+8 channel IEC 61937 runs on a 2 channel 192 kHz link. The stream plays
+from a major sync on after a start or a flush.
+
+Its timing: no silence can be inserted into it and the HAL's head position
+does not follow what is heard, so no delay is reported (as for the raw
+AC-3 / DTS); Play paces it by its dates instead (the first access unit
+after a start or a flush 0.1 s before its date, the next ones 0.4 s more
+ahead) and every second measures when it is heard (AudioTimestamp): the
+HAL starts to play only once it holds enough (~1.5 s late on Homatics'
+firmware), the excess is dropped up to a major sync; heard early, the
+next write waits. The bit rate is variable: the circular buffer is sized
+at 64 bytes per sample and the output's bytes-per-sample assertion skips
+TrueHD. When the AudioTrack cannot be created, IEC 61937 as before.
+
+Message-Id: <20261103-dvfel-audiotrack-truehd-raw-v6@djnice>
+---
+ modules/audio_output/audiotrack.c | 206 +++++++++++++++++++++++++++++-
+ src/audio_output/output.c         |   6 +-
+ 2 files changed, 207 insertions(+), 5 deletions(-)
+
+diff --git a/modules/audio_output/audiotrack.c b/modules/audio_output/audiotrack.c
+index cfcc0754a0..9d20a3a194 100644
+--- a/modules/audio_output/audiotrack.c
++++ b/modules/audio_output/audiotrack.c
+@@ -126,6 +126,14 @@ struct aout_sys_t {
+     long long i_encoding_flags;
+     bool b_passthrough;
+     bool b_passthrough_delay; /* the IEC 61937 output's delay is reported */
++    bool b_truehd_raw; /* TrueHD as it is (ENCODING_DOLBY_TRUEHD), see StartTrueHdRaw */
++    bool b_truehd_synced; /* (the raw TrueHD: a major sync seen since the start / flush) */
++    bool b_truehd_started; /* (the raw TrueHD: an access unit played since the start / flush) */
++    uint64_t i_truehd_written; /* (the raw TrueHD: its samples played since the start / flush) */
++    vlc_tick_t i_truehd_check; /* (the raw TrueHD: when its lateness is measured next) */
++    vlc_tick_t i_truehd_skip; /* (the raw TrueHD: this much to drop, it is heard late) */
++    bool b_truehd_skipping; /* (the raw TrueHD: dropping up to a major sync) */
++    vlc_tick_t i_truehd_wait; /* (the raw TrueHD: this much to wait more, it is heard early) */
+     uint8_t i_chans_to_reorder; /* do we need channel reordering */
+     uint8_t p_chan_table[AOUT_CHAN_MAX];
+ 
+@@ -180,6 +188,23 @@ struct aout_sys_t {
+ 
+ #define AUDIOTRACK_SESSION_ID_TEXT " Id of audio session the AudioTrack must be attached to"
+ 
++#define TRUEHD_RAW_TEXT N_("TrueHD to the audio HAL as it is")
++#define TRUEHD_RAW_LONGTEXT N_( \
++    "Pass TrueHD through as ENCODING_DOLBY_TRUEHD (the audio HAL wraps it " \
++    "for the HDMI sink or decodes it) instead of IEC 61937 MAT bursts.")
++
++/* the raw TrueHD's AudioTrack buffer: 250 ms at its highest rate (24.5 Mbit/s), as ExoPlayer */
++#define TRUEHD_RAW_BUFFER_SIZE 768000
++/* the raw TrueHD's pace: an access unit written this long before its date (the
++ * HAL decodes it ~0.1 s behind the AudioTrack's head on Homatics' firmware),
++ * the ones after the first also the AudioTrack's share ahead */
++#define TRUEHD_RAW_HAL_US VLC_TICK_FROM_MS(100)
++#define TRUEHD_RAW_LEAD_US VLC_TICK_FROM_MS(400)
++/* the raw TrueHD's lateness (AudioTimestamp) measured this often, corrected
++ * beyond this */
++#define TRUEHD_RAW_CHECK_US VLC_TICK_FROM_MS(1000)
++#define TRUEHD_RAW_SYNC_US VLC_TICK_FROM_MS(40)
++
+ #define PASSTHROUGH_DELAY_TEXT N_("Pass-through output delay")
+ #define PASSTHROUGH_DELAY_LONGTEXT N_( \
+     "Report the delay of the IEC 61937 pass-through output to keep the " \
+@@ -196,6 +221,8 @@ vlc_module_begin ()
+         change_private()
+     add_bool( "audiotrack-passthrough-delay", true, PASSTHROUGH_DELAY_TEXT,
+               PASSTHROUGH_DELAY_LONGTEXT, true )
++    add_bool( "audiotrack-truehd-raw", false, TRUEHD_RAW_TEXT,
++              TRUEHD_RAW_LONGTEXT, true )
+     add_shortcut( "audiotrack" )
+     set_callbacks( Open, Close )
+ vlc_module_end ()
+@@ -646,6 +673,12 @@ AudioTrack_Reset( JNIEnv *env, audio_output_t *p_aout )
+     AudioTrack_ResetPositions( env, p_aout );
+     AudioTrack_ResetPlaybackHeadPosition( env, p_aout );
+     p_sys->i_samples_written = 0;
++    p_sys->b_truehd_synced = false;
++    p_sys->b_truehd_started = false;
++    p_sys->i_truehd_written = 0;
++    p_sys->i_truehd_check = 0;
++    p_sys->i_truehd_skip = p_sys->i_truehd_wait = 0;
++    p_sys->b_truehd_skipping = false;
+ }
+ 
+ /**
+@@ -768,7 +801,8 @@ TimeGet( audio_output_t *p_aout, vlc_tick_t *restrict p_delay )
+      * up by Start: its position is as good as the PCM one's. Without a delay
+      * the bursts were played as soon as they were written, the sound ahead of
+      * the picture by the caching. The raw AC3 / E_AC3 / DTS encodings (SPDIFB)
+-     * count their frames differently: no delay. */
++     * count their frames differently: no delay. The raw TrueHD neither (no
++     * silence to insert, no position the HAL keeps to): Play paces it. */
+     if( p_sys->b_passthrough && ( !p_sys->b_passthrough_delay
+                                || p_sys->fmt.i_format != VLC_CODEC_SPDIFL ) )
+         return -1;
+@@ -983,12 +1017,16 @@ AudioTrack_Create( JNIEnv *env, audio_output_t *p_aout,
+ 
+     i_min_buffer_size = JNI_AT_CALL_STATIC_INT( getMinBufferSize, i_rate,
+                                                 i_channel_config, i_format );
+-    if( i_min_buffer_size <= 0 )
++    const bool b_truehd = jfields.AudioFormat.has_ENCODING_DOLBY_TRUEHD
++                       && i_format == jfields.AudioFormat.ENCODING_DOLBY_TRUEHD;
++    if( i_min_buffer_size <= 0 && !b_truehd )
+     {
+         msg_Warn( p_aout, "getMinBufferSize returned an invalid size" ) ;
+         return -1;
+     }
+     i_size = i_min_buffer_size * 2;
++    if( b_truehd )
++        i_size = __MAX( i_size, TRUEHD_RAW_BUFFER_SIZE );
+ 
+     /* create AudioTrack object */
+     if( AudioTrack_New( env, p_aout, i_rate, i_channel_config,
+@@ -1111,6 +1149,121 @@ static int GetPassthroughFmt( bool compat, audio_sample_format_t *fmt, bool b_dt
+     return VLC_SUCCESS;
+ }
+ 
++/* TrueHD as it is (option audiotrack-truehd-raw): an ENCODING_DOLBY_TRUEHD
++ * AudioTrack of the stream's rate gets the packetizer's access units, the
++ * audio HAL wraps them in MAT for the HDMI sink or decodes them (Homatics'
++ * firmware: its HDMI output takes TrueHD as it is, its 8 channel IEC 61937
++ * runs on a 2 channel 192 kHz link), as ExoPlayer and the Dune's own player
++ * do. No converter: the output format is the input's. Its bytes are not
++ * samples (variable bit rate): the circular buffer is sized at 64 bytes per
++ * sample (above the highest rate), the delay counts the samples put in. */
++static int
++StartTrueHdRaw( JNIEnv *env, audio_output_t *p_aout )
++{
++    aout_sys_t *p_sys = p_aout->sys;
++
++    if( !var_InheritBool( p_aout, "audiotrack-truehd-raw" )
++     || ( p_sys->fmt.i_format != VLC_CODEC_TRUEHD
++       && p_sys->fmt.i_format != VLC_CODEC_MLP )
++     || !jfields.AudioFormat.has_ENCODING_DOLBY_TRUEHD || p_sys->fmt.i_rate == 0 )
++        return VLC_EGENERIC;
++
++    p_sys->b_passthrough = true;
++    if( AudioTrack_Create( env, p_aout, p_sys->fmt.i_rate,
++                           jfields.AudioFormat.ENCODING_DOLBY_TRUEHD,
++                           AOUT_CHANS_7_1 ) != VLC_SUCCESS )
++    {
++        p_sys->b_passthrough = false;
++        msg_Warn( p_aout, "raw TrueHD configuration failed" );
++        return VLC_EGENERIC;
++    }
++    msg_Dbg( p_aout, "Using passthrough format: %d (raw TrueHD)",
++             jfields.AudioFormat.ENCODING_DOLBY_TRUEHD );
++    p_sys->b_truehd_raw = true;
++    p_sys->i_chans_to_reorder = 0;
++    p_sys->fmt.i_bytes_per_frame = 64;
++    p_sys->fmt.i_frame_length = 1;
++    /* (its lateness measured: AudioTimestamp, see TrueHdRawSync) */
++    if( jfields.AudioTimestamp.clazz && !p_sys->timestamp.p_obj )
++    {
++        jobject p_obj = JNI_CALL( NewObject, jfields.AudioTimestamp.clazz,
++                                  jfields.AudioTimestamp.ctor );
++        if( p_obj )
++        {
++            p_sys->timestamp.p_obj = (*env)->NewGlobalRef( env, p_obj );
++            (*env)->DeleteLocalRef( env, p_obj );
++        }
++    }
++    return VLC_SUCCESS;
++}
++
++/* The raw TrueHD: an access unit to play (false: dropped). From a major sync
++ * on after the start or a flush (as ExoPlayer: the HAL's parser needs one);
++ * never zeroes (an access unit's length is not zero). */
++static bool
++TrueHdMajorSync( const block_t *p_buffer )
++{
++    const uint8_t *p = p_buffer->p_buffer;
++    return p_buffer->i_buffer >= 8 && p[4] == 0xf8 && p[5] == 0x72
++        && p[6] == 0x6f && ( p[7] & 0xfe ) == 0xba;
++}
++
++/* The raw TrueHD heard against its dates: the AudioTimestamp's frame and
++ * time, an access unit's frame (the samples before it). The HAL starts to
++ * play once it holds enough (~1.5 s late on Homatics' firmware): late, the
++ * excess is dropped (up to a major sync: the HAL's decoder needs one, a
++ * click); early, the next write waits that much (a gap). */
++static void
++TrueHdRawSync( JNIEnv *env, audio_output_t *p_aout, const block_t *p_buffer )
++{
++    aout_sys_t *p_sys = p_aout->sys;
++    const vlc_tick_t i_now = mdate();
++
++    if( !p_sys->timestamp.p_obj || p_buffer->i_pts == VLC_TICK_INVALID
++     || i_now < p_sys->i_truehd_check )
++        return;
++    p_sys->i_truehd_check = i_now + TRUEHD_RAW_CHECK_US;
++    if( !JNI_AT_CALL_BOOL( getTimestamp, p_sys->timestamp.p_obj ) )
++        return;
++    const int64_t i_ts_us = JNI_AUDIOTIMESTAMP_GET_LONG( nanoTime ) / 1000;
++    const int64_t i_ts_frame = JNI_AUDIOTIMESTAMP_GET_LONG( framePosition );
++    /* (not playing yet, or a stale one) */
++    if( i_ts_frame <= 0 || i_now - i_ts_us > CLOCK_FREQ )
++        return;
++    const vlc_tick_t i_late = i_ts_us
++        + ( (int64_t) p_sys->i_truehd_written - i_ts_frame ) * CLOCK_FREQ
++          / p_sys->fmt.i_rate - p_buffer->i_pts;
++    if( i_late > TRUEHD_RAW_SYNC_US )
++        p_sys->i_truehd_skip = i_late;
++    else if( i_late < -TRUEHD_RAW_SYNC_US )
++        p_sys->i_truehd_wait = -i_late;
++    else
++        return;
++    msg_Dbg( p_aout, "raw TrueHD heard %"PRId64" ms after its date: %s",
++             i_late / 1000, i_late > 0 ? "dropped" : "waited" );
++    /* (measured again once corrected) */
++    p_sys->i_truehd_check = i_now + 2 * TRUEHD_RAW_CHECK_US;
++}
++
++static bool
++TrueHdRawAccept( aout_sys_t *p_sys, const block_t *p_buffer )
++{
++    const uint8_t *p = p_buffer->p_buffer;
++    if( p_buffer->i_buffer < 4 )
++        return false;
++    const size_t i_length = ( ( ( p[0] & 0x0f ) << 8 ) | p[1] ) * 2;
++    if( i_length == 0 || i_length > p_buffer->i_buffer )
++        return false;
++    if( !p_sys->b_truehd_synced )
++    {
++        if( p_buffer->i_buffer < 8 || p[4] != 0xf8 || p[5] != 0x72
++         || p[6] != 0x6f || ( p[7] & 0xfe ) != 0xba )
++            return false;
++        p_sys->b_truehd_synced = true;
++    }
++    return true;
++}
++
+ static int
+ StartPassthroughOnce( JNIEnv *env, audio_output_t *p_aout, bool b_first_only )
+ {
+@@ -1120,6 +1273,9 @@ StartPassthroughOnce( JNIEnv *env, audio_output_t *p_aout, bool b_first_only )
+     if( !AudioTrack_HasEncoding( p_aout, p_sys->fmt.i_format, &b_dtshd ) )
+         return VLC_EGENERIC;
+ 
++    if( StartTrueHdRaw( env, p_aout ) == VLC_SUCCESS )
++        return VLC_SUCCESS;
++
+     /* Try ENCODING_IEC61937 first, then fallback to ENCODING_[AC3|DTS|...] */
+     unsigned nb_fmt = jfields.AudioFormat.has_ENCODING_IEC61937 && !b_first_only ? 2 : 1;
+     int i_ret;
+@@ -1252,8 +1408,12 @@ ReportOutput( audio_output_t *p_aout, vlc_fourcc_t i_codec )
+                 break;
+             default: psz_codec = "?"; break;
+         }
+-        snprintf( psz_info, sizeof(psz_info), "bitstream %s %u %u", psz_codec,
+-                  p_sys->fmt.i_rate, aout_FormatNbChannels( &p_sys->fmt ) );
++        if( p_sys->b_truehd_raw )
++            snprintf( psz_info, sizeof(psz_info), "bitstream truehd-raw %u 8",
++                      p_sys->fmt.i_rate );
++        else
++            snprintf( psz_info, sizeof(psz_info), "bitstream %s %u %u", psz_codec,
++                      p_sys->fmt.i_rate, aout_FormatNbChannels( &p_sys->fmt ) );
+     }
+     else
+         snprintf( psz_info, sizeof(psz_info), "pcm %u %u", p_sys->fmt.i_rate,
+@@ -1660,6 +1820,7 @@ Stop( audio_output_t *p_aout )
+     p_sys->b_audiotrack_exception = false;
+     p_sys->b_error = false;
+     p_sys->b_passthrough = false;
++    p_sys->b_truehd_raw = false;
+     WriteOutputInfo( "off" );
+ }
+ 
+@@ -2037,6 +2198,43 @@ Play( audio_output_t *p_aout, block_t *p_buffer )
+     if( p_sys->b_error || !( env = GET_ENV() ) )
+         goto bailout;
+ 
++    if( p_sys->b_truehd_raw )
++    {
++        if( !TrueHdRawAccept( p_sys, p_buffer ) )
++            goto bailout;
++        /* its pace (no delay reported, TimeGet): the first one after a start /
++         * a flush at its date less the HAL's decoding (nothing in front of
++         * it), the next ones the AudioTrack's share earlier; the decoder's
++         * thread (Flush and Stop come from it too) waits, unlocked */
++        /* heard late: dropped (up to a major sync) */
++        if( p_sys->i_truehd_skip > 0
++         || ( p_sys->b_truehd_skipping && !TrueHdMajorSync( p_buffer ) ) )
++        {
++            p_sys->i_truehd_skip -= FRAMES_TO_US( p_buffer->i_nb_samples );
++            p_sys->b_truehd_skipping = true;
++            goto bailout;
++        }
++        p_sys->b_truehd_skipping = false;
++        if( p_buffer->i_pts != VLC_TICK_INVALID )
++        {
++            vlc_tick_t i_at = p_buffer->i_pts - TRUEHD_RAW_HAL_US;
++            /* (heard early: the HAL's queue let run out, then that gap) */
++            if( p_sys->i_truehd_wait > 0 )
++                i_at += p_sys->i_truehd_wait;
++            else if( p_sys->b_truehd_started )
++                i_at -= TRUEHD_RAW_LEAD_US;
++            p_sys->i_truehd_wait = 0;
++            vlc_mutex_unlock( &p_sys->lock );
++            mwait( i_at );
++            vlc_mutex_lock( &p_sys->lock );
++            if( p_sys->b_error )
++                goto bailout;
++        }
++        p_sys->b_truehd_started = true;
++        TrueHdRawSync( env, p_aout, p_buffer );
++        p_sys->i_truehd_written += p_buffer->i_nb_samples;
++    }
++
+     if( p_sys->i_chans_to_reorder )
+        aout_ChannelReorder( p_buffer->p_buffer, p_buffer->i_buffer,
+                             p_sys->i_chans_to_reorder, p_sys->p_chan_table,
+diff --git a/src/audio_output/output.c b/src/audio_output/output.c
+index bb8e4c3c9e..313cfa94eb 100644
+--- a/src/audio_output/output.c
++++ b/src/audio_output/output.c
+@@ -612,7 +612,11 @@ void aout_OutputPlay (audio_output_t *aout, block_t *block)
+ #ifndef NDEBUG
+     aout_owner_t *owner = aout_owner (aout);
+     assert (owner->mixer_format.i_frame_length > 0);
+-    assert (block->i_buffer == 0 || block->i_buffer / block->i_nb_samples ==
++    /* (TrueHD passed through as it is, Android's audiotrack: variable bit rate) */
++    assert (block->i_buffer == 0
++     || owner->mixer_format.i_format == VLC_CODEC_TRUEHD
++     || owner->mixer_format.i_format == VLC_CODEC_MLP
++     || block->i_buffer / block->i_nb_samples ==
+             owner->mixer_format.i_bytes_per_frame /
+             owner->mixer_format.i_frame_length);
+ #endif
+-- 
+2.55.0.windows.3
+

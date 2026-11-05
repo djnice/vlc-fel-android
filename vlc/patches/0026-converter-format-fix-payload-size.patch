@@ -1,0 +1,43 @@
+From c7e63e26f4ea9cb4c2825cb0efdce0cdd57eacab Mon Sep 17 00:00:00 2001
+From: Zhao Zhili <quinkblack@foxmail.com>
+Date: Wed, 21 Apr 2021 12:10:40 +0800
+Subject: [PATCH] converter/format: fix payload size
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 7cb75e5685b2e317dab96ce3c6f9ff1dcef9c993)
+
+Fixes #30386.
+
+Signed-off-by: Rémi Denis-Courmont <remi@remlab.net>
+(cherry picked from commit c128d1f15c3c858e452535b0573d38f22e91ff37)
+
+Message-Id: <20261103-vlc30x-c128d1f15c@djnice>
+---
+ modules/audio_filter/converter/format.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/modules/audio_filter/converter/format.c b/modules/audio_filter/converter/format.c
+index 5b946cf0ea..3e7852233b 100644
+--- a/modules/audio_filter/converter/format.c
++++ b/modules/audio_filter/converter/format.c
+@@ -414,6 +414,7 @@ static block_t *Fl64toFl32(filter_t *filter, block_t *b)
+     float  *dst = (float *)src;
+     for (size_t i = b->i_buffer / 8; i--;)
+         *(dst++) = *(src++);
++    b->i_buffer /= 2;
+ 
+     VLC_UNUSED(filter);
+     return b;
+@@ -434,6 +435,7 @@ static block_t *Fl64toS32(filter_t *filter, block_t *b)
+         else
+             *(dst++) = lround(s);
+     }
++    b->i_buffer /= 2;
+     VLC_UNUSED(filter);
+     return b;
+ }
+-- 
+2.55.0.windows.3
+
