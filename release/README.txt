@@ -166,6 +166,15 @@ TUDNIVALÓK
 
 VÁLTOZÁSOK
 ----------
+0.2.20-poc (0033-as VLC-javítás; a libdvfelplay, a kernelmodulok, a libmvc3dplay és az
+          app-javítások változatlanok) – 3D MVC .ssif-ből jobb szemes hibák nélkül. A Blu-ray 3D .ssif
+          a függő (jobb) és a bázisnézetet szakaszokban (extentekben) váltogatja. A VLC ts-demuxa a
+          jobb nézet épp gyűlő képét késznek vette, amint a bázisnézet következő képe elkezdődött,
+          pedig egy szakasz egy kép közepén is véget érhet: a Dune HD BD3D_DEMO lemezén 4899-ből 19
+          ilyen jobb szemes kép van (kb. 9,5 másodpercenként egy), és mindegyiknél kockás volt a jobb
+          szem. Az ilyen kép most egészben marad, amíg valóban véget nem ér (0033). A dekóder
+          (edge264-mvc) az egész lemezt hibátlanul dekódolja; csak a demux volt a hibás. Az MKV /
+          .mk3d és a függő nézetet külön PID-en hordozó m2ts fájlokat nem érintette.
 0.2.19-poc (0023–0032-es VLC-javítások; a libdvfelplay, a kernelmodulok, az app-javítások és a 3D
           változatlanok) – zajmentes VC-1 Blu-ray-remuxok, a képfrekvencia már az indulástól. A
           Matroskába tett VC-1-es filmek (Blu-ray-remuxok) képkockáiban benne marad a kezdőkód; a VLC
@@ -468,6 +477,15 @@ NOTES
 
 CHANGES
 -------
+0.2.20-poc (VLC patch 0033; libdvfelplay, the kernel modules, libmvc3dplay and the app patches
+          unchanged) – 3D MVC from .ssif without right eye glitches. A Blu-ray 3D .ssif interleaves the
+          dependent (right) view and the base view in extents. VLC's ts demux took the right view's
+          picture in progress as complete when the next base view picture started, but an extent can
+          end inside a picture: on Dune HD's BD3D_DEMO disc 19 of 4899 right view pictures (about one
+          every 9.5 s) are split that way, and the right eye showed a blocky picture each time. Such a
+          picture is now kept whole until it really ends (0033). The decoder (edge264-mvc) decodes the
+          whole disc correctly; only the demux was at fault. MKV / .mk3d and m2ts files with the
+          dependent view on its own PID were not affected.
 0.2.19-poc (VLC patches 0023–0032; libdvfelplay, the kernel modules, the app patches and 3D
           unchanged) – VC-1 Blu-ray remuxes without noise, the frame rate from the start. A VC-1 film in
           Matroska (a Blu-ray remux) keeps its start codes in the frames; VLC added another one to each,
