@@ -1,4 +1,4 @@
-From 43208eea7d97be02a94a695b1197c19dd20d83be Mon Sep 17 00:00:00 2001
+From 4cc61e31a74fe94c057d84702d0454f9c7a57ad3 Mon Sep 17 00:00:00 2001
 From: djnice <djnice@freemail.hu>
 Date: Sun, 18 Oct 2026 20:30:27 +0200
 Subject: [PATCH] mediacodec: 3D MVC with the hardware MVC decoder

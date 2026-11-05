@@ -62,6 +62,11 @@ struct hw_dev {
 static struct hw_dev *ghw;
 static u64 hw_dma_mask = ~0ULL;
 
+/* tests on a display without 3D: the 2D picture is the dependent (right) view */
+static int hw_2d_view;
+module_param(hw_2d_view, int, 0644);
+MODULE_PARM_DESC(hw_2d_view, "hardware MVC in 2D: 0 the base view, 1 the dependent view (tests)");
+
 /* ------------------------------------------------------------------ */
 /* vfm route and decoder parameters                                   */
 /* ------------------------------------------------------------------ */
@@ -244,7 +249,8 @@ static int hw_compose(struct hw_dev *h, struct hw_buf *b, struct vframe_s *src)
 	struct hw_planes m;
 	int r;
 
-	r = hw_map_planes(&m, src->canvas0_config);
+	r = hw_map_planes(&m, h->mode != MVC3D_HW_FP && READ_ONCE(hw_2d_view) && (src->type & VIDTYPE_MVC) ?
+			  src->canvas1_config : src->canvas0_config);
 	if (!r) {
 		hw_compose_view(h, b->va, &m);
 		hw_unmap_planes(&m);

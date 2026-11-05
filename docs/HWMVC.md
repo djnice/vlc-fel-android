@@ -24,7 +24,7 @@ Ezzel a szoftveres dekóder nélkül megy a 3D:
   lejátszó uvm-puffereibe, és vframe-et akaszt rájuk.
 - **Kijelzés:** a lejátszó a puffert a kép idejében egy videotunnelbe sorolja; a videófelület Amlogic sideband
   streamje (0x400, csatorna = tunnel) miatt a HWC a video_composer.0 → mvc3d → video_render.0 úton mutatja.
-- **VLC:** `vlc/patches/0033`: a mediacodec modul saját `mc_api`-ja (MediaCodec helyett, újraindítással váltva;
+- **VLC:** `vlc/patches/0034`: a mediacodec modul saját `mc_api`-ja (MediaCodec helyett, újraindítással váltva;
   ha nem indul, MediaCodec + a szoftveres út). Opció: `--mediacodec-mvc-hw` = 0 szoftveres, 1 hardveres
   (alapértelmezett, 3D kijelzőn), 2 hardveres 2D-ben is (teszt).
 - **HDMI-ráta:** a Dune AFR a MediaCodec-dekódertől tudja a film fps-ét. A 0032 óta a lejátszás elején
@@ -32,8 +32,13 @@ Ezzel a szoftveres dekóder nélkül megy a 3D:
   `vlc/android-patches/0003` (DuneDesktopMode) 8 s után, ha a mód rátája nem a filmé, SystemControl-lal vált
   (pl. 2160p60 → 2160p24, 23,976 Hz), a végén visszaáll. 3D-ben ebből lesz 1080p24 frame packing.
 
-Állapot: TV-n (2D) tesztelve (kép, tekerés, módváltás) a 0.2.8-as alapon; a v0.2.19-poc-ra igazítva lefordul,
-dobozon még nem próbáltuk. A frame packed 3D projektoros tesztje hátravan. Ez az ág nem kiadás.
+- **TV-s teszt 3D kijelző nélkül:** `echo 1 > /sys/module/mvc3d/parameters/hw_2d_view` (root) és
+  `--mediacodec-mvc-hw=2`: 2D-ben a függő (jobb) nézet látszik.
+
+Állapot: a v0.2.20-poc-ra épül (benne a 0033-as SSIF-javítás). TV-n (2D) tesztelve: kép, tekerés, módváltás
+(0.2.8-as alapon), és a BD3D_DEMO .ssif jobb nézete a `hw_2d_view` kapcsolóval (v0.2.19-alapon, a 0033-mal tiszta,
+nélküle ~10 s-onként hibás). A HW-dekóder ezen a lemezen az edge264-gyel képről képre bitazonos. A frame packed
+3D projektoros tesztje hátravan. Ez az ág nem kiadás.
 
 ## English
 
@@ -44,9 +49,13 @@ of both views is bit-identical (Gravity 713/713, Avatar 1384/1384); without it t
 
 This branch plays 3D MVC on that decoder: libmvc3dplay feeds it (`/dev/amstream_vbuf`), mvc3d 2026.10.18
 (`/dev/mvc3dhw`) composes each picture into the player's uvm buffers, and the player queues them into a video
-tunnel at their display time; the surface's sideband stream makes the HWC show it. VLC (patch 0033) does so with
+tunnel at their display time; the surface's sideband stream makes the HWC show it. VLC (patch 0034) does so with
 an `mc_api` of its own instead of MediaCodec (`--mediacodec-mvc-hw`: 0 software, 1 hardware, 2 hardware also in
 2D). App patch 0003 switches the HDMI rate through Amlogic SystemControl when the firmware's AFR did not
 (since VLC patch 0032 the AFR is told the frame rate and should switch by itself).
-Tested on a 2D TV on the v0.2.8 base; rebased on v0.2.19-poc (builds, not yet run on a box); frame packed 3D
-still to be tested on a projector. This branch is not a release.
+For tests on a display without 3D, `hw_2d_view=1` (mvc3d module parameter) with `--mediacodec-mvc-hw=2` shows the
+dependent (right) view in 2D.
+Built on v0.2.20-poc (with the .ssif fix 0033). Tested on a 2D TV: picture, seeks and the rate switch (on the
+v0.2.8 base), and the right view of Dune HD's BD3D_DEMO .ssif with `hw_2d_view` (clean with 0033, a glitch about
+every 10 s without it). On that disc the hardware decoder is bit-identical to edge264 for every picture. Frame
+packed 3D still to be tested on a projector. This branch is not a release.
