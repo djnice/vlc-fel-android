@@ -1,0 +1,72 @@
+From 618bcc89ea754785d4e73af05c9eab93022cf31f Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Thu, 5 Nov 2026 08:43:40 +0100
+Subject: [PATCH] ts: .ssif, a dependent view AU split by its extent stays
+ whole
+
+A Blu-ray 3D .ssif interleaves dependent and base view extents. The
+dependent view AU in progress was taken as complete at the next base view
+PES start (extents were thought to end with an AU), but an extent may end
+inside a PES: BD3D_DEMO has 19 of its 4899 dependent view PES split that
+way, each continued in the next dependent view extent. Cut short, they
+gave the right eye blocky pictures about every 10 s.
+
+Now the AU is complete there only when its PES length is unknown and its
+last packet was padded (a PES ends in a packet filled by its adaptation
+field); otherwise it goes on gathering and its base view AU waits for it.
+
+Message-Id: <20261105-dvfel-ts-ssif-split-dependent-pes@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/demux/mpeg/ts.c | 13 ++++++++++---
+ modules/demux/mpeg/ts.h |  1 +
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 52c2b43a0f..383e9fa70d 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -724,10 +724,14 @@ static int Demux( demux_t *p_demux )
+                 continue;
+             }
+             /* .ssif: the dependent view AU in progress is complete once a
+-             * base view AU starts (extents end with an AU); elsewhere the
+-             * next base view AU may be interleaved with it */
++             * base view AU starts, when it ended with its extent (its last
++             * packet padded). A dependent view extent may also end inside a
++             * PES (BD3D_DEMO: 19 of 4899): the rest comes with the next
++             * dependent view extent, its base view AU waits (MVCHold).
++             * Elsewhere the next base view AU may be interleaved with it. */
+             if( p_sys->mvc.b_ssif && p_pid->i_pid == p_sys->mvc.i_base_pid &&
+-                p_sys->mvc.p_gather && (p_pkt->p_buffer[1] & 0x40) )
++                p_sys->mvc.p_gather && (p_pkt->p_buffer[1] & 0x40) &&
++                !p_sys->mvc.i_pes_size && !p_sys->mvc.b_last_full )
+                 MVCFinishDep( p_demux );
+         }
+         if( p_pid->type == TYPE_PMT && MVCHandlePMT( p_demux, p_pkt, i_header ) )
+@@ -1753,6 +1757,9 @@ static void MVCGatherDep( demux_t *p_demux, block_t *p_pkt, int i_header )
+         p_sys->mvc.b_broken = true;
+ 
+     p_sys->mvc.i_gathered += p_pkt->i_buffer;
++    /* a PES ends in a packet padded by its adaptation field; a packet that
++     * is all payload is followed by more of the PES */
++    p_sys->mvc.b_last_full = i_header == 4;
+     block_ChainLastAppend( &p_sys->mvc.pp_gather_last, p_pkt );
+     if( p_sys->mvc.i_pes_size && p_sys->mvc.i_gathered >= p_sys->mvc.i_pes_size )
+         MVCFinishDep( p_demux );
+diff --git a/modules/demux/mpeg/ts.h b/modules/demux/mpeg/ts.h
+index 4a0e769f16..2f49236b59 100644
+--- a/modules/demux/mpeg/ts.h
++++ b/modules/demux/mpeg/ts.h
+@@ -137,6 +137,7 @@ struct demux_sys_t
+         size_t   i_gathered;
+         size_t   i_pes_size; /* from PES_packet_length, 0: unbounded */
+         bool     b_broken; /* packet lost or scrambled: dropped */
++        bool     b_last_full; /* the last packet gathered had no stuffing: the PES goes on */
+         block_t *p_queue; /* dependent view AUs, i_dts = 90 kHz DTS */
+         block_t **pp_queue_last;
+         unsigned i_queue;
+-- 
+2.55.0.windows.3
+
