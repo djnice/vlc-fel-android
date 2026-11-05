@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 djnice <djnice@freemail.hu>
 /*
  * mvc3dplay - the player side of 3D MVC playback (see mvc3dplay.h): starts
  * mvc3dhelper (a static aarch64 program shipped as libmvc3dhelper.so next to

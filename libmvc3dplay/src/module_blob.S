@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (C) 2026 djnice <djnice@freemail.hu> */
 /* the mvc3d kernel module, embedded (mvc3d_module_install); MVC3D_KO: its path, a string */
 	.section .rodata.mvc3d_ko, "a"
 	.balign 16

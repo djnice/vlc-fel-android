@@ -449,5 +449,8 @@ the first MVC file is to play in 3D.
 ## License
 
 GPL-2.0-or-later (VLC, libdvfelplay, libmvc3dplay and the kernel modules); edge264-mvc is BSD-2-Clause.
+The dvfel and mvc3d kernel modules, libdvfelplay (including the `felgpu` GPU composer) and libmvc3dplay are
+Copyright (C) 2026 djnice. Redistribution, also in firmware or in other products, must keep the copyright and
+license notices and provide the complete corresponding source code as the GPL requires.
 Dolby Vision is a trademark of Dolby Laboratories; this project is not affiliated with Dolby, Dune HD,
 R_volution or VideoLAN.

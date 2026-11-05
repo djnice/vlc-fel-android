@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (C) 2026 djnice <djnice@freemail.hu> */
 /*
  * libmvc3dplay <-> mvc3dhelper pipe protocol (the helper's stdin): a header,
  * then size bytes of payload. The helper answers on stdout with one text

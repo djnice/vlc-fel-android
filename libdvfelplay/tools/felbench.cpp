@@ -1,4 +1,5 @@
 /*
+ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
  *  Copyright (C) 2026 Team CoreELEC
  *
  *  SPDX-License-Identifier: GPL-2.0-or-later
