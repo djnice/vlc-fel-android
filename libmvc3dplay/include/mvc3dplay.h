@@ -104,6 +104,45 @@ MVC3D_EXPORT void mvc3d_restart(mvc3d* h);
  */
 MVC3D_EXPORT int64_t mvc3d_present_lead_ns(const mvc3d* h);
 
+/*
+ * Hardware MVC (no MediaCodec, no software decoder): the legacy Amlogic MVC
+ * decoder (frame_num rewritten against its wrap-around artefacts), mvc3d
+ * composes the pictures, a video tunnel shows them. The player must not use
+ * a MediaCodec video decoder meanwhile (the legacy decoder excludes it).
+ *
+ *   mvc3d_hw_open(w, h, frame packed?) -> NULL: play the software way
+ *   mvc3d_hw_set_sideband(h, ANativeWindow* of the video surface)
+ *   input:   mvc3d_hw_config() (codec config data), mvc3d_hw_decode() per
+ *            access unit (Annex-B, decode order); may block while the
+ *            decoder's input is full
+ *   output thread: mvc3d_hw_get_picture() -> buffer index + pts (display
+ *            order) -> at its time mvc3d_hw_present(index, CLOCK_MONOTONIC
+ *            ns), or mvc3d_hw_discard(index)
+ *   seek:    mvc3d_hw_flush() (pictures got before it: discard them)
+ *   end:     mvc3d_hw_close()
+ */
+typedef struct mvc3d_hw mvc3d_hw;
+
+/* 1: /dev/mvc3dhw (mvc3d 2026.10.18 or newer), the decoder, uvm and the video tunnel are there */
+MVC3D_EXPORT int mvc3d_hw_available(void);
+MVC3D_EXPORT mvc3d_hw* mvc3d_hw_open(int width, int height, int frame_packed);
+/* the video tunnel the pictures go to (a window's sideband stream shows it) */
+MVC3D_EXPORT int mvc3d_hw_tunnel_id(const mvc3d_hw* h);
+/* sets the window's sideband stream to the tunnel (an ANativeWindow*); 0 on success */
+MVC3D_EXPORT int mvc3d_hw_set_sideband(mvc3d_hw* h, void* window);
+MVC3D_EXPORT void mvc3d_hw_config(mvc3d_hw* h, const uint8_t* data, size_t size);
+/* 1 once the decoder's input has room (mvc3d_hw_decode would not block), 0 after timeout_ms */
+MVC3D_EXPORT int mvc3d_hw_wait_input(mvc3d_hw* h, int timeout_ms);
+MVC3D_EXPORT void mvc3d_hw_decode(mvc3d_hw* h, const uint8_t* au, size_t size, int64_t pts_us);
+/* a buffer index (>= 0) and its pts, or -1 after timeout_ms */
+MVC3D_EXPORT int mvc3d_hw_get_picture(mvc3d_hw* h, int timeout_ms, int64_t* pts_us);
+MVC3D_EXPORT int mvc3d_hw_present(mvc3d_hw* h, int index, int64_t mono_ns);
+MVC3D_EXPORT void mvc3d_hw_discard(mvc3d_hw* h, int index);
+MVC3D_EXPORT void mvc3d_hw_flush(mvc3d_hw* h);
+/* HDMI frame packing wanted (as for the software path) */
+MVC3D_EXPORT int mvc3d_hw_set_fp(mvc3d_hw* h, int on);
+MVC3D_EXPORT void mvc3d_hw_close(mvc3d_hw* h);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,531 @@
+From 43208eea7d97be02a94a695b1197c19dd20d83be Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sun, 18 Oct 2026 20:30:27 +0200
+Subject: [PATCH] mediacodec: 3D MVC with the hardware MVC decoder
+ (libmvc3dplay mvc3d_hw)
+
+With libmvc3dplay 2026.10.18 and the mvc3d kernel module 2026.10.18, a 3D
+MVC stream shown in 3D (or with --mediacodec-mvc-hw=2 also in 2D) is decoded
+by the legacy Amlogic MVC decoder instead of MediaCodec + the software
+decoder: libmvc3dplay rewrites frame_num against the decoder's wrap-around
+artefacts, mvc3d composes the pictures (frame packed or the base view) and a
+video tunnel shown by the video surface's sideband stream displays them.
+
+The legacy decoder excludes MediaCodec, so the decoder restarts with an
+mc_api of its own (MvcHw_*): queue_in feeds the library, dequeue_out gives
+its pictures (display order, pts from the library), release_out_ts queues a
+picture into the tunnel at its time; the output thread, the opaque pictures,
+flush and drain stay as they are. When the hardware decoder does not start
+(busy, old module) the decoder goes back to MediaCodec and 3D to the software
+path. --mediacodec-mvc-hw: 0 software, 1 hardware (default), 2 hardware also
+in 2D.
+
+Message-Id: <20261018-dvfel-mediacodec-mvc3d-hw@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 360 ++++++++++++++++++++++++++++++-
+ 1 file changed, 355 insertions(+), 5 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 26f7cabec1..5700684927 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -53,6 +53,7 @@
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <pthread.h>
++#include <stdatomic.h>
+ 
+ #define BLOCK_FLAG_CSD (0x01 << BLOCK_FLAG_PRIVATE_SHIFT)
+ 
+@@ -216,6 +217,7 @@ static bool DoviLoad(void)
+  * every buffer queued to MediaCodec (see mvc3dplay.h, API version 1).
+  */
+ typedef struct mvc3d mvc3d;
++typedef struct mvc3d_hw mvc3d_hw;
+ #define MVC3D_API_VERSION 1
+ #define MVC_PROBE_BLOCKS 8
+ 
+@@ -236,6 +238,20 @@ static struct
+     int64_t (*present_lead_ns)(const mvc3d *); /* optional */
+     int (*module_install)(const char *, int (*)(void *, const char *, const char *),
+                           void *, char *, size_t); /* optional */
++    /* the hardware path (optional, libmvc3dplay 2026.10.18 and newer, see
++     * mvc3dplay.h mvc3d_hw_*): the legacy MVC decoder, no MediaCodec */
++    bool hw;
++    int (*hw_available)(void);
++    mvc3d_hw *(*hw_open)(int, int, int);
++    int (*hw_set_sideband)(mvc3d_hw *, void *);
++    void (*hw_config)(mvc3d_hw *, const uint8_t *, size_t);
++    int (*hw_wait_input)(mvc3d_hw *, int);
++    void (*hw_decode)(mvc3d_hw *, const uint8_t *, size_t, int64_t);
++    int (*hw_get_picture)(mvc3d_hw *, int, int64_t *);
++    int (*hw_present)(mvc3d_hw *, int, int64_t);
++    void (*hw_discard)(mvc3d_hw *, int);
++    void (*hw_flush)(mvc3d_hw *);
++    void (*hw_close)(mvc3d_hw *);
+ } mvc_api;
+ 
+ static void MvcLoadOnce(void)
+@@ -251,6 +267,10 @@ static void MvcLoadOnce(void)
+     {
+         MVC_SYM(present_lead_ns);
+         MVC_SYM(module_install);
++        mvc_api.hw = MVC_SYM(hw_available) && MVC_SYM(hw_open) && MVC_SYM(hw_set_sideband)
++                  && MVC_SYM(hw_config) && MVC_SYM(hw_wait_input) && MVC_SYM(hw_decode)
++                  && MVC_SYM(hw_get_picture) && MVC_SYM(hw_present) && MVC_SYM(hw_discard)
++                  && MVC_SYM(hw_flush) && MVC_SYM(hw_close);
+         mvc_api.loaded = true;
+     }
+ #undef MVC_SYM
+@@ -278,6 +298,246 @@ static size_t MvcBaseViewSize(const uint8_t *p, size_t i_size)
+     return i_size;
+ }
+ 
++/*
++ * Hardware MVC as a MediaCodec api (mc_api): the decoder module runs as with
++ * MediaCodec (output thread, opaque pictures released at their time, flush,
++ * drain), libmvc3dplay's hardware path does the decoding and the display: the
++ * picture buffers go into a video tunnel shown by the surface's sideband stream.
++ */
++struct mvc_hw_sys
++{
++    mvc3d_hw *p_hw;
++    int i_width, i_height;
++    bool b_fp;
++    bool b_conf_sent;
++    atomic_bool b_flush;    /* dequeue_out returns (output thread: flush) */
++    atomic_bool b_eos;      /* drain: the decoder keeps its last pictures */
++    vlc_tick_t pi_pts[64];  /* by buffer index */
++};
++#define MVC_HW_EOS_INDEX 0x7ffe
++
++static struct mvc_hw_sys *MvcHwSys(mc_api *api)
++{
++    return (struct mvc_hw_sys *)api->p_sys;
++}
++
++static void MvcHw_Clean(mc_api *api)
++{
++    free(api->psz_name);
++    api->psz_name = NULL;
++    free(api->p_sys);
++    api->p_sys = NULL;
++}
++
++static int MvcHw_Configure(mc_api *api, int i_profile)
++{
++    VLC_UNUSED(i_profile);
++    api->i_quirks = 0;
++    api->b_support_rotation = false;
++    free(api->psz_name);
++    api->psz_name = strdup("mvc3d hardware");
++    return 0;
++}
++
++static int MvcHw_Start(mc_api *api, union mc_api_args *p_args)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++
++    if (!p_args->video.p_surface)
++        return MC_API_ERROR;
++    s->p_hw = mvc_api.hw_open(s->i_width, s->i_height, s->b_fp);
++    if (!s->p_hw)
++        return MC_API_ERROR;
++    if (mvc_api.hw_set_sideband(s->p_hw, p_args->video.p_surface))
++    {
++        mvc_api.hw_close(s->p_hw);
++        s->p_hw = NULL;
++        return MC_API_ERROR;
++    }
++    s->b_conf_sent = false;
++    atomic_store(&s->b_flush, false);
++    atomic_store(&s->b_eos, false);
++    api->b_started = true;
++    api->b_direct_rendering = true;
++    return 0;
++}
++
++static int MvcHw_Stop(mc_api *api)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++
++    if (s && s->p_hw)
++        mvc_api.hw_close(s->p_hw);
++    if (s)
++        s->p_hw = NULL;
++    api->b_started = false;
++    api->b_direct_rendering = false;
++    return 0;
++}
++
++static int MvcHw_Flush(mc_api *api)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++
++    atomic_store(&s->b_flush, true);
++    atomic_store(&s->b_eos, false);
++    mvc_api.hw_flush(s->p_hw);
++    return 0;
++}
++
++static int MvcHw_DequeueIn(mc_api *api, vlc_tick_t i_timeout)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++    int i_ms = i_timeout < 0 ? 2000 : (int)(i_timeout / 1000);
++
++    /* waits here (unlocked), not in queue_in, while the decoder's input is full */
++    return mvc_api.hw_wait_input(s->p_hw, i_ms) ? 0 : MC_API_INFO_TRYAGAIN;
++}
++
++static int MvcHw_QueueIn(mc_api *api, int i_index, const void *p_buf, size_t i_size,
++                         vlc_tick_t i_ts, bool b_config)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++    VLC_UNUSED(i_index);
++
++    /* input after a flush: the flush is over */
++    atomic_store(&s->b_flush, false);
++    if (!p_buf)
++        atomic_store(&s->b_eos, true);
++    else if (b_config)
++        mvc_api.hw_config(s->p_hw, p_buf, i_size);
++    else
++        mvc_api.hw_decode(s->p_hw, p_buf, i_size, i_ts);
++    return 0;
++}
++
++static int MvcHw_DequeueOut(mc_api *api, vlc_tick_t i_timeout)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++    vlc_tick_t i_waited = 0;
++    int i_idle = 0;
++
++    if (!s->b_conf_sent)
++    {
++        s->b_conf_sent = true;
++        return MC_API_INFO_OUTPUT_FORMAT_CHANGED;
++    }
++    for (;;)
++    {
++        if (atomic_exchange(&s->b_flush, false))
++            return MC_API_INFO_TRYAGAIN;
++        int64_t i_pts;
++        int i = mvc_api.hw_get_picture(s->p_hw, 100, &i_pts);
++        if (i >= 0)
++        {
++            s->pi_pts[i % 64] = i_pts;
++            return i;
++        }
++        /* draining: the pictures still in the decoder do not come out */
++        if (atomic_load(&s->b_eos) && ++i_idle >= 3)
++        {
++            atomic_store(&s->b_eos, false);
++            return MVC_HW_EOS_INDEX;
++        }
++        i_waited += VLC_TICK_FROM_MS(100);
++        if (i_timeout >= 0 && i_waited >= i_timeout)
++            return MC_API_INFO_TRYAGAIN;
++    }
++}
++
++static int MvcHw_GetOut(mc_api *api, int i_index, mc_api_out *p_out)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++
++    p_out->b_eos = false;
++    if (i_index == MC_API_INFO_OUTPUT_FORMAT_CHANGED)
++    {
++        p_out->type = MC_OUT_TYPE_CONF;
++        p_out->conf.video.width = s->i_width;
++        p_out->conf.video.height = s->i_height;
++        p_out->conf.video.stride = s->i_width;
++        p_out->conf.video.slice_height = s->i_height;
++        p_out->conf.video.pixel_format = 0;
++        p_out->conf.video.crop_left = 0;
++        p_out->conf.video.crop_top = 0;
++        p_out->conf.video.crop_right = s->i_width - 1;
++        p_out->conf.video.crop_bottom = s->i_height - 1;
++        return 1;
++    }
++    if (i_index < 0)
++        return 0;
++    p_out->type = MC_OUT_TYPE_BUF;
++    p_out->buf.p_ptr = NULL;
++    p_out->buf.i_size = 0;
++    if (i_index == MVC_HW_EOS_INDEX)
++    {
++        /* no picture (ts 0: dropped as a preroll one) */
++        p_out->b_eos = true;
++        p_out->buf.i_index = -1;
++        p_out->buf.i_ts = 0;
++        return 1;
++    }
++    p_out->buf.i_index = i_index;
++    p_out->buf.i_ts = s->pi_pts[i_index % 64];
++    return 1;
++}
++
++static int MvcHw_ReleaseOut(mc_api *api, int i_index, bool b_render)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++
++    if (i_index < 0 || i_index == MVC_HW_EOS_INDEX || !s->p_hw)
++        return 0;
++    if (b_render)
++        mvc_api.hw_present(s->p_hw, i_index, 0);
++    else
++        mvc_api.hw_discard(s->p_hw, i_index);
++    return 0;
++}
++
++static int MvcHw_ReleaseOutTs(mc_api *api, int i_index, int64_t i_ts_ns)
++{
++    struct mvc_hw_sys *s = MvcHwSys(api);
++
++    if (i_index < 0 || i_index == MVC_HW_EOS_INDEX || !s->p_hw)
++        return 0;
++    /* the video tunnel shows it at that time (CLOCK_MONOTONIC, as MediaCodec) */
++    return mvc_api.hw_present(s->p_hw, i_index, i_ts_ns) ? MC_API_ERROR : 0;
++}
++
++static int MvcHw_SetOutputSurface(mc_api *api, void *p_surface, void *p_jsurface)
++{
++    VLC_UNUSED(api); VLC_UNUSED(p_surface); VLC_UNUSED(p_jsurface);
++    return MC_API_ERROR;
++}
++
++static int MvcHw_Init(mc_api *api, unsigned i_width, unsigned i_height, bool b_fp)
++{
++    struct mvc_hw_sys *s = calloc(1, sizeof(*s));
++
++    if (!s)
++        return VLC_ENOMEM;
++    s->i_width = i_width;
++    s->i_height = i_height;
++    s->b_fp = b_fp;
++    atomic_init(&s->b_flush, false);
++    atomic_init(&s->b_eos, false);
++    api->p_sys = (mc_api_sys *)s;
++    api->clean = MvcHw_Clean;
++    api->configure = MvcHw_Configure;
++    api->start = MvcHw_Start;
++    api->stop = MvcHw_Stop;
++    api->flush = MvcHw_Flush;
++    api->dequeue_in = MvcHw_DequeueIn;
++    api->dequeue_out = MvcHw_DequeueOut;
++    api->queue_in = MvcHw_QueueIn;
++    api->get_out = MvcHw_GetOut;
++    api->release_out = MvcHw_ReleaseOut;
++    api->release_out_ts = MvcHw_ReleaseOutTs;
++    api->set_output_surface = MvcHw_SetOutputSurface;
++    return VLC_SUCCESS;
++}
++
+ /* CFG_PREFIX "mvc" */
+ #define MVC_MODE_AUTO 0
+ #define MVC_MODE_2D 1
+@@ -337,6 +597,8 @@ struct decoder_sys_t
+     bool            b_drained;
+     bool            b_adaptive;
+     int             i_decode_flags;
++    /* the MediaCodec api (NDK / JNI), back from the hardware MVC one */
++    pf_MediaCodecApi_init pf_init;
+ 
+     union
+     {
+@@ -372,6 +634,9 @@ struct decoder_sys_t
+             /* 3D MVC: decided by the first access units */
+             int i_mvc_probe; /* access units still to look at */
+             mvc3d *p_mvc;
++            /* hardware MVC: wanted at the next decoder (re)start, in use */
++            bool b_mvc_hw_want, b_mvc_hw, b_mvc_fp;
++            unsigned i_mvc_width, i_mvc_height;
+         } video;
+         struct {
+             date_t i_end_date;
+@@ -402,6 +667,7 @@ static void DoviInfo(decoder_t *, const block_t *);
+ static void DoviInfoShown(decoder_t *, unsigned, int64_t);
+ static char *DoviInfoDir(void);
+ static void MvcProbe(decoder_t *, const block_t *);
++static void MvcHwSwitch(decoder_t *, bool);
+ static void Video_OnFlush(decoder_t *);
+ static int Video_ProcessOutput(decoder_t *, mc_api_out *, picture_t **,
+                                block_t **);
+@@ -459,6 +725,18 @@ static void RemoveInflightPictures(decoder_t *);
+     "automatic (when the display supports 3D), 2D (the base view) or 3D."
+ static const int pi_mvc_values[] = { MVC_MODE_AUTO, MVC_MODE_2D, MVC_MODE_3D };
+ static const char *const ppsz_mvc_names[] = { N_("Automatic"), N_("2D"), N_("3D") };
++#define MEDIACODEC_MVC_HW_TEXT "3D MVC decoder"
++#define MEDIACODEC_MVC_HW_LONGTEXT \
++    "Software (both views decoded by the CPU, the hardware decoder shows the " \
++    "base view), hardware (the Amlogic MVC decoder, its frame_num artefacts " \
++    "avoided; the software one when it is busy or missing) or hardware also " \
++    "on a display without 3D (the base view, for tests)."
++#define MVC_HW_OFF 0
++#define MVC_HW_ON 1
++#define MVC_HW_ALSO_2D 2
++static const int pi_mvc_hw_values[] = { MVC_HW_OFF, MVC_HW_ON, MVC_HW_ALSO_2D };
++static const char *const ppsz_mvc_hw_names[] = { N_("Software"), N_("Hardware"),
++                                                N_("Hardware, also in 2D") };
+ 
+ #define CFG_PREFIX "mediacodec-"
+ 
+@@ -483,6 +761,9 @@ vlc_module_begin ()
+     add_integer(CFG_PREFIX "mvc", MVC_MODE_AUTO,
+                 MEDIACODEC_MVC_TEXT, MEDIACODEC_MVC_LONGTEXT, true)
+         change_integer_list(pi_mvc_values, ppsz_mvc_names)
++    add_integer(CFG_PREFIX "mvc-hw", MVC_HW_ON,
++                MEDIACODEC_MVC_HW_TEXT, MEDIACODEC_MVC_HW_LONGTEXT, true)
++        change_integer_list(pi_mvc_hw_values, ppsz_mvc_hw_names)
+     add_float(CFG_PREFIX "fps", 0.f,
+               MEDIACODEC_FPS_TEXT, MEDIACODEC_FPS_LONGTEXT, true)
+     set_callbacks(OpenDecoderNdk, CloseDecoder)
+@@ -867,7 +1148,8 @@ static void StopMediaCodec(decoder_t *p_dec)
+     if (p_sys->api.b_direct_rendering)
+         RemoveInflightPictures(p_dec);
+ 
+-    p_sys->api.stop(&p_sys->api);
++    if (p_sys->api.stop)
++        p_sys->api.stop(&p_sys->api);
+ }
+ 
+ /*****************************************************************************
+@@ -968,6 +1250,7 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+     p_sys->api.i_codec = p_dec->fmt_in.i_codec;
+     p_sys->api.i_cat = p_dec->fmt_in.i_cat;
+     p_sys->api.psz_mime = mime;
++    p_sys->pf_init = pf_init;
+     p_sys->video.i_mpeg_dar_num = 0;
+     p_sys->video.i_mpeg_dar_den = 0;
+ 
+@@ -1175,7 +1458,8 @@ static void CleanDecoder(decoder_t *p_dec)
+     StopMediaCodec(p_dec);
+ 
+     CSDFree(p_dec);
+-    p_sys->api.clean(&p_sys->api);
++    if (p_sys->api.clean)
++        p_sys->api.clean(&p_sys->api);
+ 
+     if (p_dec->fmt_in.i_cat == VIDEO_ES)
+     {
+@@ -1782,7 +2066,8 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+ 
+             /* Blu-ray 3D from ts: MediaCodec only gets the base view */
+             size_t i_hw_size = i_size;
+-            if (p_buf != NULL && !b_config && p_dec->fmt_in.i_codec == VLC_CODEC_H264)
++            if (p_buf != NULL && !b_config && p_dec->fmt_in.i_codec == VLC_CODEC_H264
++             && !p_sys->video.b_mvc_hw)
+                 i_hw_size = MvcBaseViewSize(p_buf, i_size);
+ 
+             if (p_sys->api.queue_in(&p_sys->api, i_index, p_buf, i_hw_size,
+@@ -1946,8 +2231,17 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
+         if (b_restart)
+         {
+             StopMediaCodec(p_dec);
++            /* 3D MVC in hardware: no MediaCodec from now on */
++            if (p_sys->video.b_mvc_hw_want && !p_sys->video.b_mvc_hw)
++                MvcHwSwitch(p_dec, true);
+ 
+             int i_ret = StartMediaCodec(p_dec);
++            if (i_ret != VLC_SUCCESS && p_sys->video.b_mvc_hw)
++            {
++                msg_Warn(p_dec, "3D MVC: the hardware decoder did not start, software");
++                MvcHwSwitch(p_dec, false);
++                i_ret = p_sys->api.start ? StartMediaCodec(p_dec) : VLC_EGENERIC;
++            }
+             switch (i_ret)
+             {
+             case VLC_SUCCESS:
+@@ -2189,9 +2483,11 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+         i_width = i_vw;
+         i_height = i_vh;
+     }
++    const int i_hw = mvc_api.hw ? var_InheritInteger(p_dec, CFG_PREFIX "mvc-hw") : MVC_HW_OFF;
++    const bool b_3d = i_mode == MVC_MODE_3D || mvc_api.display_3d();
+     /* the mvc3d kernel module bundled with libmvc3dplay: installed when
+      * missing or older (asks for root access once), as for Dolby Vision */
+-    if (mvc_api.module_install && (i_mode == MVC_MODE_3D || mvc_api.display_3d()))
++    if (mvc_api.module_install && (b_3d || i_hw == MVC_HW_ALSO_2D))
+     {
+         static bool b_told;
+         char psz_msg[160];
+@@ -2204,12 +2500,25 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+             vlc_dialog_display_error(p_dec, "3D MVC", "%s", psz_msg);
+         }
+     }
++    p_sys->video.i_mvc_width = i_width;
++    p_sys->video.i_mvc_height = i_height;
++    p_sys->video.b_mvc_fp = b_3d;
++    /* the hardware decoder: MediaCodec has to go (the legacy decoder excludes
++     * it), the decoder restarts with the mvc3d api (MvcHwSwitch) */
++    if (i_hw != MVC_HW_OFF && (b_3d || i_hw == MVC_HW_ALSO_2D) && mvc_api.hw_available())
++    {
++        msg_Info(p_dec, "3D MVC %ux%u: hardware decoder, %s, libmvc3dplay %s", i_width,
++                 i_height, b_3d ? "frame packing" : "2D (base view)", mvc_api.version());
++        p_sys->video.b_mvc_hw_want = true;
++        p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
++        return;
++    }
+     if (!mvc_api.available())
+     {
+         msg_Info(p_dec, "3D MVC: no mvc3d kernel module, 2D (base view)");
+         return;
+     }
+-    if (i_mode == MVC_MODE_AUTO && !mvc_api.display_3d())
++    if (!b_3d)
+     {
+         msg_Info(p_dec, "3D MVC: the display has no 3D, 2D (base view)");
+         return;
+@@ -2230,6 +2539,47 @@ static void MvcProbe(decoder_t *p_dec, const block_t *p_block)
+         p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+ 
++/*
++ * The api of the stopped decoder: to the hardware MVC one (b_hw), or back to
++ * MediaCodec when that does not start (3D then through the software path).
++ */
++static void MvcHwSwitch(decoder_t *p_dec, bool b_hw)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    mc_api *api = &p_sys->api;
++    vlc_object_t *p_obj = api->p_obj;
++    const char *psz_mime = api->psz_mime;
++    enum es_format_category_e i_cat = api->i_cat;
++    vlc_fourcc_t i_codec = api->i_codec;
++
++    api->clean(api);
++    memset(api, 0, sizeof(*api));
++    api->p_obj = p_obj;
++    api->psz_mime = psz_mime;
++    api->i_cat = i_cat;
++    api->i_codec = i_codec;
++    if (b_hw && MvcHw_Init(api, p_sys->video.i_mvc_width, p_sys->video.i_mvc_height,
++                           p_sys->video.b_mvc_fp) == VLC_SUCCESS)
++    {
++        api->configure(api, p_sys->video.i_profile);
++        p_sys->video.b_mvc_hw = true;
++        return;
++    }
++    p_sys->video.b_mvc_hw = false;
++    p_sys->video.b_mvc_hw_want = false;
++    if (p_sys->pf_init(api) != 0 || api->configure(api, p_sys->video.i_profile) != 0)
++    {
++        msg_Err(p_dec, "MediaCodec back: failed");
++        return;
++    }
++    if (p_sys->video.b_mvc_fp && !p_sys->video.p_mvc && mvc_api.available())
++    {
++        p_sys->video.p_mvc = mvc_api.open(p_sys->video.i_mvc_width, p_sys->video.i_mvc_height);
++        if (p_sys->video.p_mvc)
++            msg_Info(p_dec, "3D MVC: frame packing, software decoder");
++    }
++}
++
+ /*
+  * The player's information panel: the live Dolby Vision level 1 (min / max /
+  * average PQ of the RPU's DM data, 12 bits) and level 5 (active area offsets:
+-- 
+2.55.0.windows.3
+

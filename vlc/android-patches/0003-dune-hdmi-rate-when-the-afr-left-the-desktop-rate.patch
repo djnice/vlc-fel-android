@@ -1,0 +1,167 @@
+diff --git a/application/vlc-android/AndroidManifest.xml b/application/vlc-android/AndroidManifest.xml
+index 622f418..687f6fc 100644
+--- a/application/vlc-android/AndroidManifest.xml
++++ b/application/vlc-android/AndroidManifest.xml
+@@ -66,6 +66,9 @@
+ 
+     <application>
+ 
++        <!-- Amlogic SystemControl (Dune HD / R_volution: the HDMI rate, DuneDesktopMode) -->
++        <uses-library android:name="droidlogic.software.core" android:required="false" />
++
+         <!-- Enable VLC in Samsung multiwindow mode -->
+         <meta-data
+             android:name="com.samsung.android.sdk.multiwindow.enable"
+diff --git a/application/vlc-android/src/org/videolan/vlc/gui/video/VideoPlayerActivity.kt b/application/vlc-android/src/org/videolan/vlc/gui/video/VideoPlayerActivity.kt
+index 79293d8..52f50e6 100644
+--- a/application/vlc-android/src/org/videolan/vlc/gui/video/VideoPlayerActivity.kt
++++ b/application/vlc-android/src/org/videolan/vlc/gui/video/VideoPlayerActivity.kt
+@@ -230,6 +230,7 @@ import org.videolan.vlc.util.FileUtils
+ import org.videolan.vlc.util.FileUtils.getUri
+ import org.videolan.vlc.util.FlagSet
+ import org.videolan.vlc.util.FrameRateManager
++import org.videolan.vlc.util.DuneDesktopMode
+ import org.videolan.vlc.util.IDialogManager
+ import org.videolan.vlc.util.LocaleUtil
+ import org.videolan.vlc.util.LocaleUtil.localeEquivalent
+@@ -983,6 +984,7 @@ open class VideoPlayerActivity : AppCompatActivity(), PlaybackService.Callback,
+         }
+         cleanUI()
+         stopPlayback()
++        DuneDesktopMode.onStop(applicationContext)
+         service?.playlistManager?.videoStatsOn?.postValue(false)
+         if (isInteractive && !isPlayingPopup)
+             service?.isInPiPMode?.value = false
+@@ -1758,6 +1760,8 @@ open class VideoPlayerActivity : AppCompatActivity(), PlaybackService.Callback,
+             val surfaceView = rootView?.findViewById<View>(R.id.surface_video) as SurfaceView
+             FrameRateManager(this, service!!).matchFrameRate(surfaceView, window)
+         }
++        // Dune HD / R_volution: the HDMI rate when the firmware's AFR left the desktop rate
++        service?.let { DuneDesktopMode.onPlaying(this, it) }
+         overlayDelegate.updatePlaybackSpeedChip()
+     }
+ 
+diff --git a/application/vlc-android/src/org/videolan/vlc/util/DuneDesktopMode.kt b/application/vlc-android/src/org/videolan/vlc/util/DuneDesktopMode.kt
+new file mode 100644
+index 0000000..7d790da
+--- /dev/null
++++ b/application/vlc-android/src/org/videolan/vlc/util/DuneDesktopMode.kt
+@@ -0,0 +1,118 @@
++package org.videolan.vlc.util
++
++import android.content.Context
++import android.util.Log
++import androidx.fragment.app.FragmentActivity
++import androidx.lifecycle.lifecycleScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import org.videolan.vlc.PlaybackService
++import org.videolan.vlc.getSelectedVideoTrack
++
++/**
++ * The HDMI refresh rate on Dune HD / R_volution (Amlogic) firmware.
++ *
++ * The firmware's AFR switches the HDMI mode for a third-party player from the
++ * frame rate of its MediaCodec video decoder. Without one it stays at the
++ * desktop rate: 3D MVC on the hardware MVC decoder (libmvc3dplay, no
++ * MediaCodec), whose frame packed HDMI output needs a 24 Hz mode, or a stream
++ * without VUI timing (the kernel decoder says 60 fps). Android sees only the
++ * current mode, so no public API switches it; the firmware's own way is
++ * Amlogic SystemControl (droidlogic SystemControlManager, shared library
++ * droidlogic.software.core): a mode set there reaches SurfaceFlinger too.
++ *
++ * With the AFR on (dune.afrc.afr = 1) and, once it had its time, the mode's
++ * rate not the film's, the rate is switched here (the resolution stays, as
++ * the user's dune.afrc.ar = 0 keeps it; 23.976 / 29.97 / 59.94 fps take the
++ * fractional rate policy). At the end the mode before the playback comes back,
++ * when it was switched here.
++ */
++object DuneDesktopMode {
++    private const val TAG = "VLC/DuneDesktopMode"
++    private const val FRAC = "ubootenv.var.frac_rate_policy"
++    /* the firmware's AFR decides about 6 s after the decoder started */
++    private const val AFR_WAIT_MS = 8000L
++    private val hz = Regex("""(\d+)(\.\d+)?hz$""")
++
++    private var checked: String? = null
++    private var job: Job? = null
++    private var before: String? = null
++    private var beforeFrac: String? = null
++    private var switched = false
++
++    private fun scm(): Any? = runCatching {
++        Class.forName("com.droidlogic.app.SystemControlManager").getMethod("getInstance").invoke(null)
++    }.getOrNull()
++
++    private fun call(o: Any, name: String) = o.javaClass.getMethod(name).invoke(o) as? String
++
++    private fun bootenv(s: Any, key: String) =
++        s.javaClass.getMethod("getBootenv", String::class.java, String::class.java).invoke(s, key, "0") as? String
++
++    private fun sysprop(name: String): String = runCatching {
++        Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, name) as String
++    }.getOrDefault("")
++
++    /** a media plays (every Playing event: once per media) */
++    fun onPlaying(activity: FragmentActivity, service: PlaybackService) {
++        val key = service.currentMediaWrapper?.uri?.toString() ?: return
++        if (key == checked || sysprop("dune.afrc.afr") != "1") return
++        checked = key
++        job?.cancel()
++        job = activity.lifecycleScope.launch(Dispatchers.IO) {
++            val s = scm() ?: return@launch
++            if (before == null) runCatching {
++                before = call(s, "getActiveDispMode")?.trim()
++                beforeFrac = bootenv(s, FRAC)
++            }
++            delay(AFR_WAIT_MS)
++            val v = runCatching { service.mediaplayer.getSelectedVideoTrack() }.getOrNull() ?: return@launch
++            if (v.getFrameRateNum() <= 0 || v.getFrameRateDen() <= 0) return@launch
++            matchRate(s, v.getFrameRateNum().toDouble() / v.getFrameRateDen())
++        }
++    }
++
++    private fun matchRate(s: Any, fps: Double) {
++        if (fps < 23.0 || fps > 61.0) return
++        runCatching {
++            val cur = call(s, "getActiveDispMode")?.trim() ?: return
++            val m = hz.find(cur) ?: return
++            val rate = Math.round(fps).toInt()
++            val frac = if (Math.abs(fps - rate) > 0.01) "1" else "0"
++            val want = cur.substring(0, m.range.first) + rate + "hz"
++            val curFrac = bootenv(s, FRAC)
++            if (want == cur && frac == curFrac) return
++            Log.i(TAG, "AFR did not switch: $cur -> $want (frac_rate_policy $curFrac -> $frac) for %.3f fps".format(fps))
++            s.javaClass.getMethod("setBootenv", String::class.java, String::class.java).invoke(s, FRAC, frac)
++            s.javaClass.getMethod("setMboxOutputMode", String::class.java).invoke(s, want)
++            switched = true
++        }.onFailure { Log.w(TAG, "matchRate", (it as? java.lang.reflect.InvocationTargetException)?.cause ?: it) }
++    }
++
++    /** the player goes away: the mode before the playback, when it was switched here */
++    fun onStop(ctx: Context) {
++        job?.cancel()
++        job = null
++        checked = null
++        val want = before
++        val frac = beforeFrac
++        val restore = switched
++        before = null
++        beforeFrac = null
++        switched = false
++        if (!restore || want.isNullOrEmpty()) return
++        /* blocking while the TV syncs: not on the main thread */
++        Thread {
++            val s = scm() ?: return@Thread
++            runCatching {
++                if (call(s, "getActiveDispMode")?.trim() == want) return@Thread
++                Log.i(TAG, "restore $want (frac_rate_policy $frac)")
++                if (frac != null)
++                    s.javaClass.getMethod("setBootenv", String::class.java, String::class.java).invoke(s, FRAC, frac)
++                s.javaClass.getMethod("setMboxOutputMode", String::class.java).invoke(s, want)
++            }.onFailure { Log.w(TAG, "restore", (it as? java.lang.reflect.InvocationTargetException)?.cause ?: it) }
++        }.start()
++    }
++}

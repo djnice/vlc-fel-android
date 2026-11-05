@@ -32,7 +32,7 @@
 
 #define MVC3D_DEV		"/dev/mvc3d"
 /* module version (/sys/module/mvc3d/version) */
-#define MVC3D_VERSION		"2026.10.12.3"
+#define MVC3D_VERSION		"2026.10.18.1"
 
 #define MVC3D_MAX_BUFS		16
 #define MVC3D_FMT_UYVY		0
@@ -103,5 +103,64 @@ struct mvc3d_buf {
  * (1920x2205 / 1280x1470); /sys/module/mvc3d/parameters/fp_out tells
  */
 #define MVC3D_IOC_SET_FP	_IOW(MVC3D_IOC_MAGIC, 7, __u32)
+
+/*
+ * /dev/mvc3dhw - hardware MVC decoding (no software decoder, no MediaCodec)
+ *
+ * The player feeds the stream (frame_num rewritten, see libmvc3dplay
+ * mvcfnr) to the legacy Amlogic MVC decoder (/dev/amstream_vbuf,
+ * VFORMAT_H264MVC). While a client has MVC3D_HW_START'ed, the decoder's
+ * pictures (both views) come here ("decoder.h264mvc mvc3dhw" in place of the
+ * vfm map "default"); mvc3d composes each into one of the client's uvm
+ * buffers (/dev/uvm, packed 4:2:2 UYVY, stride = width * 2): frame packed
+ * (L, active space, R) or the base view alone (2D), and attaches the vframe
+ * of that picture to the buffer as the decoder's. The client queues the
+ * buffer into a video tunnel (/dev/videotunnel) at its display time; the
+ * window's sideband stream (Amlogic type 0x400, channel = tunnel id) makes
+ * the HWC show it through video_composer.0 (-> mvc3d -> video_render.0).
+ *
+ * Pictures come in display order (MVC3D_HW_WAIT). The decoder's first two
+ * pictures after a start are not valid (seq 0 and 1: drop them; they stand for
+ * the stream's first two pictures, which never come); its last pictures stay
+ * in it at the end of the stream.
+ */
+#define MVC3D_HW_DEV		"/dev/mvc3dhw"
+#define MVC3D_HW_MAX_BUFS	12
+#define MVC3D_HW_2D		0
+#define MVC3D_HW_FP		1
+
+struct mvc3d_hw_start {
+	__u32 width;		/* in: one view (1920x1080 or 1280x720) */
+	__u32 height;
+	__u32 mode;		/* in: MVC3D_HW_2D / MVC3D_HW_FP */
+	__u32 out_height;	/* out: picture height (2D: height; FP: 2 * height + active space) */
+	__u32 stride;		/* out: bytes per line (width * 2) */
+	__u32 gen;		/* out: pictures of this start have this gen (MVC3D_HW_FLUSH changes it) */
+	__u32 reserved[2];
+};
+
+struct mvc3d_hw_buf {
+	__s32 fd;		/* ADD_BUF in: uvm dma-buf of >= stride * out_height bytes */
+	__s32 index;		/* ADD_BUF out, RELEASE in */
+};
+
+struct mvc3d_hw_pic {
+	__u32 timeout_ms;	/* in */
+	__s32 index;		/* out: the buffer holding the picture (client owns it now) */
+	__u32 seq;		/* out: decoder picture number since the decoder started */
+	__u32 gen;		/* out: MVC3D_HW_FLUSH count */
+	__u64 decoded_ns;	/* out: CLOCK_MONOTONIC when composed */
+	__u32 reserved[2];
+};
+
+#define MVC3D_HW_START		_IOWR(MVC3D_IOC_MAGIC, 0x20, struct mvc3d_hw_start)
+#define MVC3D_HW_ADD_BUF	_IOWR(MVC3D_IOC_MAGIC, 0x21, struct mvc3d_hw_buf)
+#define MVC3D_HW_WAIT		_IOWR(MVC3D_IOC_MAGIC, 0x22, struct mvc3d_hw_pic)
+/* the buffer is back from the display (video tunnel) or dropped */
+#define MVC3D_HW_RELEASE	_IOW(MVC3D_IOC_MAGIC, 0x23, struct mvc3d_hw_buf)
+/* seek: pictures not yet taken are dropped; out: the gen of the pictures from now on */
+#define MVC3D_HW_FLUSH		_IOR(MVC3D_IOC_MAGIC, 0x24, __u32)
+/* __u32 as MVC3D_IOC_SET_FP */
+#define MVC3D_HW_SET_FP		_IOW(MVC3D_IOC_MAGIC, 0x25, __u32)
 
 #endif

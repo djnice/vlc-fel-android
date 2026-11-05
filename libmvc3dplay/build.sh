@@ -29,7 +29,7 @@ mkdir -p "$OUT/armeabi-v7a"
 $CLANG -O2 -Wall -Wextra -Wno-unused-parameter -fPIC -shared -fvisibility=hidden \
   -I"$SRC/include" -I"$SRC/src" -I"$MVC3D_UAPI" -DMVC3D_HAVE_KO -DMVC3D_KO="\"$MVC3D_KO\"" \
   -o "$OUT/armeabi-v7a/libmvc3dplay.so" \
-  "$SRC/src/mvc3dplay.c" "$SRC/src/module_install.c" "$SRC/src/module_blob.S" \
+  "$SRC/src/mvc3dplay.c" "$SRC/src/mvc3dhw.c" "$SRC/src/mvcfnr.c" "$SRC/src/module_install.c" "$SRC/src/module_blob.S" \
   -llog -ldl -Wl,-z,max-page-size=16384 -Wl,--gc-sections
 $AARCH64_CC -O3 -march=armv8.2-a -mtune=cortex-a76 -Wall -static -s \
   -I"$EDGE264" -I"$MVC3D_UAPI" -I"$SRC/src" -o "$OUT/armeabi-v7a/libmvc3dhelper.so" \

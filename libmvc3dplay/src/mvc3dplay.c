@@ -30,7 +30,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define MVC3D_LIB_VERSION "2026.10.12"
+#define MVC3D_LIB_VERSION "2026.11.05.1"
 #define HELPER_NAME "libmvc3dhelper.so"
 #define MODULE_DEV "/dev/mvc3d"
 

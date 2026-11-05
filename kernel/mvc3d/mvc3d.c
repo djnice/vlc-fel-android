@@ -21,6 +21,10 @@
  * picture one vsync after the composer released the frame; a player that
  * renders its frames ahead (MVC3D_IOC_SET_LEAD) gets that back: mvc3d holds
  * each picture to the vsync it was meant for.
+ *
+ * Hardware MVC (mvc3d_hw.c, /dev/mvc3dhw): the legacy MVC decoder's pictures are composed here
+ * into the player's uvm buffers, which reach the video composer through a video tunnel; mvc3d
+ * passes them through (frame packed: 1:1 on the whole output).
  */
 
 #include <linux/module.h>
@@ -630,6 +634,7 @@ struct m3_dev {
 	int dump_left;
 	bool vc_on;
 	struct work_struct vc_work;
+	bool hw_on;			/* a /dev/mvc3dhw client plays: its tunnel frames pass through */
 
 	/* jobs (display order) and output queue */
 	struct m3_job jobs[QUEUE_LEN];
@@ -985,7 +990,7 @@ static void reset_locked(struct m3_dev *d)
 static void vc_path_apply(struct m3_dev *d)
 {
 	char id[64], chain[128];
-	bool want = d->client_ready || vc_route;
+	bool want = d->client_ready || vc_route || d->hw_on;
 
 	if (want == d->vc_on)
 		return;
@@ -1184,6 +1189,9 @@ static int m3_thread(void *data)
 			u32 due = 0, gen;
 			int pi = -1;
 
+			/* hardware MVC: the display takes the frames itself (m3_get) */
+			if (READ_ONCE(d->hw_on))
+				break;
 			if (!vc_may_get(d))
 				break;
 			spin_lock_irqsave(&d->lock, flags);
@@ -1284,12 +1292,31 @@ static void m3_kick(struct m3_dev *d)
 /* provider side (the display calls us, often from the vsync irq)     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * hardware MVC: the tunnel frames go straight through (no thread in between, which would move
+ * a frame released just before a vsync to the next one); frame packed: 1:1 on the whole output
+ */
+static void hw_fix_axis(struct vframe_s *vf)
+{
+	if (vf && READ_ONCE(fp_out) && vf->height > 1400) {
+		vf->axis[0] = 0;
+		vf->axis[1] = 0;
+		vf->axis[2] = vf->width - 1;
+		vf->axis[3] = vf->height - 1;
+	}
+}
+
 static struct vframe_s *m3_peek(void *op_arg)
 {
 	struct m3_dev *d = op_arg;
 	struct vframe_s *vf = NULL;
 	unsigned long flags;
 
+	if (READ_ONCE(d->hw_on)) {
+		vf = d->prov_reg ? vf_peek(DRV_NAME) : NULL;
+		hw_fix_axis(vf);
+		return vf;
+	}
 	spin_lock_irqsave(&d->lock, flags);
 	vs_tick_locked(d);
 	if (d->out_cnt && outq_visible_locked(d, 0))
@@ -1304,6 +1331,13 @@ static struct vframe_s *m3_get(void *op_arg)
 	struct vframe_s *vf = NULL;
 	unsigned long flags;
 
+	if (READ_ONCE(d->hw_on)) {
+		vf = d->prov_reg ? vf_get(DRV_NAME) : NULL;
+		hw_fix_axis(vf);
+		if (vf)
+			d->passed++;
+		return vf;
+	}
 	spin_lock_irqsave(&d->lock, flags);
 	vs_tick_locked(d);
 	if (d->out_cnt && outq_visible_locked(d, 0)) {
@@ -1350,6 +1384,21 @@ static void m3_put(struct vframe_s *vf, void *op_arg)
 
 	if (!vf)
 		return;
+	/* a frame the display took straight from the composer (hardware MVC, also after its end) */
+	if (!buf_of(d, vf)) {
+		bool pass = false;
+
+		spin_lock_irqsave(&d->lock, flags);
+		for (i = 0; i < QUEUE_LEN; i++)
+			if (d->pass[i] == vf)
+				pass = true;
+		spin_unlock_irqrestore(&d->lock, flags);
+		if (!pass) {
+			if (d->prov_reg)
+				vf_put(vf, DRV_NAME);
+			return;
+		}
+	}
 	spin_lock_irqsave(&d->lock, flags);
 	b = buf_of(d, vf);
 	if (b) {
@@ -1385,6 +1434,12 @@ static int m3_vf_states(struct vframe_states *states, void *op_arg)
 	unsigned long flags;
 	int i, nfree = 0;
 
+	if (READ_ONCE(d->hw_on) && d->prov_reg) {
+		struct vframe_provider_s *up = vf_get_provider(DRV_NAME);
+
+		if (up && !vf_get_states(up, states))
+			return 0;
+	}
 	spin_lock_irqsave(&d->lock, flags);
 	for (i = 0; i < d->nbufs; i++)
 		if (d->bufs[i].state == BUF_FREE)
@@ -1780,7 +1835,7 @@ static int m3_open(struct inode *inode, struct file *f)
 	int ret = 0;
 
 	mutex_lock(&d->mlock);
-	if (d->owner)
+	if (d->owner || d->hw_on)
 		ret = -EBUSY;
 	else
 		d->owner = f;
@@ -1897,6 +1952,25 @@ static const struct file_operations stats_reset_fops = {
 	.write = stats_reset_write,
 };
 
+/* the hardware path (/dev/mvc3dhw) uses the video composer route; not with a software client */
+static int m3_hw_attach(bool on)
+{
+	struct m3_dev *d = gdev;
+	int ret = 0;
+
+	mutex_lock(&d->mlock);
+	if (on && d->owner) {
+		ret = -EBUSY;
+	} else {
+		d->hw_on = on;
+		vc_path_apply(d);
+	}
+	mutex_unlock(&d->mlock);
+	return ret;
+}
+
+#include "mvc3d_hw.c"
+
 /* ------------------------------------------------------------------ */
 /* module                                                             */
 /* ------------------------------------------------------------------ */
@@ -1937,6 +2011,9 @@ static int __init m3_init(void)
 	d->dbg = debugfs_create_dir(DRV_NAME, NULL);
 	debugfs_create_file("stats", 0444, d->dbg, NULL, &stats_fops);
 	debugfs_create_file("stats_reset", 0200, d->dbg, NULL, &stats_reset_fops);
+	ret = mvc3d_hw_init(d->dbg);
+	if (ret)
+		goto fail_misc;
 	/* the firmware's code tells; the list of checked kernel builds is the fallback */
 	if (fp_flags_off < 0)
 		fp_flags_off = fp_flags_scan();
@@ -1966,6 +2043,9 @@ static int __init m3_init(void)
 		MVC3D_VERSION, vc_map_id);
 	return 0;
 
+fail_misc:
+	debugfs_remove_recursive(d->dbg);
+	misc_deregister(&d->misc);
 fail_thread:
 	kthread_stop(d->thread);
 fail_recv:
@@ -1981,6 +2061,7 @@ static void __exit m3_exit(void)
 	struct m3_dev *d = gdev;
 	bool playing;
 
+	mvc3d_hw_exit();
 	if (plane_probe_on)
 		unregister_kprobe(&plane_check_probe);
 	if (fp_probe_on) {

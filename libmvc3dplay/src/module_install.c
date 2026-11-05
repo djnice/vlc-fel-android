@@ -79,6 +79,8 @@ static const char INSTALL_SCRIPT[] =
 	"i=0\n"
 	"while [ ! -e /dev/mvc3d ] && [ \\$i -lt 50 ]; do sleep 0.1; i=\\$((i + 1)); done\n"
 	"chmod 666 /dev/mvc3d\n"
+	"# the hardware MVC path (mvc3d 2026.10.18 and newer)\n"
+	"[ -e /dev/mvc3dhw ] && chmod 666 /dev/mvc3dhw\n"
 	"EOS\n"
 	"if cmp -s \"$D/boot/mvc3d.sh.tmp\" \"$D/boot/mvc3d.sh\"; then\n"
 	"  rm -f \"$D/boot/mvc3d.sh.tmp\"\n"
@@ -89,6 +91,9 @@ static const char INSTALL_SCRIPT[] =
 	"i=0\n"
 	"while [ ! -e /dev/mvc3d ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done\n"
 	"chmod 666 /dev/mvc3d || exit 7\n"
+	"i=0\n"
+	"while [ ! -e /dev/mvc3dhw ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i + 1)); done\n"
+	"[ -e /dev/mvc3dhw ] && chmod 666 /dev/mvc3dhw\n"
 	"echo \"mvc3d $(cat /sys/module/mvc3d/version 2>/dev/null) ready\"\n";
 
 static void logi(const char *fmt, const char *a, const char *b)
