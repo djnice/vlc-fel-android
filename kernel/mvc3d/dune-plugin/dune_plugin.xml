@@ -1,0 +1,35 @@
+<dune_plugin>
+  <name>mvc3d</name>
+  <caption>3D MVC (S928X, S905X4)</caption>
+  <global_actions>
+    <boot_end>
+      <type>plugin_system</type>
+      <data>
+        <run_string>bin/ctl.sh boot &amp;</run_string>
+      </data>
+    </boot_end>
+    <install>
+      <type>plugin_system</type>
+      <data>
+        <run_string>bin/ctl.sh install</run_string>
+        <handle_response>yes</handle_response>
+      </data>
+    </install>
+    <update>
+      <type>plugin_system</type>
+      <data>
+        <run_string>bin/ctl.sh install</run_string>
+        <handle_response>yes</handle_response>
+      </data>
+    </update>
+    <uninstall>
+      <type>plugin_system</type>
+      <data>
+        <run_string>bin/ctl.sh uninstall</run_string>
+      </data>
+    </uninstall>
+  </global_actions>
+  <type>plain</type>
+  <version>2026.11.06.1-0.2.21</version>
+  <version_index>1</version_index>
+</dune_plugin>
