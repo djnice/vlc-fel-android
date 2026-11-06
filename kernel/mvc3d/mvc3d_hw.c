@@ -643,6 +643,12 @@ static long hw_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	unsigned long flags;
 	long r;
 
+	if (cmd == MVC3D_HW_START) {
+		mutex_lock(&h->mlock);
+		if (!h->owner)
+			h->owner = f;
+		mutex_unlock(&h->mlock);
+	}
 	if (h->owner != f)
 		return -EBUSY;
 	switch (cmd) {
@@ -689,16 +695,49 @@ static long hw_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 static int hw_open(struct inode *inode, struct file *f)
 {
-	struct hw_dev *h = ghw;
-	int r = 0;
+	return 0;	/* the first MVC3D_HW_START makes this file the owner */
+}
 
+/*
+ * The player, before its film (no ioctl from Java): write "arm" on a file of this device = frame packing wanted until
+ * the file's close or the end of the film (the hardware or the software client), so the mode set the player does now,
+ * before the decoder opens, is already the frame packed one. read: "armed=N on=N started=N\n", on = the HDMI output is
+ * frame packed, started = a decoder client runs (not: the player has no 3D, it gives the mode back).
+ */
+static struct file *fp_armer;
+
+static ssize_t hw_write(struct file *f, const char __user *u, size_t n, loff_t *pos)
+{
+	struct hw_dev *h = ghw;
+	char c[8] = "";
+	int r = n;
+
+	if (copy_from_user(c, u, min(n, sizeof(c) - 1)))
+		return -EFAULT;
+	if (strncmp(c, "arm", 3))
+		return -EINVAL;
+	if (!fp_probe_on)
+		return -ENODEV;
 	mutex_lock(&h->mlock);
-	if (h->owner)
+	if (fp_armer && fp_armer != f) {
 		r = -EBUSY;
-	else
-		h->owner = f;
+	} else {
+		fp_armer = f;
+		WRITE_ONCE(fp_client, true);
+		pr_info(HW_NAME ": frame packing armed before the film\n");
+	}
 	mutex_unlock(&h->mlock);
 	return r;
+}
+
+static ssize_t hw_read(struct file *f, char __user *u, size_t n, loff_t *pos)
+{
+	char c[48];
+	loff_t at = 0;	/* always the whole line: a status */
+	int len = scnprintf(c, sizeof(c), "armed=%d on=%d started=%d\n", READ_ONCE(fp_client), READ_ONCE(fp_out),
+			    READ_ONCE(ghw->started) || READ_ONCE(gdev->owner));
+
+	return simple_read_from_buffer(u, n, &at, c, len);
 }
 
 static int hw_release(struct inode *inode, struct file *f)
@@ -712,6 +751,12 @@ static int hw_release(struct inode *inode, struct file *f)
 		WRITE_ONCE(fp_client, false);
 		h->owner = NULL;
 	}
+	if (fp_armer == f) {
+		fp_armer = NULL;
+		/* no film came: the next mode set is 2D again (a software client: its own close does this) */
+		if (!h->started && !READ_ONCE(gdev->owner))
+			WRITE_ONCE(fp_client, false);
+	}
 	mutex_unlock(&h->mlock);
 	return 0;
 }
@@ -720,6 +765,9 @@ static const struct file_operations hw_fops = {
 	.owner = THIS_MODULE,
 	.open = hw_open,
 	.release = hw_release,
+	.read = hw_read,
+	.write = hw_write,
+	.llseek = noop_llseek,
 	.unlocked_ioctl = hw_ioctl,
 	.compat_ioctl = hw_ioctl,
 };

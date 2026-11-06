@@ -1,0 +1,141 @@
+From 15daee50fae5566c871339d2feb0ff11858498b0 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Fri, 6 Nov 2026 10:07:18 +0100
+Subject: [PATCH] VLC FEL: the 3D MVC decoder of the S928X, hardware or
+ software (Video settings); the frame packing mode without a known rate
+
+---
+ .../java/org/videolan/resources/VLCOptions.kt | 11 +++++++++++
+ .../ui/preferences/PreferencesVideo.kt        |  4 +++-
+ .../vlc-android/res/xml/preferences_video.xml |  7 +++++++
+ .../vlc/gui/preferences/PreferencesVideo.kt   |  4 +++-
+ .../org/videolan/vlc/util/DuneDesktopMode.kt  | 19 ++++++++++++++++---
+ 5 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/application/resources/src/main/java/org/videolan/resources/VLCOptions.kt b/application/resources/src/main/java/org/videolan/resources/VLCOptions.kt
+index 7599ef8..37ee504 100644
+--- a/application/resources/src/main/java/org/videolan/resources/VLCOptions.kt
++++ b/application/resources/src/main/java/org/videolan/resources/VLCOptions.kt
+@@ -77,6 +77,15 @@ import java.io.File
+ import java.util.Collections
+ 
+ object VLCOptions {
++    /** VLC FEL: the S928X (S5), the box whose 3D MVC can be decoded in software too (the S905X4: hardware only) */
++    val isS928x: Boolean by lazy {
++        try {
++            File("/proc/device-tree/compatible").readText().replace('\u0000', ' ').split(' ', ',').any { it.trim() == "s5" }
++        } catch (e: Exception) {
++            false
++        }
++    }
++
+     private const val TAG = "VLC/VLCConfig"
+ 
+     private const val AOUT_AAUDIO = 0
+@@ -212,6 +221,8 @@ object VLCOptions {
+             }
+             options.add("--sout-keep")
+ 
++            // VLC FEL: the 3D MVC decoder of the S928X, hardware or software (the setting mvc_hardware)
++            if (isS928x) options.add("--mediacodec-mvc-hw=" + if (pref.getBoolean("mvc_hardware", false)) "1" else "0")
+             val customOptions = pref.getString(KEY_CUSTOM_LIBVLC_OPTIONS, null)
+             if (!customOptions.isNullOrEmpty()) {
+                 val optionsArray = customOptions.split("\\r?\\n".toRegex()).toTypedArray()
+diff --git a/application/television/src/main/java/org/videolan/television/ui/preferences/PreferencesVideo.kt b/application/television/src/main/java/org/videolan/television/ui/preferences/PreferencesVideo.kt
+index 6c22b34..7a4e69d 100644
+--- a/application/television/src/main/java/org/videolan/television/ui/preferences/PreferencesVideo.kt
++++ b/application/television/src/main/java/org/videolan/television/ui/preferences/PreferencesVideo.kt
+@@ -42,6 +42,8 @@ class PreferencesVideo : BasePreferenceFragment(), SharedPreferences.OnSharedPre
+ 
+     override fun onStart() {
+         super.onStart()
++        // VLC FEL: only the S928X has a choice of 3D MVC decoder
++        findPreference<androidx.preference.Preference>("mvc_hardware")?.isVisible = org.videolan.resources.VLCOptions.isS928x
+         preferenceScreen.sharedPreferences!!.registerOnSharedPreferenceChangeListener(this)
+     }
+ 
+@@ -53,7 +55,7 @@ class PreferencesVideo : BasePreferenceFragment(), SharedPreferences.OnSharedPre
+     override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
+         if (sharedPreferences == null || key == null) return
+         when (key) {
+-            KEY_PREFERRED_RESOLUTION -> {
++            KEY_PREFERRED_RESOLUTION, "mvc_hardware" -> {
+                 launch {
+                     VLCInstance.restart()
+                     restartMediaPlayer()
+diff --git a/application/vlc-android/res/xml/preferences_video.xml b/application/vlc-android/res/xml/preferences_video.xml
+index 9ba89a0..1786f26 100644
+--- a/application/vlc-android/res/xml/preferences_video.xml
++++ b/application/vlc-android/res/xml/preferences_video.xml
+@@ -4,6 +4,13 @@
+                                       xmlns:app="http://schemas.android.com/apk/res-auto"
+                                       android:key="video_category"
+                                       android:title="@string/video_prefs_category">
++    <CheckBoxPreference
++            app:singleLineTitle="false"
++            android:defaultValue="false"
++            android:key="mvc_hardware"
++            android:summary="S928X: on, the hardware decoder; off, the software decoder. From the next video."
++            android:title="3D MVC: hardware decoder"/>
++
+     <CheckBoxPreference
+             app:singleLineTitle="false"
+             android:defaultValue="false"
+diff --git a/application/vlc-android/src/org/videolan/vlc/gui/preferences/PreferencesVideo.kt b/application/vlc-android/src/org/videolan/vlc/gui/preferences/PreferencesVideo.kt
+index 2fdc6e5..7585101 100644
+--- a/application/vlc-android/src/org/videolan/vlc/gui/preferences/PreferencesVideo.kt
++++ b/application/vlc-android/src/org/videolan/vlc/gui/preferences/PreferencesVideo.kt
+@@ -55,6 +55,8 @@ class PreferencesVideo : BasePreferenceFragment(), SharedPreferences.OnSharedPre
+ 
+     override fun onStart() {
+         super.onStart()
++        // VLC FEL: only the S928X has a choice of 3D MVC decoder
++        findPreference<androidx.preference.Preference>("mvc_hardware")?.isVisible = org.videolan.resources.VLCOptions.isS928x
+         preferenceScreen.sharedPreferences!!.registerOnSharedPreferenceChangeListener(this)
+     }
+ 
+@@ -67,7 +69,7 @@ class PreferencesVideo : BasePreferenceFragment(), SharedPreferences.OnSharedPre
+     override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
+         if (sharedPreferences == null || key == null) return
+         when (key) {
+-            KEY_PREFERRED_RESOLUTION -> {
++            KEY_PREFERRED_RESOLUTION, "mvc_hardware" -> {
+                 lifecycleScope.launch {
+                     VLCInstance.restart()
+                     restartMediaPlayer()
+diff --git a/application/vlc-android/src/org/videolan/vlc/util/DuneDesktopMode.kt b/application/vlc-android/src/org/videolan/vlc/util/DuneDesktopMode.kt
+index 7d790da..6943a36 100644
+--- a/application/vlc-android/src/org/videolan/vlc/util/DuneDesktopMode.kt
++++ b/application/vlc-android/src/org/videolan/vlc/util/DuneDesktopMode.kt
+@@ -68,12 +68,25 @@ object DuneDesktopMode {
+                 beforeFrac = bootenv(s, FRAC)
+             }
+             delay(AFR_WAIT_MS)
+-            val v = runCatching { service.mediaplayer.getSelectedVideoTrack() }.getOrNull() ?: return@launch
+-            if (v.getFrameRateNum() <= 0 || v.getFrameRateDen() <= 0) return@launch
+-            matchRate(s, v.getFrameRateNum().toDouble() / v.getFrameRateDen())
++            val v = runCatching { service.mediaplayer.getSelectedVideoTrack() }.getOrNull()
++            if (v != null && v.getFrameRateNum() > 0 && v.getFrameRateDen() > 0) {
++                matchRate(s, v.getFrameRateNum().toDouble() / v.getFrameRateDen())
++            } else if (mvcFramePacking()) {
++                // a Blu-ray 3D's .ssif / m2ts tells VLC no rate, and frame packing needs its 24 Hz mode
++                matchRate(s, 24000.0 / 1001)
++            }
+         }
+     }
+ 
++    /** the hardware MVC decoder plays frame packed (the mvc3d module's status; old modules have none) */
++    private fun mvcFramePacking() = runCatching {
++        java.io.RandomAccessFile("/dev/mvc3dhw", "r").use { f ->
++            val b = ByteArray(48)
++            val n = f.read(b)
++            n > 0 && String(b, 0, n).contains("armed=1")
++        }
++    }.getOrDefault(false)
++
+     private fun matchRate(s: Any, fps: Double) {
+         if (fps < 23.0 || fps > 61.0) return
+         runCatching {
+-- 
+2.55.0.windows.3
+

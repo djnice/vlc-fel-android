@@ -50,6 +50,11 @@ ellenőrzött kprobe-okkal pótolja, amit a Dune 5.4 `aml_media` az MVC frame pa
 FEL appal még nem. Az appból a modul a film előtt élesíthető: „arm” a `/dev/mvc3dhw`-re (a VLC FEL ezt még nem használja, ott a módváltás
 a kép után jön).
 
+### Kapcsoló S928X-en
+
+Beállítások → Videó → „3D MVC: hardware decoder” (csak S928X-en látszik; alapból ki: szoftveres). `vlc/android-patches/0004`. A .ssif-nek nincs
+rátája a VLC-ben: a frame packinghez a `DuneDesktopMode` 23,976 Hz-et választ, ha a modul élesítve van. A módváltás itt a kép után ~8 s-mal jön.
+
 ## English
 
 The S928X's own MVC decoder corrupts the dependent view when `frame_num` wraps around. CoreELEC's fix
@@ -79,3 +84,8 @@ checked against the r25 code, what Dune's 5.4 `aml_media` lacks for MVC frame pa
 `vd_set_dcu`, `vpp_set_filters`, `config_vd_position`). Tested on a projector with the CineFuze test APK (.ssif, mkv, mk3d, m2ts, ISO), not
 yet with the VLC FEL app. A player can arm frame packing before its film: write "arm" on `/dev/mvc3dhw` (VLC FEL does not do that yet: its
 mode switch comes after the picture).
+
+### The switch on the S928X
+
+Settings > Video > "3D MVC: hardware decoder" (shown on the S928X only; off by default: software). `vlc/android-patches/0004`. A .ssif has no rate in
+VLC: `DuneDesktopMode` takes 23.976 Hz for frame packing when the module is armed. The mode switch comes ~8 s after the picture here.
