@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later WITH Linux-syscall-note */
+/* Copyright (C) 2026 djnice <djnice@freemail.hu> */
 /*
  * dvfel (SC2) - Dolby Vision FEL on Amlogic S905X4 (SC2) Android firmwares
  * (Dune HD, kernel 5.4.125): the player's MediaCodec decodes the base layer

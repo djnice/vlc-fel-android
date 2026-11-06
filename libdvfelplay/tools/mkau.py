@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 djnice <djnice@freemail.hu>
 """
 mkau.py - the video access units of a file (MKV/MP4, HEVC) for dvfp_test:
 Annex-B with their pts, in decode order, as a player hands them to MediaCodec.

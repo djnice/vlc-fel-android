@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 djnice <djnice@freemail.hu>
 /*
  * dvfel (SC2) - Dolby Vision FEL composition by the Dolby Vision core of an
  * Amlogic S905X4 (SC2) on Android firmwares with the 5.4.125 kernel (Dune HD).

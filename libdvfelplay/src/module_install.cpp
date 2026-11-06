@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 djnice <djnice@freemail.hu>
 /*
  * Installation of the dvfel kernel module bundled with this library
  * (dvfp_module_install): the module is loaded with root (su) and installed

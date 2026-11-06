@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 djnice <djnice@freemail.hu>
 /*
  * mvc3dhelper - software 3D MVC decoding and frame packing for the mvc3d
  * kernel module (Amlogic S5 Android)

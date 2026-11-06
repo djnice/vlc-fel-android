@@ -83,8 +83,8 @@ dvfel (SC2): kprobes on the driver's is_dovi_dual_layer_frame() / dolby_vision_p
 - After a seek a few frames (up to about a second, until the EL's next key picture) show without the EL. During a pause the EL decoder logs a few fence wait timeouts.
 - No [demo mode](#demo-mode-fel-vs-base-layer) there: the SoC composes, nothing to compare in the player (the
   menu item says *not available*).
-- 3D MVC: S928X only. The `mvc3d` module is built for the S928X kernel and does not load on the S905X4: with
-  a 3D display the module installation may ask for root once and then report a failure; MVC plays in 2D.
+- 3D MVC on the S905X4 (since v0.2.21): hardware decoder only, see [3D MVC](#3d-mvc-blu-ray-3d). Not tested with
+  this app yet, only with CineFuze (same library and module).
 - R22 on the S905X4 is not tested.
 
 ## Demo mode (FEL vs. base layer)
@@ -108,6 +108,13 @@ AREA    3840X1600 L5
   *Dolby Vision demo: not available*.
 
 ## 3D MVC (Blu-ray 3D)
+
+Decoder (since v0.2.21):
+
+- **S928X**: Settings → Video → *3D MVC: hardware decoder*. Off by default: the software decoder (edge264). On: the
+  SoC's MVC decoder, with the mvc3d module composing the frame packed picture. The setting is shown on the S928X only.
+- **S905X4**: the hardware decoder only, no setting. Without it (no module, a decoder that does not start) MVC plays
+  in 2D (base view).
 
 H.264 MVC files are shown in 3D when the display reports 3D support (HDMI EDID), with both views at full
 resolution as HDMI 1.4 **frame packing** (1920x2205, 1080p24). Sources:
@@ -137,7 +144,9 @@ stock hdmitx21 make it 1080p24 frame packing (timing, 3D vendor infoframe).
 - Works from a 1080p and from a 2160p desktop (on 2160p the GUI is moved to where it is on 1080p).
 - 2D displays: the base view in 2D (as before); VLC option `--mediacodec-mvc=1` forces 2D, `=2` 3D
   (Settings → Advanced → Custom libVLC options).
-- Needs the `mvc3d` kernel module, installed by VLC FEL like `dvfel` (one root question).
+- Needs the `mvc3d` kernel module, installed by VLC FEL like `dvfel` (one root question), or the Dune HD plugin
+  [`mvc3d`](kernel/mvc3d/dune-plugin) (no root question).
+- The HDMI mode: with the hardware decoder the switch to frame packing comes about 8 s after the picture here.
 
 ## Dual layer files (DTDL)
 
@@ -449,5 +458,8 @@ the first MVC file is to play in 3D.
 ## License
 
 GPL-2.0-or-later (VLC, libdvfelplay, libmvc3dplay and the kernel modules); edge264-mvc is BSD-2-Clause.
+The dvfel and mvc3d kernel modules, libdvfelplay (including the `felgpu` GPU composer) and libmvc3dplay are
+Copyright (C) 2026 djnice. Redistribution, also in firmware or in other products, must keep the copyright and
+license notices and provide the complete corresponding source code as the GPL requires.
 Dolby Vision is a trademark of Dolby Laboratories; this project is not affiliated with Dolby, Dune HD,
 R_volution or VideoLAN.
