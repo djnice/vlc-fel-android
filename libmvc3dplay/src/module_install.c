@@ -27,6 +27,37 @@
 /* the module (module_blob.S) */
 extern const unsigned char mvc3d_ko_start[], mvc3d_ko_end[];
 #endif
+#ifdef MVC3D_HAVE_KO_SC2
+/* the S905X4 module (mvc3d_sc2.c: the hardware path only) */
+extern const unsigned char mvc3d_sc2_ko_start[], mvc3d_sc2_ko_end[];
+#endif
+
+/* Amlogic S905X4 (device tree "amlogic, sc2"): its own module (the S928X one must not load there) */
+static int is_sc2(void)
+{
+	static int sc2 = -1;
+
+	if (sc2 < 0) {
+		char buf[256];
+		ssize_t n = 0;
+		int fd = open("/proc/device-tree/compatible", O_RDONLY | O_CLOEXEC);
+
+		if (fd >= 0) {
+			n = read(fd, buf, sizeof(buf) - 1);
+			close(fd);
+		}
+		sc2 = 0;
+		for (ssize_t i = 0; i + 3 <= n; i++)
+			if (!memcmp(buf + i, "sc2", 3))
+				sc2 = 1;
+	}
+	return sc2;
+}
+
+static const char *bundled_version(void)
+{
+	return is_sc2() ? MVC3D_SC2_VERSION : MVC3D_VERSION;
+}
 
 /* the Dune firmware's switch for su (its sud daemon): "" (default) or "1" on */
 #define ROOT_PROP "persist.vendor.root_access"
@@ -77,8 +108,9 @@ static const char INSTALL_SCRIPT[] =
 	"insmod $INST || exit 1\n"
 	"# ueventd creates the device node asynchronously\n"
 	"i=0\n"
-	"while [ ! -e /dev/mvc3d ] && [ \\$i -lt 50 ]; do sleep 0.1; i=\\$((i + 1)); done\n"
-	"chmod 666 /dev/mvc3d\n"
+	"while [ ! -e /dev/mvc3d ] && [ ! -e /dev/mvc3dhw ] && [ \\$i -lt 50 ]; do sleep 0.1; i=\\$((i + 1)); done\n"
+	"# the S905X4 module has /dev/mvc3dhw only\n"
+	"[ -e /dev/mvc3d ] && chmod 666 /dev/mvc3d\n"
 	"# the hardware MVC path (mvc3d 2026.10.18 and newer)\n"
 	"[ -e /dev/mvc3dhw ] && chmod 666 /dev/mvc3dhw\n"
 	"EOS\n"
@@ -89,8 +121,9 @@ static const char INSTALL_SCRIPT[] =
 	"fi\n"
 	"chmod 755 \"$D/boot/mvc3d.sh\"\n"
 	"i=0\n"
-	"while [ ! -e /dev/mvc3d ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done\n"
-	"chmod 666 /dev/mvc3d || exit 7\n"
+	"while [ ! -e /dev/mvc3d ] && [ ! -e /dev/mvc3dhw ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done\n"
+	"if [ -e /dev/mvc3d ]; then chmod 666 /dev/mvc3d || exit 7\n"
+	"elif [ ! -e /dev/mvc3dhw ]; then echo \"no device node\"; exit 7; fi\n"
 	"i=0\n"
 	"while [ ! -e /dev/mvc3dhw ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i + 1)); done\n"
 	"[ -e /dev/mvc3dhw ] && chmod 666 /dev/mvc3dhw\n"
@@ -148,7 +181,10 @@ static int ready(void)
 	char v[64];
 
 	read_line("/sys/module/mvc3d/version", v, sizeof(v));
-	/* versions are dates (YYYY.MM.DD[.n]): compare as strings */
+	/* versions are dates (YYYY.MM.DD[.n][-sc2]): compare as strings */
+	if (is_sc2())
+		return v[0] && strstr(v, "-sc2") && strcmp(v, MVC3D_SC2_VERSION) >= 0 &&
+		       access(MVC3D_HW_DEV, R_OK | W_OK) == 0;
 	return v[0] && strcmp(v, MVC3D_VERSION) >= 0 && access(MVC3D_DEV, R_OK | W_OK) == 0;
 }
 
@@ -186,6 +222,11 @@ static int write_file(const char *path, const void *data, size_t size)
 	return fclose(f) == 0 && ok ? 0 : -1;
 }
 
+int mvc3d_soc_sc2(void)
+{
+	return is_sc2();
+}
+
 int mvc3d_module_install(const char *dir, mvc3d_ask_fn ask, void *opaque, char *msg,
 			 size_t msg_size)
 {
@@ -221,10 +262,22 @@ int mvc3d_module_install(const char *dir, mvc3d_ask_fn ask, void *opaque, char *
 			ret = result = MVC3D_MODULE_FAILED;
 			goto out;
 		}
+		const unsigned char *ko_start = mvc3d_ko_start, *ko_end = mvc3d_ko_end;
+
+		if (is_sc2()) {
+#ifdef MVC3D_HAVE_KO_SC2
+			ko_start = mvc3d_sc2_ko_start;
+			ko_end = mvc3d_sc2_ko_end;
+#else
+			set_msg(msg, msg_size, "no kernel module for this player (S905X4) in this build");
+			ret = result = MVC3D_MODULE_FAILED;
+			goto out;
+#endif
+		}
 		snprintf(ko, sizeof(ko), "%s/mvc3d.ko", d);
 		snprintf(script, sizeof(script), "%s/mvc3d_install.sh", d);
 		snprintf(declined, sizeof(declined), "%s/mvc3d_root_declined", d);
-		if (write_file(ko, mvc3d_ko_start, mvc3d_ko_end - mvc3d_ko_start) ||
+		if (write_file(ko, ko_start, ko_end - ko_start) ||
 		    write_file(script, INSTALL_SCRIPT, sizeof(INSTALL_SCRIPT) - 1)) {
 			set_msg(msg, msg_size, "cannot write the installation files");
 			ret = result = MVC3D_MODULE_FAILED;
@@ -243,7 +296,7 @@ int mvc3d_module_install(const char *dir, mvc3d_ask_fn ask, void *opaque, char *
 		 */
 		if (!su_works()) {
 			read_line(declined, v, sizeof(v));
-			if (!strcmp(v, MVC3D_VERSION)) {
+			if (!strcmp(v, bundled_version())) {
 				logi("%s%s", "root access off, the module installation was declined earlier", "");
 				set_msg(msg, msg_size, "installation declined");
 				ret = result = MVC3D_MODULE_DECLINED;
@@ -254,7 +307,10 @@ int mvc3d_module_install(const char *dir, mvc3d_ask_fn ask, void *opaque, char *
 					"This needs root access, which is switched off on this player.\n\n"
 					"Switch root access on for the installation? It is switched off "
 					"again afterwards.") <= 0) {
-				write_file(declined, MVC3D_VERSION "\n", strlen(MVC3D_VERSION) + 1);
+				char dv[64];
+
+				snprintf(dv, sizeof(dv), "%s\n", bundled_version());
+				write_file(declined, dv, strlen(dv));
 				logi("%s%s", "root access off, the module installation declined", "");
 				set_msg(msg, msg_size, "not installed: 3D MVC plays in 2D");
 				ret = result = MVC3D_MODULE_DECLINED;
@@ -290,7 +346,7 @@ int mvc3d_module_install(const char *dir, mvc3d_ask_fn ask, void *opaque, char *
 			goto out;
 		}
 		unlink(declined);
-		logi("kernel module %s installed%s", MVC3D_VERSION, "");
+		logi("kernel module %s installed%s", bundled_version(), "");
 		set_msg(msg, msg_size, "kernel module installed");
 		ret = result = MVC3D_MODULE_INSTALLED;
 	}
@@ -303,7 +359,7 @@ out:
 const char *mvc3d_bundled_module_version(void)
 {
 #ifdef MVC3D_HAVE_KO
-	return MVC3D_VERSION;
+	return bundled_version();
 #else
 	return "";
 #endif

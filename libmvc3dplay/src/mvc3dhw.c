@@ -98,6 +98,7 @@ struct vt_buffer_data {
 #define NATIVE_WINDOW_SET_SIDEBAND_STREAM 18
 #define AM_SIDEBAND_MAGIC 0xabcdcdef
 #define AM_SIDEBAND_TUNNEL 0x400
+#define AM_SIDEBAND_OMX 0x20	/* the legacy video layer (amvideo): S905X4 direct mode */
 
 struct anw_priv {
 	int magic, version;
@@ -132,6 +133,8 @@ struct au {
 
 struct mvc3d_hw {
 	int w, h, fp, out_h, stride;
+	int direct;		/* MVC3D_HW_F_DIRECT (S905X4): the decoder's pictures, no buffers or tunnel */
+	int returner_on;
 	int hw, amfd, vt, tunnel;
 	int buf_fd[NBUFS];
 	int nbufs;
@@ -174,8 +177,8 @@ static int64_t mono_ns(void)
 
 int mvc3d_hw_available(void)
 {
-	return !access(MVC3D_HW_DEV, R_OK | W_OK) && !access("/dev/amstream_vbuf", R_OK | W_OK) &&
-	       !access("/dev/videotunnel", R_OK | W_OK) && !access("/dev/uvm", R_OK | W_OK);
+	/* the video tunnel and uvm (S928X) are checked at the open: the S905X4 module needs neither */
+	return !access(MVC3D_HW_DEV, R_OK | W_OK) && !access("/dev/amstream_vbuf", R_OK | W_OK);
 }
 
 static int am_open(struct mvc3d_hw *h)
@@ -331,8 +334,8 @@ int mvc3d_hw_set_sideband(mvc3d_hw *h, void *window)
 	h->sb.num_fds = 0;
 	h->sb.num_ints = 3;
 	h->sb.data[0] = (int)AM_SIDEBAND_MAGIC;
-	h->sb.data[1] = AM_SIDEBAND_TUNNEL;
-	h->sb.data[2] = h->tunnel;
+	h->sb.data[1] = h->direct ? AM_SIDEBAND_OMX : AM_SIDEBAND_TUNNEL;
+	h->sb.data[2] = h->direct ? 0 : h->tunnel;
 	int r = p->perform(window, NATIVE_WINDOW_SET_SIDEBAND_STREAM, &h->sb);
 	if (r) {
 		LOGE("sideband stream: %d", r);
@@ -373,6 +376,19 @@ mvc3d_hw *mvc3d_hw_open(int width, int height, int frame_packed)
 	h->out_h = s.out_height;
 	h->stride = s.stride;
 	h->kgen = s.gen;
+	h->direct = !!(s.reserved[0] & MVC3D_HW_F_DIRECT);
+	if (h->direct) {
+		/* slots of the module, not buffers of ours */
+		h->nbufs = MVC3D_HW_MAX_BUFS;
+		h->amfd = am_open(h);
+		if (h->amfd < 0)
+			goto fail;
+		if (pthread_create(&h->feeder, NULL, feeder_thread, h))
+			goto fail;
+		LOGI("open %dx%d %s, direct (decoder pictures to the video layer)", width, height,
+		     h->fp ? "frame packed" : "2D");
+		return h;
+	}
 
 	int uvm = open("/dev/uvm", O_RDWR | O_CLOEXEC);
 	if (uvm < 0)
@@ -423,6 +439,7 @@ mvc3d_hw *mvc3d_hw_open(int width, int height, int frame_packed)
 		pthread_join(h->feeder, NULL);
 		goto fail;
 	}
+	h->returner_on = 1;
 	if (h->fp) {
 		/* the 1080p24 (720p) modes the firmware sets go out frame packed */
 		uint32_t on = 1;
@@ -550,6 +567,16 @@ int mvc3d_hw_present(mvc3d_hw *h, int index, int64_t mono_ns_at)
 {
 	if (index < 0 || index >= h->nbufs)
 		return -1;
+	if (h->direct) {
+		struct mvc3d_hw_present q = { .index = index,
+					      .due_ns = (uint64_t)(mono_ns_at > 0 ? mono_ns_at : mono_ns()) };
+		if (ioctl(h->hw, MVC3D_HW_PRESENT, &q) < 0) {
+			mvc3d_hw_discard(h, index);
+			return -1;
+		}
+		h->shown++;
+		return 0;
+	}
 	h->on_display[index] = 1;
 	struct vt_buffer_data q = { .tunnel_id = h->tunnel, .buffer_fd = h->buf_fd[index], .fence_fd = -1,
 				    .time_stamp = mono_ns_at > 0 ? mono_ns_at : mono_ns() };
@@ -565,6 +592,11 @@ int mvc3d_hw_present(mvc3d_hw *h, int index, int64_t mono_ns_at)
 void mvc3d_hw_discard(mvc3d_hw *h, int index)
 {
 	struct mvc3d_hw_buf b = { .index = index };
+	if (h->direct) {
+		if (index >= 0 && index < h->nbufs)
+			ioctl(h->hw, MVC3D_HW_RELEASE, &b);
+		return;
+	}
 	if (index >= 0 && index < h->nbufs && !h->on_display[index])
 		ioctl(h->hw, MVC3D_HW_RELEASE, &b);
 }
@@ -599,7 +631,8 @@ void mvc3d_hw_close(mvc3d_hw *h)
 	pthread_cond_broadcast(&h->qc);
 	pthread_mutex_unlock(&h->qm);
 	pthread_join(h->feeder, NULL);
-	pthread_join(h->returner, NULL);
+	if (h->returner_on)
+		pthread_join(h->returner, NULL);
 	if (h->window) {
 		struct anw_priv *p = h->window;
 		p->perform(h->window, NATIVE_WINDOW_SET_SIDEBAND_STREAM, NULL);
@@ -607,11 +640,14 @@ void mvc3d_hw_close(mvc3d_hw *h)
 	/* the decoder goes first (its pictures reference nothing of ours), then the tunnel */
 	if (h->amfd >= 0)
 		close(h->amfd);
-	struct vt_ctrl_data dc = { .tunnel_id = h->tunnel, .role = VT_ROLE_PRODUCER, .ctrl_cmd = VT_CTRL_DISCONNECT };
-	ioctl(h->vt, VT_IOC_CTRL, &dc);
-	struct vt_alloc_id_data fid = { h->tunnel };
-	ioctl(h->vt, VT_IOC_FREE_ID, &fid);
-	close(h->vt);
+	if (h->vt >= 0) {
+		struct vt_ctrl_data dc = { .tunnel_id = h->tunnel, .role = VT_ROLE_PRODUCER,
+					   .ctrl_cmd = VT_CTRL_DISCONNECT };
+		ioctl(h->vt, VT_IOC_CTRL, &dc);
+		struct vt_alloc_id_data fid = { h->tunnel };
+		ioctl(h->vt, VT_IOC_FREE_ID, &fid);
+		close(h->vt);
+	}
 	LOGI("close: fed %u, shown %u, dropped %u, pts overflow %u, rewriter: %u idrs, %u dropped, %u errors",
 	     h->fed, h->shown, h->dropped, h->late_pts, h->fnr.idrs_inserted, h->fnr.aus_dropped, h->fnr.errors);
 	close(h->hw);

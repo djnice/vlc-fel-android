@@ -40,6 +40,16 @@ Ezzel a szoftveres dekóder nélkül megy a 3D:
 nélküle ~10 s-onként hibás). A HW-dekóder ezen a lemezen az edge264-gyel képről képre bitazonos. A frame packed
 3D projektoros tesztje hátravan. Ez az ág nem kiadás.
 
+### S905X4 (SC2, Dune HD Pro Vision 4K, r25)
+
+Külön modul: `kernel/mvc3d/sc2` (`/dev/mvc3dhw`, `MVC3D_HW_F_DIRECT`), a lib SoC szerint választ (`MVC3D_KO_SC2`). Szoftveres MVC ezen a
+SoC-on nincs: ha a hardveres dekóder nem indul, a MediaCodec 2D bázisnézete megy. A modul 2026.11.06.8-sc2 a dekóder 31 bites DMA-hibáját
+kerüli meg (a munkaterület és a referenciapufferek 2 GB alatti, 28 MB-os poolban; ami nem fér el, azt elutasítja), és r25-kódmintával
+ellenőrzött kprobe-okkal pótolja, amit a Dune 5.4 `aml_media` az MVC frame packingből kihagy a CoreELEC 5.15-höz képest (`video_vf_get`,
+`vd_set_dcu`, `vpp_set_filters`, `config_vd_position`). Projektoron a CineFuze teszt-APK-val próbálva (.ssif, mkv, mk3d, m2ts, ISO); a VLC
+FEL appal még nem. Az appból a modul a film előtt élesíthető: „arm” a `/dev/mvc3dhw`-re (a VLC FEL ezt még nem használja, ott a módváltás
+a kép után jön).
+
 ## English
 
 The S928X's own MVC decoder corrupts the dependent view when `frame_num` wraps around. CoreELEC's fix
@@ -59,3 +69,13 @@ Built on v0.2.20-poc (with the .ssif fix 0033). Tested on a 2D TV: picture, seek
 v0.2.8 base), and the right view of Dune HD's BD3D_DEMO .ssif with `hw_2d_view` (clean with 0033, a glitch about
 every 10 s without it). On that disc the hardware decoder is bit-identical to edge264 for every picture. Frame
 packed 3D still to be tested on a projector. This branch is not a release.
+
+### S905X4 (SC2, Dune HD Pro Vision 4K, r25)
+
+Its own module: `kernel/mvc3d/sc2` (`/dev/mvc3dhw`, `MVC3D_HW_F_DIRECT`); the library picks by SoC (`MVC3D_KO_SC2`). There is no software
+MVC on this SoC: when the hardware decoder does not start, MediaCodec's 2D base view plays. Module 2026.11.06.8-sc2 works around the
+decoder's 31 bit DMA bug (work space and reference buffers in a 28 MB pool below 2 GiB; what does not fit is refused) and adds, with kprobes
+checked against the r25 code, what Dune's 5.4 `aml_media` lacks for MVC frame packing compared with CoreELEC 5.15 (`video_vf_get`,
+`vd_set_dcu`, `vpp_set_filters`, `config_vd_position`). Tested on a projector with the CineFuze test APK (.ssif, mkv, mk3d, m2ts, ISO), not
+yet with the VLC FEL app. A player can arm frame packing before its film: write "arm" on `/dev/mvc3dhw` (VLC FEL does not do that yet: its
+mode switch comes after the picture).

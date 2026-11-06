@@ -30,7 +30,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define MVC3D_LIB_VERSION "2026.11.05.1"
+#define MVC3D_LIB_VERSION "2026.11.06.2"
 #define HELPER_NAME "libmvc3dhelper.so"
 #define MODULE_DEV "/dev/mvc3d"
 
@@ -65,10 +65,15 @@ static int helper_path(char* buf, size_t size)
 	return 0;
 }
 
+int mvc3d_soc_sc2(void);	/* module_install.c */
+
+/* the software decoder's path; the S905X4 has only the hardware one (no software decoder there, not fast enough) */
 int mvc3d_available(void)
 {
 	char path[512];
 
+	if (mvc3d_soc_sc2())
+		return 0;
 	return access(MODULE_DEV, R_OK | W_OK) == 0 && helper_path(path, sizeof(path)) == 0 &&
 	       access(path, X_OK) == 0;
 }

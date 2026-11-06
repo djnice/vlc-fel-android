@@ -33,6 +33,8 @@
 #define MVC3D_DEV		"/dev/mvc3d"
 /* module version (/sys/module/mvc3d/version) */
 #define MVC3D_VERSION		"2026.10.18.1"
+/* the S905X4 (SC2) module (mvc3d_sc2.c: /dev/mvc3dhw only, MVC3D_HW_F_DIRECT) */
+#define MVC3D_SC2_VERSION "2026.11.06.8-sc2"
 
 #define MVC3D_MAX_BUFS		16
 #define MVC3D_FMT_UYVY		0
@@ -162,5 +164,24 @@ struct mvc3d_hw_pic {
 #define MVC3D_HW_FLUSH		_IOR(MVC3D_IOC_MAGIC, 0x24, __u32)
 /* __u32 as MVC3D_IOC_SET_FP */
 #define MVC3D_HW_SET_FP		_IOW(MVC3D_IOC_MAGIC, 0x25, __u32)
+
+/*
+ * S905X4 (SC2) module (mvc3d_sc2.c): MVC3D_HW_START sets reserved[0] (zero it before the call) to
+ * MVC3D_HW_F_DIRECT. Then there are no client buffers (no MVC3D_HW_ADD_BUF, no uvm, no video tunnel):
+ * the decoder's own pictures go to the display (vfm "decoder.h264mvc mvc3dhw amvideo", the legacy video
+ * layer; the VPP shows the base view, or with frame packing both views itself). MVC3D_HW_WAIT gives a
+ * picture slot (index); the client passes it on with MVC3D_HW_PRESENT at its display time (the slot is
+ * shown from the first vsync near due_ns and goes back to the decoder by itself) or drops it with
+ * MVC3D_HW_RELEASE. The window needs the sideband stream of type 2 (OMX, 0x20), channel 0.
+ */
+#define MVC3D_HW_F_DIRECT	1
+
+struct mvc3d_hw_present {
+	__s32 index;		/* in: a slot from MVC3D_HW_WAIT */
+	__u32 reserved;
+	__u64 due_ns;		/* in: CLOCK_MONOTONIC display time */
+};
+
+#define MVC3D_HW_PRESENT	_IOW(MVC3D_IOC_MAGIC, 0x26, struct mvc3d_hw_present)
 
 #endif
