@@ -28,6 +28,8 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
+#include <dlfcn.h>
+#include <sys/system_properties.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "mvc3dhw", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "mvc3dhw", __VA_ARGS__)
 #else
@@ -563,6 +565,33 @@ int mvc3d_hw_get_picture(mvc3d_hw *h, int timeout_ms, int64_t *pts_us)
 	}
 }
 
+/*
+ * The video tunnel's time of a picture kept away from the border of two vsyncs (dvfp_snap_present_ns of libdvfelplay,
+ * when it is there). A Matroska film's 1 ms timestamps flip around a border its playback happens to start on, and
+ * pictures are lost from the start to the end, some starts only (Avatar on .60, 11-06: 15 of 240 lost; with this 0 of
+ * 18 starts; as Dolby Vision's, 10-30). debug.mvc3d.snap 0: as they come (tests).
+ */
+static int64_t snap_ns(int64_t ns)
+{
+	static int64_t (*snap)(int64_t);
+	static int tried;
+
+	if (!tried) {
+		char v[PROP_VALUE_MAX] = "";
+
+		tried = 1;
+		__system_property_get("debug.mvc3d.snap", v);
+		if (v[0] != '0') {
+			void *lib = dlopen("libdvfelplay.so", RTLD_NOW);
+
+			if (lib)
+				snap = (int64_t (*)(int64_t))dlsym(lib, "dvfp_snap_present_ns");
+		}
+		LOGI("present times %s", snap ? "snapped to the vsyncs" : "as they come");
+	}
+	return snap ? snap(ns) : ns;
+}
+
 int mvc3d_hw_present(mvc3d_hw *h, int index, int64_t mono_ns_at)
 {
 	if (index < 0 || index >= h->nbufs)
@@ -579,7 +608,7 @@ int mvc3d_hw_present(mvc3d_hw *h, int index, int64_t mono_ns_at)
 	}
 	h->on_display[index] = 1;
 	struct vt_buffer_data q = { .tunnel_id = h->tunnel, .buffer_fd = h->buf_fd[index], .fence_fd = -1,
-				    .time_stamp = mono_ns_at > 0 ? mono_ns_at : mono_ns() };
+				    .time_stamp = mono_ns_at > 0 ? snap_ns(mono_ns_at) : mono_ns() };
 	if (ioctl(h->vt, VT_IOC_QUEUE_BUFFER, &q) < 0) {
 		h->on_display[index] = 0;
 		mvc3d_hw_discard(h, index);
