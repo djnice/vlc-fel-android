@@ -1,0 +1,443 @@
+From dcc04d60e986d574825c2a0d9239b2cd4a685b87 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sun, 8 Nov 2026 10:06:20 +0100
+Subject: [PATCH] audiotrack: "native" device, PCM at the source's sample rate
+ on Dune HD boxes
+
+A new output device, "native": as "pcm", but a mono or stereo PCM source
+at 32, 44.1, 96 or 192 kHz goes out at its own rate, 16-bit stereo, where
+the box sends such PCM to HDMI as it is, instead of being resampled to the
+output's mixer rate (48 kHz) - for a music player.
+
+The Dune HD Android firmware (ro.dunehd.native_sr=1) has an attribute flag
+for it, 0x4000 (AudioAttributes, no name there but in its FLAG_ALL_PUBLIC):
+its audio policy gives such a track a direct output (DIRECT | DEEP_BUFFER,
+the Amlogic HAL's PCM_DIRECT) at the track's rate. Measured on a Dune HD
+Pro 8K Plus (Android 11, S928X): 44.1, 96 and 192 kHz on
+HDMI (amhdmitx config, ALSA pcm5p) from an app's AudioTrack; without the
+flag the mixer's 48 kHz, FLAG_HW_AV_SYNC also 48 kHz (the HAL mixes the
+hw-sync LPCM). The Dune's own player asks for 0x4e00.
+
+The AudioTrack is made from AudioAttributes and AudioFormat (API 21) with
+the flag. Not used: on another box, when persist.dunehd.native_sr.disable
+is true, above persist.dunehd.native_sr.max_sr, for a rate the direct
+output does not list (88.2, 176.4 kHz: the mixer's way) or the HDMI sink's
+EDID (Amlogic aud_cap) does not take, for 48 kHz (the mixer's own rate) and
+for more than 2 channels. If the AudioTrack cannot be made, the output's
+rate as before. The output info file says "pcm 44100 2 native".
+
+Message-Id: <20261108-dvfel-audiotrack-native-rate@djnice>
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/audio_output/audiotrack.c | 303 +++++++++++++++++++++++++++++-
+ 1 file changed, 294 insertions(+), 9 deletions(-)
+
+diff --git a/modules/audio_output/audiotrack.c b/modules/audio_output/audiotrack.c
+index 4a9f478570..a6c281807f 100644
+--- a/modules/audio_output/audiotrack.c
++++ b/modules/audio_output/audiotrack.c
+@@ -30,6 +30,10 @@
+ #include <dlfcn.h>
+ #include <stdbool.h>
+ #include <stdio.h>
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/system_properties.h>
+ 
+ #include <vlc_common.h>
+ #include <vlc_plugin.h>
+@@ -58,6 +62,7 @@ enum at_dev {
+     AT_DEV_STEREO = 0,
+     AT_DEV_PCM,
+     AT_DEV_ENCODED,
++    AT_DEV_NATIVE,
+ };
+ #define AT_DEV_DEFAULT AT_DEV_STEREO
+ #define AT_DEV_MAX_CHANNELS 8
+@@ -77,6 +82,12 @@ static const struct {
+      * codecs specified by ENCODING_FLAGS_MASK. This extra value is a long long
+      * that contains binary-shifted AudioFormat.ENCODING_* values. */
+     { "encoded", "Up to 8 channels, passthrough if available.", AT_DEV_ENCODED },
++
++    /* "native": as "pcm", but stereo PCM at the source's sample rate where
++     * the box can send it to HDMI as it is (see NativeRateUsable), instead of
++     * the output's mixer rate (48 kHz). No passthrough. */
++    { "native", "Up to 8 channels, the source's sample rate if the box can.",
++      AT_DEV_NATIVE },
+     {  NULL, NULL, AT_DEV_DEFAULT },
+ };
+ 
+@@ -125,6 +136,7 @@ struct aout_sys_t {
+     uint32_t i_max_audiotrack_samples;
+     long long i_encoding_flags;
+     bool b_passthrough;
++    bool b_native_rate; /* the source's rate, a direct output (AT_DEV_NATIVE) */
+     bool b_passthrough_delay; /* the IEC 61937 output's delay is reported */
+     bool b_truehd_raw; /* TrueHD as it is (ENCODING_DOLBY_TRUEHD), see StartTrueHdRaw */
+     bool b_truehd_synced; /* (the raw TrueHD: a major sync seen since the start / flush) */
+@@ -314,6 +326,24 @@ static struct
+         jmethodID setInputGainAllChannelsTo;
+         jmethodID setEnabled;
+     } DynamicsProcessing;
++    /* the AudioTrack made from AudioAttributes and AudioFormat (API 21): the
++     * native rate's (AT_DEV_NATIVE), with the box's attribute flag */
++    struct {
++        jclass attr_builder;
++        jmethodID attr_ctor;
++        jmethodID attr_setUsage;
++        jmethodID attr_setContentType;
++        jmethodID attr_setFlags;
++        jmethodID attr_build;
++        jclass fmt_builder;
++        jmethodID fmt_ctor;
++        jmethodID fmt_setEncoding;
++        jmethodID fmt_setSampleRate;
++        jmethodID fmt_setChannelMask;
++        jmethodID fmt_build;
++        jmethodID at_ctor;
++        bool ok;
++    } AttrTrack;
+ } jfields;
+ 
+ /* init all jni fields.
+@@ -524,6 +554,53 @@ InitJNIFields( audio_output_t *p_aout, JNIEnv* env )
+         }
+     }
+ 
++    /* AudioAttributes.Builder, AudioFormat.Builder and their AudioTrack
++     * constructor (API 21): the native rate's AudioTrack, none of them
++     * critical */
++    jfields.AttrTrack.ok = false;
++    GET_CLASS( "android/media/AudioAttributes$Builder", false );
++    if( clazz )
++    {
++        jfields.AttrTrack.attr_builder = (jclass) (*env)->NewGlobalRef( env, clazz );
++        CHECK_EXCEPTION( "NewGlobalRef", true );
++        GET_ID( GetMethodID, AttrTrack.attr_ctor, "<init>", "()V", false );
++        GET_ID( GetMethodID, AttrTrack.attr_setUsage, "setUsage",
++                "(I)Landroid/media/AudioAttributes$Builder;", false );
++        GET_ID( GetMethodID, AttrTrack.attr_setContentType, "setContentType",
++                "(I)Landroid/media/AudioAttributes$Builder;", false );
++        GET_ID( GetMethodID, AttrTrack.attr_setFlags, "setFlags",
++                "(I)Landroid/media/AudioAttributes$Builder;", false );
++        GET_ID( GetMethodID, AttrTrack.attr_build, "build",
++                "()Landroid/media/AudioAttributes;", false );
++        GET_CLASS( "android/media/AudioFormat$Builder", false );
++        if( clazz )
++        {
++            jfields.AttrTrack.fmt_builder = (jclass) (*env)->NewGlobalRef( env, clazz );
++            CHECK_EXCEPTION( "NewGlobalRef", true );
++            GET_ID( GetMethodID, AttrTrack.fmt_ctor, "<init>", "()V", false );
++            GET_ID( GetMethodID, AttrTrack.fmt_setEncoding, "setEncoding",
++                    "(I)Landroid/media/AudioFormat$Builder;", false );
++            GET_ID( GetMethodID, AttrTrack.fmt_setSampleRate, "setSampleRate",
++                    "(I)Landroid/media/AudioFormat$Builder;", false );
++            GET_ID( GetMethodID, AttrTrack.fmt_setChannelMask, "setChannelMask",
++                    "(I)Landroid/media/AudioFormat$Builder;", false );
++            GET_ID( GetMethodID, AttrTrack.fmt_build, "build",
++                    "()Landroid/media/AudioFormat;", false );
++            clazz = jfields.AudioTrack.clazz;
++            GET_ID( GetMethodID, AttrTrack.at_ctor, "<init>",
++                    "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V",
++                    false );
++            jfields.AttrTrack.ok = jfields.AttrTrack.attr_ctor
++                && jfields.AttrTrack.attr_setUsage
++                && jfields.AttrTrack.attr_setContentType
++                && jfields.AttrTrack.attr_setFlags && jfields.AttrTrack.attr_build
++                && jfields.AttrTrack.fmt_ctor && jfields.AttrTrack.fmt_setEncoding
++                && jfields.AttrTrack.fmt_setSampleRate
++                && jfields.AttrTrack.fmt_setChannelMask
++                && jfields.AttrTrack.fmt_build && jfields.AttrTrack.at_ctor;
++        }
++    }
++
+ #undef CHECK_EXCEPTION
+ #undef GET_CLASS
+ #undef GET_ID
+@@ -557,6 +634,23 @@ check_exception( JNIEnv *env, audio_output_t *p_aout,
+ }
+ #define CHECK_AT_EXCEPTION( method ) check_exception( env, p_aout, method )
+ 
++/* the native rate's AudioTrack is optional (the usual one follows): an
++ * exception does not mark the output as failed */
++static inline bool
++check_native_exception( JNIEnv *env, audio_output_t *p_aout,
++                        const char *method )
++{
++    if( (*env)->ExceptionCheck( env ) )
++    {
++        (*env)->ExceptionDescribe( env );
++        (*env)->ExceptionClear( env );
++        msg_Warn( p_aout, "native rate: %s triggered an exception", method );
++        return true;
++    }
++    return false;
++}
++#define CHECK_NATIVE_EXCEPTION( method ) check_native_exception( env, p_aout, method )
++
+ /* DynamicsProcessing is optional: don't mark the AudioTrack as failed */
+ static inline bool
+ check_dp_exception( JNIEnv *env, audio_output_t *p_aout,
+@@ -919,16 +1013,174 @@ AudioTrack_GetChanOrder( uint16_t i_physical_channels, uint32_t p_chans_out[] )
+  * Create an Android AudioTrack.
+  * returns -1 on error, 0 on success.
+  */
++/* The Dune HD firmware's attribute flag (AudioAttributes, no name there, but
++ * in its FLAG_ALL_PUBLIC 0x4111): the policy gives such a PCM track a direct
++ * output (DIRECT | DEEP_BUFFER, the HAL's PCM_DIRECT) and HDMI runs at the
++ * track's rate. Measured on a Pro 8K Plus (Android 11): 44.1, 96 and 192 kHz
++ * on HDMI from an app's 16-bit stereo AudioTrack; the Dune's own player asks
++ * for 0x4e00. */
++#define DUNE_NATIVE_SR_FLAG 0x4000
++#define AUDIO_ATTRIBUTES_USAGE_MEDIA 1
++#define AUDIO_ATTRIBUTES_CONTENT_TYPE_MUSIC 2
++
++static bool
++PropertyIs( const char *psz_name, const char *psz_value )
++{
++    char psz_prop[PROP_VALUE_MAX] = "";
++    __system_property_get( psz_name, psz_prop );
++    return strcmp( psz_prop, psz_value ) == 0;
++}
++
++/* The HDMI sink's PCM rates from its EDID (Amlogic's aud_cap: "PCM, 2 ch,
++ * 32/44.1/48/96/192 kHz, 16/20/24 bit"): true if i_rate is one of them or
++ * the line cannot be read */
++static bool
++SinkTakesPcmRate( audio_output_t *p_aout, unsigned i_rate )
++{
++    FILE *f = fopen( "/sys/class/amhdmitx/amhdmitx0/aud_cap", "r" );
++    if( !f )
++        return true;
++    char psz_line[256];
++    bool b_found = false, b_takes = false;
++    while( !b_found && fgets( psz_line, sizeof(psz_line), f ) )
++    {
++        if( strncmp( psz_line, "PCM,", 4 ) != 0 )
++            continue;
++        b_found = true;
++        /* the rates: the field ending in "kHz" */
++        char *psz_khz = strstr( psz_line, "kHz" );
++        if( !psz_khz )
++            break;
++        char *psz_start = psz_khz;
++        while( psz_start > psz_line && psz_start[-1] != ',' )
++            psz_start--;
++        *psz_khz = '\0';
++        char *psz_save;
++        for( char *psz_tok = strtok_r( psz_start, "/ ", &psz_save ); psz_tok;
++             psz_tok = strtok_r( NULL, "/ ", &psz_save ) )
++        {
++            if( (unsigned) lround( strtod( psz_tok, NULL ) * 1000 ) == i_rate )
++                b_takes = true;
++        }
++    }
++    fclose( f );
++    if( b_found && !b_takes )
++        msg_Dbg( p_aout, "native rate: the HDMI sink takes no %u Hz PCM",
++                 i_rate );
++    return !b_found || b_takes;
++}
++
++/* AT_DEV_NATIVE: true if a stereo track at i_rate can go out as it is - a
++ * Dune HD firmware (ro.dunehd.native_sr, the direct output's PCM rates), not
++ * turned off, under its limit, a rate the sink takes; the mixer's own rate
++ * (48 kHz) goes the usual way */
++static bool
++NativeRateUsable( audio_output_t *p_aout, unsigned i_rate )
++{
++    if( !jfields.AttrTrack.ok || !PropertyIs( "ro.dunehd.native_sr", "1" )
++     || PropertyIs( "persist.dunehd.native_sr.disable", "true" ) )
++    {
++        msg_Dbg( p_aout, "native rate: not on this box" );
++        return false;
++    }
++    if( i_rate != 32000 && i_rate != 44100 && i_rate != 96000
++     && i_rate != 192000 )
++        return false;
++    char psz_max[PROP_VALUE_MAX] = "";
++    __system_property_get( "persist.dunehd.native_sr.max_sr", psz_max );
++    unsigned i_max = strtoul( psz_max, NULL, 10 );
++    if( i_max > 0 && i_rate > i_max )
++    {
++        msg_Dbg( p_aout, "native rate: %u Hz over the box's limit %u Hz",
++                 i_rate, i_max );
++        return false;
++    }
++    return SinkTakesPcmRate( p_aout, i_rate );
++}
++
++/* new AudioTrack(AudioAttributes, AudioFormat, size, MODE_STREAM, session)
++ * with the box's native rate flag */
++static jobject
++AudioTrack_NewNative( JNIEnv *env, audio_output_t *p_aout, unsigned int i_rate,
++                      int i_channel_config, int i_format, int i_size,
++                      jint session_id )
++{
++    jobject builder, attr = NULL, fmt = NULL, track = NULL, tmp;
++
++    builder = (*env)->NewObject( env, jfields.AttrTrack.attr_builder,
++                                 jfields.AttrTrack.attr_ctor );
++    if( CHECK_NATIVE_EXCEPTION( "AudioAttributes.Builder" ) || !builder )
++        return NULL;
++#define BUILDER_CALL( method, ... ) do { \
++    tmp = (*env)->CallObjectMethod( env, builder, jfields.AttrTrack.method, \
++                                    ##__VA_ARGS__ ); \
++    if( tmp ) (*env)->DeleteLocalRef( env, tmp ); \
++} while( 0 )
++    BUILDER_CALL( attr_setUsage, AUDIO_ATTRIBUTES_USAGE_MEDIA );
++    BUILDER_CALL( attr_setContentType, AUDIO_ATTRIBUTES_CONTENT_TYPE_MUSIC );
++    BUILDER_CALL( attr_setFlags, DUNE_NATIVE_SR_FLAG );
++    if( !CHECK_NATIVE_EXCEPTION( "AudioAttributes.Builder.set" ) )
++    {
++        attr = (*env)->CallObjectMethod( env, builder,
++                                         jfields.AttrTrack.attr_build );
++        if( CHECK_NATIVE_EXCEPTION( "AudioAttributes.Builder.build" ) )
++            attr = NULL;
++    }
++    (*env)->DeleteLocalRef( env, builder );
++    if( !attr )
++        return NULL;
++
++    builder = (*env)->NewObject( env, jfields.AttrTrack.fmt_builder,
++                                 jfields.AttrTrack.fmt_ctor );
++    if( !CHECK_NATIVE_EXCEPTION( "AudioFormat.Builder" ) && builder )
++    {
++        BUILDER_CALL( fmt_setEncoding, i_format );
++        BUILDER_CALL( fmt_setSampleRate, (jint) i_rate );
++        BUILDER_CALL( fmt_setChannelMask, i_channel_config );
++        if( !CHECK_NATIVE_EXCEPTION( "AudioFormat.Builder.set" ) )
++        {
++            fmt = (*env)->CallObjectMethod( env, builder,
++                                            jfields.AttrTrack.fmt_build );
++            if( CHECK_NATIVE_EXCEPTION( "AudioFormat.Builder.build" ) )
++                fmt = NULL;
++        }
++        (*env)->DeleteLocalRef( env, builder );
++    }
++#undef BUILDER_CALL
++
++    if( fmt )
++    {
++        track = (*env)->NewObject( env, jfields.AudioTrack.clazz,
++                                   jfields.AttrTrack.at_ctor, attr, fmt,
++                                   i_size, jfields.AudioTrack.MODE_STREAM,
++                                   session_id );
++        if( CHECK_NATIVE_EXCEPTION( "AudioTrack<init>(attributes)" ) )
++            track = NULL;
++        (*env)->DeleteLocalRef( env, fmt );
++    }
++    (*env)->DeleteLocalRef( env, attr );
++    if( track )
++        msg_Dbg( p_aout, "native rate: AudioTrack %u Hz, flags 0x%x", i_rate,
++                 DUNE_NATIVE_SR_FLAG );
++    return track;
++}
++
+ static int
+ AudioTrack_New( JNIEnv *env, audio_output_t *p_aout, unsigned int i_rate,
+                 int i_channel_config, int i_format, int i_size )
+ {
+     aout_sys_t *p_sys = p_aout->sys;
+     jint session_id = var_InheritInteger( p_aout, "audiotrack-session-id" );
+-    jobject p_audiotrack = JNI_AT_NEW( jfields.AudioManager.STREAM_MUSIC,
+-                                       i_rate, i_channel_config, i_format,
+-                                       i_size, jfields.AudioTrack.MODE_STREAM,
+-                                       session_id );
++    jobject p_audiotrack;
++    if( p_sys->b_native_rate )
++        p_audiotrack = AudioTrack_NewNative( env, p_aout, i_rate,
++                                             i_channel_config, i_format,
++                                             i_size, session_id );
++    else
++        p_audiotrack = JNI_AT_NEW( jfields.AudioManager.STREAM_MUSIC,
++                                   i_rate, i_channel_config, i_format,
++                                   i_size, jfields.AudioTrack.MODE_STREAM,
++                                   session_id );
+     if( CHECK_AT_EXCEPTION( "AudioTrack<init>" ) || !p_audiotrack )
+     {
+         msg_Warn( p_aout, "AudioTrack Init failed" ) ;
+@@ -948,7 +1200,8 @@ AudioTrack_New( JNIEnv *env, audio_output_t *p_aout, unsigned int i_rate,
+     if( !p_sys->p_audiotrack )
+         return -1;
+ 
+-    if( jfields.DynamicsProcessing.clazz && !p_sys->b_passthrough )
++    if( jfields.DynamicsProcessing.clazz && !p_sys->b_passthrough
++     && !p_sys->b_native_rate )
+     {
+         if (session_id == 0 )
+             session_id = JNI_AT_CALL_INT( getAudioSessionId );
+@@ -1433,18 +1686,38 @@ ReportOutput( audio_output_t *p_aout, vlc_fourcc_t i_codec )
+                       p_sys->fmt.i_rate, aout_FormatNbChannels( &p_sys->fmt ) );
+     }
+     else
+-        snprintf( psz_info, sizeof(psz_info), "pcm %u %u", p_sys->fmt.i_rate,
+-                  aout_FormatNbChannels( &p_sys->fmt ) );
++        snprintf( psz_info, sizeof(psz_info), "pcm %u %u%s", p_sys->fmt.i_rate,
++                  aout_FormatNbChannels( &p_sys->fmt ),
++                  p_sys->b_native_rate ? " native" : "" );
+     msg_Dbg( p_aout, "output: %s", psz_info );
+     WriteOutputInfo( psz_info );
+ }
+ 
++static int StartPCMTrack( JNIEnv *, audio_output_t *, unsigned );
++
+ static int
+ StartPCM( JNIEnv *env, audio_output_t *p_aout, unsigned i_max_channels )
+ {
+     aout_sys_t *p_sys = p_aout->sys;
+-    unsigned i_nb_channels;
+-    int i_at_format, i_ret;
++
++    /* AT_DEV_NATIVE: a mono or stereo source at its own rate, 16-bit stereo
++     * (the direct output's PCM), else (or if the box refuses it) as usual */
++    p_sys->b_native_rate = false;
++    if( p_sys->at_dev == AT_DEV_NATIVE
++     && aout_FormatNbChannels( &p_sys->fmt ) <= 2
++     && NativeRateUsable( p_aout, p_sys->fmt.i_rate ) )
++    {
++        const audio_sample_format_t fmt_in = p_sys->fmt;
++        p_sys->b_native_rate = true;
++        p_sys->fmt.i_format = VLC_CODEC_S16N;
++        p_sys->fmt.i_physical_channels = AOUT_CHANS_STEREO;
++        if( StartPCMTrack( env, p_aout, 2 ) == VLC_SUCCESS )
++            return VLC_SUCCESS;
++        msg_Warn( p_aout, "native rate: no AudioTrack at %u Hz, the output's "
++                  "rate", fmt_in.i_rate );
++        p_sys->b_native_rate = false;
++        p_sys->fmt = fmt_in;
++    }
+ 
+     if (jfields.AudioTrack.getNativeOutputSampleRate)
+         p_sys->fmt.i_rate =
+@@ -1453,6 +1726,17 @@ StartPCM( JNIEnv *env, audio_output_t *p_aout, unsigned i_max_channels )
+     else
+         p_sys->fmt.i_rate = VLC_CLIP( p_sys->fmt.i_rate, 4000, 48000 );
+ 
++    return StartPCMTrack( env, p_aout, i_max_channels );
++}
++
++/* the PCM AudioTrack at p_sys->fmt's rate */
++static int
++StartPCMTrack( JNIEnv *env, audio_output_t *p_aout, unsigned i_max_channels )
++{
++    aout_sys_t *p_sys = p_aout->sys;
++    unsigned i_nb_channels;
++    int i_at_format, i_ret;
++
+     do
+     {
+         /* We can only accept U8, S16N, FL32, and AC3 */
+@@ -1565,6 +1849,7 @@ Start( audio_output_t *p_aout, audio_sample_format_t *restrict p_fmt )
+         return VLC_EGENERIC;
+ 
+     p_sys->fmt = *p_fmt;
++    p_sys->b_native_rate = false;
+     p_sys->b_passthrough_delay =
+         var_InheritBool( p_aout, "audiotrack-passthrough-delay" );
+ 
+-- 
+2.55.0.windows.3
+
