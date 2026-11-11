@@ -1,0 +1,199 @@
+From 1b1639a3f73828955bcc2dd31299ad4db4be4aa2 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 10 Nov 2026 08:28:06 +0100
+Subject: [PATCH] mediacodec: HDR10+ as Dolby Vision profile 8.1 (option
+ mediacodec-dovi-hdr10plus)
+Message-Id: <hdr10plus-dv-20261110@cinefuze>
+
+An HEVC stream without RPU whose first access unit carries HDR10+ dynamic
+metadata (ST 2094-40 SEI) goes, with the option on, to the Dolby Vision
+decoder as profile 8.1: libdvfelplay's DVFP_MODE_HDR10PLUS (2026.11.10.1)
+adds to every access unit an RPU generated from its HDR10+ metadata, as the
+SamuriHL CoreELEC Kodi build converts. Older libraries (no
+dvfp_probe_hdr10plus) leave the stream HDR10+.
+
+The live levels of the player's information panel (files/dvinfo) are read
+from the generated RPU (after the filter); <app files>/dvfp_hdr10plus exists
+while the conversion runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ modules/codec/omxil/mediacodec.c | 84 ++++++++++++++++++++++++++++++--
+ 1 file changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 5700684927..b822a6bc9f 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -87,6 +87,7 @@ struct dvfp_rpu_info
+ #define DVFP_EL_FEL 2
+ #define DVFP_MODE_CONVERT 0
+ #define DVFP_MODE_FEL 1
++#define DVFP_MODE_HDR10PLUS 2
+ 
+ static struct
+ {
+@@ -103,6 +104,7 @@ static struct
+     int64_t (*snap_present_ns)(int64_t); /* optional */
+     int64_t (*present_lead_ns)(const dvfp *); /* optional */
+     void (*set_demo)(dvfp *, int); /* optional */
++    int (*probe_hdr10plus)(const uint8_t *, size_t); /* optional (DVFP_MODE_HDR10PLUS) */
+     int (*module_install)(const char *, int (*)(void *, const char *, const char *),
+                           void *, char *, size_t); /* optional */
+ } dvfp_api;
+@@ -169,6 +171,7 @@ static void DoviLoadOnce(void)
+         DVFP_SYM(present_lead_ns);
+         DVFP_SYM(set_demo);
+         DVFP_SYM(module_install);
++        DVFP_SYM(probe_hdr10plus);
+         dvfp_api.loaded = true;
+     }
+ #undef DVFP_SYM
+@@ -620,6 +623,7 @@ struct decoder_sys_t
+             int i_profile; /* the HEVC profile the decoder was chosen for */
+             dvfp *p_dvfp;
+             bool b_dovi; /* the Dolby Vision decoder is in use */
++            bool b_hdr10plus; /* for an HDR10+ stream converted to profile 8.1 */
+             int i_dovi_mc_profile; /* its profile constant for the stream */
+             /* the player's information panel: the live level 1 (DoviInfo) */
+             char *psz_dvinfo; /* <app files>/ */
+@@ -662,6 +666,7 @@ static int VideoHXXX_OnNewBlock(decoder_t *, block_t **);
+ static int VideoMPEG2_OnNewBlock(decoder_t *, block_t **);
+ static int VideoVC1_OnNewBlock(decoder_t *, block_t **);
+ static void DoviProbe(decoder_t *, const block_t *);
++static void Hdr10PlusProbe(decoder_t *);
+ static int DoviFilter(decoder_t *, block_t **);
+ static void DoviInfo(decoder_t *, const block_t *);
+ static void DoviInfoShown(decoder_t *, unsigned, int64_t);
+@@ -713,6 +718,11 @@ static void RemoveInflightPictures(decoder_t *);
+     "top of each half shows the level 1 brightness (max and average, in nits) " \
+     "measured with and without the enhancement layer, their difference and " \
+     "the RPU's own level 1."
++#define MEDIACODEC_DOVI_HDR10PLUS_TEXT "HDR10+ as Dolby Vision"
++#define MEDIACODEC_DOVI_HDR10PLUS_LONGTEXT \
++    "An HDR10+ stream goes to the Dolby Vision decoder as profile 8.1: every " \
++    "picture gets an RPU generated from its HDR10+ dynamic metadata " \
++    "(libdvfelplay, as the SamuriHL CoreELEC Kodi build converts)."
+ #define MEDIACODEC_FPS_TEXT "Video frame rate"
+ #define MEDIACODEC_FPS_LONGTEXT \
+     "The frame rate the video decoder is told (0: the stream's). An Amlogic " \
+@@ -758,6 +768,8 @@ vlc_module_begin ()
+              MEDIACODEC_DOVI_FEL_TEXT, MEDIACODEC_DOVI_FEL_LONGTEXT, true)
+     add_bool(CFG_PREFIX "dovi-demo", false,
+              MEDIACODEC_DOVI_DEMO_TEXT, MEDIACODEC_DOVI_DEMO_LONGTEXT, true)
++    add_bool(CFG_PREFIX "dovi-hdr10plus", false,
++             MEDIACODEC_DOVI_HDR10PLUS_TEXT, MEDIACODEC_DOVI_HDR10PLUS_LONGTEXT, true)
+     add_integer(CFG_PREFIX "mvc", MVC_MODE_AUTO,
+                 MEDIACODEC_MVC_TEXT, MEDIACODEC_MVC_LONGTEXT, true)
+         change_integer_list(pi_mvc_values, ppsz_mvc_names)
+@@ -1465,6 +1477,13 @@ static void CleanDecoder(decoder_t *p_dec)
+     {
+         if (p_sys->video.p_dvfp)
+             dvfp_api.close(p_sys->video.p_dvfp);
++        if (p_sys->video.b_hdr10plus && p_sys->video.psz_dvinfo)
++        {
++            /* the player's marker of the conversion */
++            char psz_path[300];
++            snprintf(psz_path, sizeof(psz_path), "%sdvfp_hdr10plus", p_sys->video.psz_dvinfo);
++            unlink(psz_path);
++        }
+         if (p_sys->video.psz_dvinfo)
+             vlc_mutex_destroy(&p_sys->video.dvinfo_lock);
+         free(p_sys->video.psz_dvinfo);
+@@ -2342,7 +2361,7 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+         DoviProbe(p_dec, *pp_block);
+     if (p_sys->video.i_mvc_probe > 0)
+         MvcProbe(p_dec, *pp_block);
+-    if (p_sys->video.b_dovi && p_sys->video.psz_dvinfo)
++    if (p_sys->video.b_dovi && p_sys->video.psz_dvinfo && !p_sys->video.b_hdr10plus)
+         DoviInfo(p_dec, *pp_block);
+     if (p_sys->video.p_dvfp)
+     {
+@@ -2350,6 +2369,9 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+         if (i_ret != 1)
+             return i_ret;
+     }
++    /* HDR10+: the levels of the RPU generated for the picture */
++    if (p_sys->video.b_hdr10plus && p_sys->video.psz_dvinfo && *pp_block)
++        DoviInfo(p_dec, *pp_block);
+ 
+     return Video_OnNewBlock(p_dec, pp_block);
+ }
+@@ -2367,6 +2389,56 @@ static int DoviMediaCodecProfile(int i_dv_profile)
+     }
+ }
+ 
++/*
++ * First access unit of an HEVC stream without RPU, with HDR10+ metadata (and
++ * the option on): to the Dolby Vision decoder as profile 8.1, libdvfelplay
++ * adds an RPU generated from the HDR10+ metadata to every access unit. The
++ * player sees it by <app files>/dvfp_hdr10plus (while the decoder lives).
++ */
++static void Hdr10PlusProbe(decoder_t *p_dec)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    dvfp *p_dvfp = dvfp_api.open(p_dec->fmt_out.video.i_width,
++                                 p_dec->fmt_out.video.i_height, DVFP_MODE_HDR10PLUS);
++    if (!p_dvfp)
++    {
++        msg_Warn(p_dec, "HDR10+: libdvfelplay failed, HEVC");
++        return;
++    }
++    const int i_mc_profile = DoviMediaCodecProfile(8);
++    const char *psz_mime = p_sys->api.psz_mime;
++    p_sys->api.psz_mime = "video/dolby-vision";
++    if (p_sys->api.configure(&p_sys->api, i_mc_profile) != 0
++     && p_sys->api.configure(&p_sys->api, 0) != 0)
++    {
++        msg_Warn(p_dec, "HDR10+: no Dolby Vision decoder, HEVC");
++        p_sys->api.psz_mime = psz_mime;
++        p_sys->api.configure(&p_sys->api, p_sys->video.i_profile);
++        dvfp_api.close(p_dvfp);
++        return;
++    }
++    msg_Info(p_dec, "HDR10+ converted to Dolby Vision profile 8.1: decoder %s, libdvfelplay %s",
++             p_sys->api.psz_name, dvfp_api.version());
++    p_sys->video.p_dvfp = p_dvfp;
++    p_sys->video.b_dovi = true;
++    p_sys->video.b_hdr10plus = true;
++    p_sys->video.i_dovi_mc_profile = i_mc_profile;
++    p_sys->video.psz_dvinfo = DoviInfoDir();
++    if (p_sys->video.psz_dvinfo)
++    {
++        vlc_mutex_init(&p_sys->video.dvinfo_lock);
++        char psz_path[300];
++        snprintf(psz_path, sizeof(psz_path), "%sdvfp_hdr10plus", p_sys->video.psz_dvinfo);
++        FILE *f = fopen(psz_path, "w");
++        if (f)
++        {
++            fputs("1\n", f);
++            fclose(f);
++        }
++    }
++    p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
++}
++
+ /*
+  * First access unit of an HEVC stream: Dolby Vision (an RPU)? The decoder is
+  * restarted as the Dolby Vision decoder then (before anything was queued).
+@@ -2378,9 +2450,15 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+ 
+     p_sys->video.b_dovi_probe = false;
+     if (p_dec->fmt_out.i_codec != VLC_CODEC_ANDROID_OPAQUE || !DoviLoad()
+-     || dvfp_api.probe(p_block->p_buffer, p_block->i_buffer, &info) != 0
+-     || !info.has_rpu)
++     || dvfp_api.probe(p_block->p_buffer, p_block->i_buffer, &info) != 0)
++        return;
++    if (!info.has_rpu)
++    {
++        if (dvfp_api.probe_hdr10plus && var_InheritBool(p_dec, CFG_PREFIX "dovi-hdr10plus")
++         && dvfp_api.probe_hdr10plus(p_block->p_buffer, p_block->i_buffer))
++            Hdr10PlusProbe(p_dec);
+         return;
++    }
+ 
+     const int i_mc_profile = DoviMediaCodecProfile(info.profile);
+     if (i_mc_profile < 0)
+-- 
+2.55.0.windows.3
+

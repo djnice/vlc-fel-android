@@ -1,0 +1,34 @@
+From ca5c0932339205a371b66f789cf026eb7ba40ebe Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 10 Nov 2026 11:13:05 +0100
+Subject: [PATCH] mediacodec: AV1 with the hardware decoder (video/av01)
+Message-Id: <20261110-dvfel-mediacodec-av1@djnice>
+
+VLC 3's MediaCodec module had no AV1: an AV1 film was decoded by dav1d on
+the CPU, which cannot keep up with 4K on these boxes (the pictures came
+later and later, 85 s behind after two minutes, and all were dropped: no
+picture at all, the sound on), and with no hardware decoder the firmware's
+frame rate switch was not made either. The Amlogic boxes have
+OMX.amlogic.av1.decoder.awesome2 (video/av01, up to 8192x4320); its csd-0
+is the AV1CodecConfigurationRecord, the av1C the container gives VLC.
+---
+ modules/codec/omxil/mediacodec.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index b822a6bc9f..a1be8d13b6 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -1221,6 +1221,9 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+         case VLC_CODEC_VC1:  mime = "video/wvc1"; break;
+         case VLC_CODEC_VP8:  mime = "video/x-vnd.on2.vp8"; break;
+         case VLC_CODEC_VP9:  mime = "video/x-vnd.on2.vp9"; break;
++        /* AV1: csd-0 the AV1CodecConfigurationRecord (av1C, the container's
++         * codec private data), as Android's own extractors give it */
++        case VLC_CODEC_AV1:  mime = "video/av01"; break;
+         }
+     }
+     else
+-- 
+2.55.0.windows.3
+

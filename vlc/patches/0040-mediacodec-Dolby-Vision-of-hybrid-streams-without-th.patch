@@ -1,0 +1,289 @@
+From 5d65bb2944d3bf2ad3c716ea75a7ed98f4d30edf Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 10 Nov 2026 16:29:49 +0000
+Subject: [PATCH] mediacodec: Dolby Vision of hybrid streams without their
+ HDR10+ (option mediacodec-dovi-no-hdr10plus)
+Message-Id: <20261110-dvfel-mediacodec-hybrid-no-hdr10plus@djnice>
+
+A "hybrid" film carries both Dolby Vision (an RPU in every access unit)
+and HDR10+ (ST 2094-40 in a prefix SEI). The Dolby Vision decoder played
+it, but a display that takes HDR10+ before Dolby Vision showed HDR10+: a
+Philips Android TV (MediaTek MT5895) switched to its HDR10+ mode for such
+a stream from the Dolby Vision decoder, and to Dolby Vision for the same
+decoder without HDR10+ in the stream.
+
+With the option mediacodec-dovi-no-hdr10plus (default off), a stream that
+goes to the Dolby Vision decoder (its own RPU, any profile) has its HDR10+
+SEI messages taken out of every access unit before it is queued: a prefix
+SEI NAL unit with HDR10+ alone goes, one with other messages too (mastering
+display, content light level) keeps those, its emulation prevention bytes
+redone. An HDR10+ stream without RPU is not touched (it is no Dolby Vision
+decoder's), nor one converted from HDR10+ (mediacodec-dovi-hdr10plus).
+The first access unit that lost HDR10+ is logged once.
+---
+ modules/codec/omxil/mediacodec.c | 208 +++++++++++++++++++++++++++++++
+ 1 file changed, 208 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index a1be8d13b6..d4f00a380e 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -624,6 +624,10 @@ struct decoder_sys_t
+             dvfp *p_dvfp;
+             bool b_dovi; /* the Dolby Vision decoder is in use */
+             bool b_hdr10plus; /* for an HDR10+ stream converted to profile 8.1 */
++            /* a stream with its own RPU and HDR10+ (a "hybrid" file): the
++             * HDR10+ SEI messages taken out for the Dolby Vision decoder */
++            bool b_strip_hdr10plus;
++            unsigned i_hdr10plus_stripped;
+             int i_dovi_mc_profile; /* its profile constant for the stream */
+             /* the player's information panel: the live level 1 (DoviInfo) */
+             char *psz_dvinfo; /* <app files>/ */
+@@ -668,6 +672,7 @@ static int VideoVC1_OnNewBlock(decoder_t *, block_t **);
+ static void DoviProbe(decoder_t *, const block_t *);
+ static void Hdr10PlusProbe(decoder_t *);
+ static int DoviFilter(decoder_t *, block_t **);
++static void DoviStripHdr10Plus(decoder_t *, block_t *);
+ static void DoviInfo(decoder_t *, const block_t *);
+ static void DoviInfoShown(decoder_t *, unsigned, int64_t);
+ static char *DoviInfoDir(void);
+@@ -723,6 +728,11 @@ static void RemoveInflightPictures(decoder_t *);
+     "An HDR10+ stream goes to the Dolby Vision decoder as profile 8.1: every " \
+     "picture gets an RPU generated from its HDR10+ dynamic metadata " \
+     "(libdvfelplay, as the SamuriHL CoreELEC Kodi build converts)."
++#define MEDIACODEC_DOVI_NO_HDR10PLUS_TEXT "Dolby Vision of hybrid streams"
++#define MEDIACODEC_DOVI_NO_HDR10PLUS_LONGTEXT \
++    "A stream with both Dolby Vision (its own RPU) and HDR10+ goes to the " \
++    "Dolby Vision decoder without its HDR10+ metadata: a display that takes " \
++    "HDR10+ before Dolby Vision (some MediaTek TVs) shows it as Dolby Vision."
+ #define MEDIACODEC_FPS_TEXT "Video frame rate"
+ #define MEDIACODEC_FPS_LONGTEXT \
+     "The frame rate the video decoder is told (0: the stream's). An Amlogic " \
+@@ -770,6 +780,8 @@ vlc_module_begin ()
+              MEDIACODEC_DOVI_DEMO_TEXT, MEDIACODEC_DOVI_DEMO_LONGTEXT, true)
+     add_bool(CFG_PREFIX "dovi-hdr10plus", false,
+              MEDIACODEC_DOVI_HDR10PLUS_TEXT, MEDIACODEC_DOVI_HDR10PLUS_LONGTEXT, true)
++    add_bool(CFG_PREFIX "dovi-no-hdr10plus", false,
++             MEDIACODEC_DOVI_NO_HDR10PLUS_TEXT, MEDIACODEC_DOVI_NO_HDR10PLUS_LONGTEXT, true)
+     add_integer(CFG_PREFIX "mvc", MVC_MODE_AUTO,
+                 MEDIACODEC_MVC_TEXT, MEDIACODEC_MVC_LONGTEXT, true)
+         change_integer_list(pi_mvc_values, ppsz_mvc_names)
+@@ -2372,6 +2384,9 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+         if (i_ret != 1)
+             return i_ret;
+     }
++    /* a hybrid stream (RPU + HDR10+) to the Dolby Vision decoder: without HDR10+ */
++    if (p_sys->video.b_strip_hdr10plus && *pp_block)
++        DoviStripHdr10Plus(p_dec, *pp_block);
+     /* HDR10+: the levels of the RPU generated for the picture */
+     if (p_sys->video.b_hdr10plus && p_sys->video.psz_dvinfo && *pp_block)
+         DoviInfo(p_dec, *pp_block);
+@@ -2521,12 +2536,205 @@ static void DoviProbe(decoder_t *p_dec, const block_t *p_block)
+     p_sys->video.p_dvfp = p_dvfp;
+     p_sys->video.b_dovi = true;
+     p_sys->video.i_dovi_mc_profile = i_mc_profile;
++    p_sys->video.b_strip_hdr10plus = var_InheritBool(p_dec, CFG_PREFIX "dovi-no-hdr10plus");
++    p_sys->video.i_hdr10plus_stripped = 0;
+     p_sys->video.psz_dvinfo = DoviInfoDir();
+     if (p_sys->video.psz_dvinfo)
+         vlc_mutex_init(&p_sys->video.dvinfo_lock);
+     p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+ }
+ 
++/* the next Annex-B start code (00 00 01) at or after i, else n */
++static size_t AnnexBNext(const uint8_t *p, size_t i, size_t n)
++{
++    for (; i + 2 < n; i++)
++        if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1)
++            return i;
++    return n;
++}
++
++/* an SEI message's payload: HDR10+ (ST 2094-40, ITU-T T.35 Samsung, application 4)? */
++static bool SeiIsHdr10Plus(unsigned i_type, const uint8_t *p, size_t i_size)
++{
++    return i_type == 4 /* user_data_registered_itu_t_t35 */ && i_size >= 6
++        && p[0] == 0xB5 && p[1] == 0x00 && p[2] == 0x3C
++        && p[3] == 0x00 && p[4] == 0x01 && p[5] == 0x04;
++}
++
++/*
++ * A prefix SEI NAL unit's payload ([p, p + n), escaped, after its 2-byte
++ * header) without its HDR10+ messages, escaped again into [out]: the size
++ * written; 0: nothing of it left (the NAL unit goes); (size_t)-1: no HDR10+ in
++ * it or not parsed (left as it is). [out] holds at least 2 * n bytes.
++ */
++static size_t SeiWithoutHdr10Plus(const uint8_t *p, size_t n, uint8_t *out)
++{
++    /* the RBSP: emulation prevention bytes taken out */
++    uint8_t *rbsp = malloc(n ? n : 1);
++    if (!rbsp)
++        return (size_t)-1;
++    size_t r = 0, o;
++    unsigned zeros = 0;
++    for (size_t i = 0; i < n; i++)
++    {
++        if (zeros >= 2 && p[i] == 0x03)
++        {
++            zeros = 0;
++            continue;
++        }
++        zeros = p[i] == 0 ? zeros + 1 : 0;
++        rbsp[r++] = p[i];
++    }
++    /* the messages; the kept ones copied to keep[] */
++    uint8_t *keep = malloc(r + 1);
++    if (!keep)
++    {
++        free(rbsp);
++        return (size_t)-1;
++    }
++    size_t k = 0, i = 0;
++    bool b_found = false;
++    while (i < r && !(rbsp[i] == 0x80 && i + 1 == r)) /* rbsp_trailing_bits */
++    {
++        const size_t i_start = i;
++        unsigned i_type = 0, i_size = 0;
++        while (i < r && rbsp[i] == 0xFF) i_type += rbsp[i++];
++        if (i >= r) goto bad;
++        i_type += rbsp[i++];
++        while (i < r && rbsp[i] == 0xFF) i_size += rbsp[i++];
++        if (i >= r) goto bad;
++        i_size += rbsp[i++];
++        if (i_size > r - i) goto bad;
++        if (SeiIsHdr10Plus(i_type, &rbsp[i], i_size))
++            b_found = true;
++        else
++        {
++            memcpy(&keep[k], &rbsp[i_start], i + i_size - i_start);
++            k += i + i_size - i_start;
++        }
++        i += i_size;
++    }
++    free(rbsp);
++    if (!b_found)
++    {
++        free(keep);
++        return (size_t)-1;
++    }
++    if (k == 0)
++    {
++        free(keep);
++        return 0;
++    }
++    keep[k++] = 0x80;
++    /* escaped again */
++    o = 0;
++    zeros = 0;
++    for (size_t j = 0; j < k; j++)
++    {
++        if (zeros >= 2 && keep[j] <= 0x03)
++        {
++            out[o++] = 0x03;
++            zeros = 0;
++        }
++        out[o++] = keep[j];
++        zeros = keep[j] == 0 ? zeros + 1 : 0;
++    }
++    free(keep);
++    return o;
++bad:
++    free(rbsp);
++    free(keep);
++    return (size_t)-1;
++}
++
++/*
++ * An access unit (Annex-B) of a stream that has its own RPU, for the Dolby
++ * Vision decoder: its HDR10+ SEI messages taken out (option
++ * mediacodec-dovi-no-hdr10plus). A display that takes HDR10+ before Dolby
++ * Vision (a Philips TV, MediaTek MT5895) showed such a "hybrid" file as HDR10+
++ * while the Dolby Vision decoder played it. The other SEI messages stay.
++ */
++static void DoviStripHdr10Plus(decoder_t *p_dec, block_t *p_block)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    const uint8_t *p = p_block->p_buffer;
++    const size_t n = p_block->i_buffer;
++    size_t i = AnnexBNext(p, 0, n);
++    /* a quick look first: no prefix SEI NAL unit, nothing to do */
++    bool b_sei = false;
++    for (size_t s = i; s < n; s = AnnexBNext(p, s + 3, n))
++        if (s + 4 < n && ((p[s + 3] >> 1) & 0x3F) == 39)
++        {
++            b_sei = true;
++            break;
++        }
++    if (!b_sei)
++        return;
++
++    uint8_t *out = malloc(n);
++    uint8_t *sei = malloc(2 * n + 4);
++    if (!out || !sei)
++    {
++        free(out);
++        free(sei);
++        return;
++    }
++    size_t o = 0;
++    unsigned i_dropped = 0;
++    memcpy(out, p, i);
++    o = i;
++    while (i < n)
++    {
++        const size_t i_next = AnnexBNext(p, i + 3, n);
++        const size_t i_nal = i + 3;
++        /* the unit ends before the zero bytes in front of the next start code */
++        size_t i_end = i_next;
++        while (i_end > i_nal && p[i_end - 1] == 0)
++            i_end--;
++        bool b_copied = false;
++        if (i_end - i_nal > 2 && ((p[i_nal] >> 1) & 0x3F) == 39)
++        {
++            const size_t i_sei = SeiWithoutHdr10Plus(&p[i_nal + 2], i_end - i_nal - 2, sei);
++            if (i_sei != (size_t)-1)
++            {
++                i_dropped++;
++                if (i_sei > 0 && o + 3 + 2 + i_sei + (i_next - i_end) <= n)
++                {
++                    memcpy(&out[o], &p[i], 3 + 2);
++                    o += 5;
++                    memcpy(&out[o], sei, i_sei);
++                    o += i_sei;
++                    memcpy(&out[o], &p[i_end], i_next - i_end);
++                    o += i_next - i_end;
++                    b_copied = true;
++                }
++                else if (i_sei == 0)
++                {
++                    /* nothing left of it: the unit goes, its start code too */
++                    b_copied = true;
++                }
++                else
++                    i_dropped--; /* (would not fit: left as it is) */
++            }
++        }
++        if (!b_copied)
++        {
++            memcpy(&out[o], &p[i], i_next - i);
++            o += i_next - i;
++        }
++        i = i_next;
++    }
++    if (i_dropped > 0)
++    {
++        memcpy(p_block->p_buffer, out, o);
++        p_block->i_buffer = o;
++        if (p_sys->video.i_hdr10plus_stripped++ == 0)
++            msg_Info(p_dec, "Dolby Vision with HDR10+ (hybrid): HDR10+ taken out for the Dolby Vision decoder");
++    }
++    free(out);
++    free(sei);
++}
++
+ /*
+  * First access units of an H.264 stream: 3D MVC (subset SPS or slice
+  * extension NAL units)? libmvc3dplay then gets every buffer queued from now
+-- 
+2.47.3
+

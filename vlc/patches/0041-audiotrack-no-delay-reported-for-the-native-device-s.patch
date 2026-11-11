@@ -1,0 +1,48 @@
+From 3f974cfa7ada8cfff21c74356497901e9baf8830 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 06:36:09 +0000
+Subject: [PATCH] audiotrack: no delay reported for the "native" device's
+ direct track
+Message-Id: <20261111-dvfel-audiotrack-native-nodelay@djnice>
+
+Music on the "native" device (0035: a direct output at the track's own
+rate, Dune HD boxes) stalled in its first second, and again after every
+seek: the empty direct AudioTrack, played at the start and after a flush,
+was paused by AudioFlinger for its underrun ("pause because of UNDERRUN,
+framesReady = 0"), the HAL went to standby and back, and the timestamps
+that followed made the samples look 100-160 ms early: the aout inserted
+that much silence ("playback way too early: playing silence"). The usual
+mixed output was not affected (a mild down-sampling only). Playing the
+track only once it had 125 / 250 ms of frames did not help.
+
+The native rate's track is music only (the player gives no picture to
+keep to): TimeGet reports no delay for it, as for the passthrough
+encodings without one; the aout then inserts nothing, the AudioTrack's
+buffer paces the writes.
+---
+ modules/audio_output/audiotrack.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/modules/audio_output/audiotrack.c b/modules/audio_output/audiotrack.c
+index 2310a58b5d..8d77bf2bf5 100644
+--- a/modules/audio_output/audiotrack.c
++++ b/modules/audio_output/audiotrack.c
+@@ -918,6 +918,15 @@ TimeGet( audio_output_t *p_aout, vlc_tick_t *restrict p_delay )
+                                || p_sys->fmt.i_format != VLC_CODEC_SPDIFL ) )
+         return -1;
+ 
++    /* The native rate's direct track (AT_DEV_NATIVE, music: no picture to
++     * keep to) neither: AudioFlinger paused it for its underrun at every start
++     * and seek, the HAL went to standby and back, and its timestamps made the
++     * samples look 100-160 ms early - the aout inserted that much silence,
++     * heard as a stall in the first second. Without a delay nothing is
++     * inserted; the AudioTrack's buffer paces the writes. */
++    if( p_sys->b_native_rate )
++        return -1;
++
+     vlc_mutex_lock( &p_sys->lock );
+ 
+     if( p_sys->b_error || !p_sys->i_samples_written || !( env = GET_ENV() ) )
+-- 
+2.47.3
+

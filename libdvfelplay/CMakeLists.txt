@@ -10,7 +10,7 @@ if(NOT LIBDOVI_DIR)
   message(FATAL_ERROR "set LIBDOVI_DIR")
 endif()
 
-add_library(dvfelplay SHARED src/dvfelplay.cpp src/felgpu.c src/module_install.cpp)
+add_library(dvfelplay SHARED src/dvfelplay.cpp src/felgpu.c src/module_install.cpp src/hdr10plus.cpp)
 # the dvfel kernel module to bundle (dvfp_module_install)
 set(DVFEL_KO "" CACHE FILEPATH "dvfel.ko to embed")
 if(DVFEL_KO)

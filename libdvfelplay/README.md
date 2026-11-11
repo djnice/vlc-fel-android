@@ -64,6 +64,16 @@ frames moved this far from the middle between two vsyncs, 0 the worst case; read
 their RPU, a stalled EL decoder or late frames (e.g. Dune HD's `MP4_P7_FEL_STDL.mp4`, whose access units from
 frame 105 on are about half without EL and RPU).
 
+## HDR10+ → Dolby Vision profile 8.1 (2026.11.10.1)
+
+`DVFP_MODE_HDR10PLUS` (check `dvfp_probe_hdr10plus()` exists): an HDR10+ stream without RPU goes to the Dolby Vision
+decoder as profile 8.1, every access unit with an RPU generated from its HDR10+ metadata, as the SamuriHL CoreELEC Kodi
+build converts ("histogram plus" level 1, level 6 and source PQ range from the mastering display / content light level
+SEIs; a picture without HDR10+ metadata gets the last RPU). `src/hdr10plus.cpp`: the RPU is dovi_tool 2.3.4 `generate`
+output used as a template (libdovi 3.3.2's C API has no generator), the values patched in; host test:
+`g++ -std=c++17 -Isrc test/hdr10plus_test.cpp src/hdr10plus.cpp -o /tmp/h10t && /tmp/h10t test/hdr10plus_vectors.txt [stream.hevc]`
+(the vectors: dovi_tool's output for 40 random value sets). `debug.dvfp.h10dbg` 1: the NAL units of the first 100 access
+units with HDR10+ metadata and the encoder's options logged.
 
 ## License
 

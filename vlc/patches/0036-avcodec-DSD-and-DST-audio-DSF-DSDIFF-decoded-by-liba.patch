@@ -1,0 +1,78 @@
+From 7adfe7cbb023dc5cdbdf62310de898685782911b Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sun, 8 Nov 2026 15:04:54 +0100
+Subject: [PATCH] avcodec: DSD and DST audio (DSF / DSDIFF) decoded by
+ libavcodec
+Message-Id: <20261108-dvfel-avcodec-dsd@djnice>
+
+libavformat's dsf and iff demuxers give DSD (1-bit) streams, and libavcodec
+has their decoders (dsd_lsbf / msbf, planar, dst: float PCM at the DSD rate
+/ 8, 352.8 kHz for DSD64), but VLC had no fourcc for them: the streams were
+dropped and a .dsf / .dff "played" in silence. The fourccs and their
+libavcodec ids added.
+---
+ include/vlc_fourcc.h           |  6 ++++++
+ modules/codec/avcodec/fourcc.c |  7 +++++++
+ src/misc/fourcc_list.h         | 11 +++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/include/vlc_fourcc.h b/include/vlc_fourcc.h
+index 070270e771..df3da4e221 100644
+--- a/include/vlc_fourcc.h
++++ b/include/vlc_fourcc.h
+@@ -435,6 +435,12 @@
+ #define VLC_CODEC_FLAC                       VLC_FOURCC('f','l','a','c')
+ #define VLC_CODEC_MLP                        VLC_FOURCC('m','l','p',' ')
+ #define VLC_CODEC_TRUEHD                     VLC_FOURCC('t','r','h','d')
++/* DSD (1-bit) audio, decoded to PCM by libavcodec */
++#define VLC_CODEC_DSD_LSBF                   VLC_FOURCC('D','S','D','l')
++#define VLC_CODEC_DSD_MSBF                   VLC_FOURCC('D','S','D','m')
++#define VLC_CODEC_DSD_LSBF_PLANAR            VLC_FOURCC('D','S','D','L')
++#define VLC_CODEC_DSD_MSBF_PLANAR            VLC_FOURCC('D','S','D','M')
++#define VLC_CODEC_DST                        VLC_FOURCC('D','S','T',' ')
+ #define VLC_CODEC_DVAUDIO                    VLC_FOURCC('d','v','a','u')
+ #define VLC_CODEC_SPEEX                      VLC_FOURCC('s','p','x',' ')
+ #define VLC_CODEC_OPUS                       VLC_FOURCC('O','p','u','s')
+diff --git a/modules/codec/avcodec/fourcc.c b/modules/codec/avcodec/fourcc.c
+index 1e5ac23246..c48255ff05 100644
+--- a/modules/codec/avcodec/fourcc.c
++++ b/modules/codec/avcodec/fourcc.c
+@@ -444,6 +444,13 @@ static const struct vlc_avcodec_fourcc audio_codecs[] =
+     /* AV_CODEC_ID_MP1 */
+     { VLC_CODEC_TWINVQ, AV_CODEC_ID_TWINVQ },
+     { VLC_CODEC_TRUEHD, AV_CODEC_ID_TRUEHD },
++#if LIBAVCODEC_VERSION_CHECK( 57, 2, 100 )
++    { VLC_CODEC_DSD_LSBF, AV_CODEC_ID_DSD_LSBF },
++    { VLC_CODEC_DSD_MSBF, AV_CODEC_ID_DSD_MSBF },
++    { VLC_CODEC_DSD_LSBF_PLANAR, AV_CODEC_ID_DSD_LSBF_PLANAR },
++    { VLC_CODEC_DSD_MSBF_PLANAR, AV_CODEC_ID_DSD_MSBF_PLANAR },
++    { VLC_CODEC_DST, AV_CODEC_ID_DST },
++#endif
+     { VLC_CODEC_ALS, AV_CODEC_ID_MP4ALS },
+     { VLC_CODEC_ATRAC1, AV_CODEC_ID_ATRAC1 },
+     { VLC_CODEC_ATRAC3AL, AV_CODEC_ID_ATRAC3AL },
+diff --git a/src/misc/fourcc_list.h b/src/misc/fourcc_list.h
+index a8ae883123..aa6a43e3a6 100644
+--- a/src/misc/fourcc_list.h
++++ b/src/misc/fourcc_list.h
+@@ -1442,6 +1442,17 @@ static const staticentry_t p_list_audio[] = {
+     B(VLC_CODEC_TRUEHD, "TrueHD Audio"),
+         A("trhd"),
+ 
++    B(VLC_CODEC_DSD_LSBF, "DSD Audio (LSB first)"),
++        A("DSDl"),
++    B(VLC_CODEC_DSD_MSBF, "DSD Audio (MSB first)"),
++        A("DSDm"),
++    B(VLC_CODEC_DSD_LSBF_PLANAR, "DSD Audio (LSB first, planar)"),
++        A("DSDL"),
++    B(VLC_CODEC_DSD_MSBF_PLANAR, "DSD Audio (MSB first, planar)"),
++        A("DSDM"),
++    B(VLC_CODEC_DST, "DST (Direct Stream Transfer) Audio"),
++        A("DST "),
++
+     B(VLC_CODEC_QCELP, "QCELP Audio"),
+         A("Qclp"),
+         A("Qclq"),
+-- 
+2.55.0.windows.3
+

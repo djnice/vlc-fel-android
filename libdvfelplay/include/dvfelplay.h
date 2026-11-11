@@ -140,7 +140,24 @@ enum dvfp_mode
   DVFP_MODE_CONVERT = 0,
   /* the above plus EL decoding and GPU composition (profile 7 FEL) */
   DVFP_MODE_FEL = 1,
+  /*
+   * an HDR10+ stream (no RPU) to the Dolby Vision decoder as profile 8.1:
+   * every access unit gets an RPU generated from its HDR10+ dynamic metadata
+   * (level 1) and the stream's mastering display / content light level SEIs
+   * (level 6, source PQ range), as the SamuriHL CoreELEC Kodi build converts
+   * ("histogram plus" peak brightness source). A picture without HDR10+
+   * metadata gets the last RPU again. Newer than the first API version 1
+   * libraries: check dvfp_probe_hdr10plus() exists first.
+   */
+  DVFP_MODE_HDR10PLUS = 2,
 };
+
+/*
+ * 1 if the Annex-B access unit carries HDR10+ dynamic metadata (a prefix SEI
+ * with an ST 2094-40 user_data_registered_itu_t_t35 message) and no Dolby
+ * Vision RPU. Optional symbol (with DVFP_MODE_HDR10PLUS).
+ */
+DVFP_EXPORT int dvfp_probe_hdr10plus(const uint8_t* au, size_t size);
 /*
  * width, height: the base layer size (the EL is half of it in both
  * directions). DVFP_MODE_FEL starts the EL decoder and the GPU compositor;

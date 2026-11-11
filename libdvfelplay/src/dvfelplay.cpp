@@ -42,6 +42,7 @@
 #include "dvfel_sc2_uapi.h"
 #include "dvfel_uapi.h"
 #include "felgpu.h"
+#include "hdr10plus.h"
 
 #include <algorithm>
 #include <atomic>
@@ -88,7 +89,7 @@
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
 
-#define DVFP_VERSION "2026.10.31.1"
+#define DVFP_VERSION "2026.11.10.1"
 
 namespace
 {
@@ -959,6 +960,12 @@ struct dvfp
   void Stop();
 
   int Filter(const uint8_t* in, size_t size, const uint8_t** out, size_t* outSize);
+  int FilterHdr10Plus(const uint8_t* in, size_t size, const uint8_t** out, size_t* outSize);
+  void LogHdr10Plus() const
+  {
+    LOGI("HDR10+ to profile 8.1: %llu RPUs, %llu level changes, %llu repeated without metadata",
+         (unsigned long long)m_h10Rpus, (unsigned long long)m_h10Changes, (unsigned long long)m_rpuRepeated);
+  }
   void Commit(int64_t pts);
   void Drop();
   void Flush();
@@ -1042,6 +1049,14 @@ private:
   // without one get it again
   std::vector<uint8_t> m_lastRpuIn;
   std::vector<uint8_t> m_lastRpuOut;
+  // DVFP_MODE_HDR10PLUS: the stream's static HDR metadata, the values of the
+  // last generated RPU
+  hdr10plus::Static m_h10Static;
+  hdr10plus::Values m_h10Last{};
+  bool m_h10Have{false};
+  uint64_t m_h10Rpus{0}, m_h10Changes{0};
+  int m_h10Dbg{0};
+  bool m_h10Opts{false};
   bool m_lastCrcValid{false};
   uint32_t m_lastCrc{0};
   bool m_elSeen{false}; // an access unit with EL was committed
@@ -1096,6 +1111,8 @@ private:
 
 int dvfp::Filter(const uint8_t* in, size_t size, const uint8_t** out, size_t* outSize)
 {
+  if (mode == DVFP_MODE_HDR10PLUS)
+    return FilterHdr10Plus(in, size, out, outSize);
   // what an earlier access unit left uncommitted belongs to no packet
   Drop();
   m_out.clear();
@@ -1200,6 +1217,98 @@ int dvfp::Filter(const uint8_t* in, size_t size, const uint8_t** out, size_t* ou
   // the RPU goes as it is then; the EL is removed all the same
   if (!ok && m_convertErrors++ < 10)
     LOGW("RPU not converted to profile 8.1, passed unchanged");
+  return 0;
+}
+
+// HDR10+ -> profile 8.1: the access unit as it is (its HDR10+ SEI too), the
+// RPU generated from its HDR10+ metadata after its slices; a picture without
+// HDR10+ metadata gets the last RPU (a Dolby Vision display needs one with
+// every frame; some encodes drop the SEIs for the end credits)
+int dvfp::FilterHdr10Plus(const uint8_t* in, size_t size, const uint8_t** out, size_t* outSize)
+{
+  Drop();
+  m_out.clear();
+  m_out.reserve(size + 64 + m_lastRpuOut.size());
+  bool vcl = false, hasRpu = false, haveMeta = false;
+  hdr10plus::Meta meta;
+  size_t tail = SIZE_MAX;
+  std::string types; // debug.dvfp.h10dbg: the NAL units of access units without HDR10+ metadata
+  const bool dbg = m_h10Dbg < 100 && PropInt("debug.dvfp.h10dbg", 0) > 0;
+  ForEachNal(in, size, [&](const uint8_t* nal, size_t n) {
+    const int type = n >= 2 ? NalType(nal) : -1;
+    if (dbg && type == 39 && !m_h10Opts)
+    {
+      // the encoder's options (x265's user data unregistered SEI)
+      const char* p = static_cast<const char*>(memmem(nal, n, "hdr10", 5));
+      if (p)
+      {
+        m_h10Opts = true;
+        const size_t at = p - reinterpret_cast<const char*>(nal);
+        const size_t from = at > 60 ? at - 60 : 0;
+        LOGI("h10dbg encoder: %.*s", int(std::min<size_t>(200, n - from)), reinterpret_cast<const char*>(nal) + from);
+      }
+    }
+    if (dbg)
+    {
+      char b[48];
+      if (type == 39 && n > 4)
+        snprintf(b, sizeof(b), "%d(%zu:%02x%02x%02x) ", type, n, nal[2], nal[3], nal[4]);
+      else
+        snprintf(b, sizeof(b), "%d(%zu) ", type, n);
+      types += b;
+    }
+    if (type == 36 || type == 37)
+    {
+      if (tail == SIZE_MAX)
+        tail = m_out.size();
+    }
+    else
+    {
+      tail = SIZE_MAX;
+    }
+    if (type >= 0 && type < 32)
+      vcl = true;
+    else if (type == 39 && hdr10plus::ParseSei(nal, n, m_h10Static, meta))
+      haveMeta = true;
+    else if (type == 62)
+      hasRpu = true; // a stream with its own RPU keeps it
+    m_out.insert(m_out.end(), START_CODE, START_CODE + 4);
+    m_out.insert(m_out.end(), nal, nal + n);
+  });
+
+  if (vcl && !hasRpu)
+  {
+    if (haveMeta)
+    {
+      const hdr10plus::Values v = hdr10plus::Convert(meta, m_h10Static);
+      if (!m_h10Have || v != m_h10Last)
+      {
+        if (m_h10Changes++ < 3 || !m_h10Have)
+          LOGI("HDR10+ -> RPU: source %u..%u, L1 %u / %u / %u, L6 %u / %u / %u / %u", v.sourceMinPq,
+               v.sourceMaxPq, v.minPq, v.maxPq, v.avgPq, v.mdlMax, v.mdlMin, v.maxCll, v.maxFall);
+        m_lastRpuOut = hdr10plus::WriteRpu(v);
+        m_h10Last = v;
+        m_h10Have = true;
+      }
+    }
+    if (!m_lastRpuOut.empty())
+    {
+      const size_t at = tail == SIZE_MAX ? m_out.size() : tail;
+      m_out.insert(m_out.begin() + at, m_lastRpuOut.begin(), m_lastRpuOut.end());
+      m_out.insert(m_out.begin() + at, START_CODE, START_CODE + 4);
+      m_h10Rpus++;
+      if (!haveMeta && m_rpuRepeated++ < 5)
+        LOGI("access unit without HDR10+ metadata: the last RPU repeated");
+    }
+    if (dbg && haveMeta)
+    {
+      m_h10Dbg++;
+      LOGI("h10dbg AU %llu meta L1 %u/%u/%u: %s", (unsigned long long)m_h10Rpus, m_h10Last.minPq, m_h10Last.maxPq,
+           m_h10Last.avgPq, types.c_str());
+    }
+  }
+  *out = m_out.data();
+  *outSize = m_out.size();
   return 0;
 }
 
@@ -2742,7 +2851,7 @@ int dvfp_probe(const uint8_t* au, size_t size, struct dvfp_rpu_info* info)
 dvfp* dvfp_open(int width, int height, int mode)
 {
   VsyncTracker::Get(); // the vsync period is known by the first frame
-  if (mode != DVFP_MODE_CONVERT && mode != DVFP_MODE_FEL)
+  if (mode != DVFP_MODE_CONVERT && mode != DVFP_MODE_FEL && mode != DVFP_MODE_HDR10PLUS)
     return nullptr;
   auto* h = new (std::nothrow) dvfp();
   if (!h)
@@ -2765,12 +2874,36 @@ dvfp* dvfp_open(int width, int height, int mode)
     }
   }
   LOGI("dvfelplay %s opened, %s, %dx%d", DVFP_VERSION,
-       mode == DVFP_MODE_FEL ? "FEL composition" : "profile 8.1 conversion", width, height);
+       mode == DVFP_MODE_FEL         ? "FEL composition"
+       : mode == DVFP_MODE_HDR10PLUS ? "HDR10+ to profile 8.1"
+                                     : "profile 8.1 conversion",
+       width, height);
   return h;
+}
+
+int dvfp_probe_hdr10plus(const uint8_t* au, size_t size)
+{
+  if (!au)
+    return 0;
+  bool hdr10plus = false, rpu = false;
+  hdr10plus::Static st;
+  ForEachNal(au, size, [&](const uint8_t* nal, size_t n) {
+    if (n < 2)
+      return;
+    const int type = NalType(nal);
+    hdr10plus::Meta meta;
+    if (type == 62)
+      rpu = true;
+    else if (type == 39 && !hdr10plus && hdr10plus::ParseSei(nal, n, st, meta))
+      hdr10plus = true;
+  });
+  return hdr10plus && !rpu;
 }
 
 void dvfp_close(dvfp* h)
 {
+  if (h && h->mode == DVFP_MODE_HDR10PLUS)
+    h->LogHdr10Plus();
   delete h;
 }
 

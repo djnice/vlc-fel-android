@@ -1,0 +1,288 @@
+From 50794cc0a82f9283e88726ea636b9c5bd38937f9 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sun, 8 Nov 2026 18:32:20 +0100
+Subject: [PATCH] avcodec: DSD to 88.2 / 96 kHz PCM, low-passed, +6 dB
+Message-Id: <20261108-dvfel-avcodec-dsd-lp@djnice>
+
+libavcodec's DSD decoders give float PCM at the DSD rate / 8 (352.8 kHz
+for DSD64) with the sigma-delta modulator's shaped noise still in it
+(-35 dB re the signal at 50-100 kHz, measured): on a box whose output
+runs at 192 kHz it went on to the receiver and was heard as noise, at a
+low level (DSD's 0 dB, 50 % modulation, is -6 dBFS there).
+
+The decoded DSD now goes through a Kaiser-windowed low-pass (flat to
+30 kHz, -90 dB from 54 kHz) decimated to 88.2 kHz (96 kHz for the 48 kHz
+family; 85 taps for DSD64, scaled for DSD128 / 256), with +6 dB in the
+taps and a soft knee above -1 dBFS for the +3 dB DSD allows over its 0 dB.
+---
+ modules/codec/avcodec/audio.c | 192 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 190 insertions(+), 2 deletions(-)
+
+diff --git a/modules/codec/avcodec/audio.c b/modules/codec/avcodec/audio.c
+index 63758aa71d..8ec114428b 100644
+--- a/modules/codec/avcodec/audio.c
++++ b/modules/codec/avcodec/audio.c
+@@ -41,6 +41,8 @@
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/mem.h>
+ 
++#include <math.h>
++
+ #define API_CHANNEL_LAYOUT_STRUCT (LIBAVCODEC_VERSION_CHECK(59, 24, 100)) // AVCodecContext.ch_layout
+ 
+ #define API_CHANNEL_LAYOUT (LIBAV_UTIL_VERSION_CHECK( 52, 2, 6, 0, 100))
+@@ -49,11 +51,35 @@
+ # include <libavutil/channel_layout.h>
+ #endif
+ 
++/*
++ * DSD: libavcodec's decoders give float PCM at the DSD rate / 8 (352.8 kHz for
++ * DSD64) with the modulator's shaped noise above ~25 kHz still in it (-40 dB re
++ * a -6 dB tone at 50-100 kHz): a box whose output runs at 192 kHz sent it on to
++ * the receiver, heard as noise. Low-passed (flat to 30 kHz, -90 dB from 54 kHz)
++ * and decimated to 88.2 kHz (96 kHz for the 48 kHz family). +6 dB: DSD's 0 dB
++ * (50 % modulation) is libavcodec's -6 dBFS, PCM's 0 dB in players; a soft knee
++ * above -1 dBFS for the +3 dB the format allows over it.
++ */
++typedef struct
++{
++    unsigned i_factor;   /* input rate / output rate, 0: off */
++    unsigned i_taps;
++    unsigned i_channels;
++    float   *p_taps;
++    float   *p_buf;      /* interleaved frames: the history and the new ones */
++    size_t   i_buf;      /* frames in p_buf */
++    size_t   i_alloc;    /* frames p_buf holds */
++} dsd_lp_t;
++
+ /*****************************************************************************
+  * decoder_sys_t : decoder descriptor
+  *****************************************************************************/
+ struct decoder_sys_t
+ {
++    /* DSD to 88.2 / 96 kHz PCM */
++    bool     b_dsd;
++    dsd_lp_t dsd;
++
+     AVCodecContext *p_context;
+     const AVCodec  *p_codec;
+ 
+@@ -80,6 +106,148 @@ static block_t * ConvertAVFrame( decoder_t *p_dec, AVFrame *frame );
+ static int  DecodeAudio( decoder_t *, block_t * );
+ static void Flush( decoder_t * );
+ 
++static bool DsdCodec( enum AVCodecID id )
++{
++#if LIBAVCODEC_VERSION_CHECK( 57, 2, 100 )
++    return id == AV_CODEC_ID_DSD_LSBF || id == AV_CODEC_ID_DSD_MSBF
++        || id == AV_CODEC_ID_DSD_LSBF_PLANAR || id == AV_CODEC_ID_DSD_MSBF_PLANAR
++        || id == AV_CODEC_ID_DST;
++#else
++    VLC_UNUSED( id );
++    return false;
++#endif
++}
++
++/* the PCM rate a DSD decoder's i_rate goes out at (i_rate itself: as it is) */
++static unsigned DsdOutRate( unsigned i_rate )
++{
++    const unsigned i_out = i_rate % 44100 == 0 ? 88200 : 96000;
++    return i_rate > i_out && i_rate % i_out == 0 ? i_out : i_rate;
++}
++
++static double BesselI0( double x )
++{
++    double s = 1., t = 1.;
++    for( int k = 1; k < 64; k++ )
++    {
++        const double q = x / ( 2 * k );
++        t *= q * q;
++        s += t;
++        if( t < 1e-12 * s )
++            break;
++    }
++    return s;
++}
++
++static void DsdLpClean( dsd_lp_t *lp )
++{
++    free( lp->p_taps );
++    free( lp->p_buf );
++    memset( lp, 0, sizeof(*lp) );
++}
++
++/* the Kaiser-windowed low-pass from i_rate to its DsdOutRate, +6 dB in the taps */
++static int DsdLpSetup( decoder_t *p_dec, dsd_lp_t *lp, unsigned i_rate,
++                       unsigned i_channels )
++{
++    const unsigned i_out = DsdOutRate( i_rate );
++    const unsigned i_factor = i_rate / i_out;
++    if( lp->p_taps && lp->i_factor == i_factor && lp->i_channels == i_channels )
++        return VLC_SUCCESS;
++    DsdLpClean( lp );
++
++    const double f_pass = i_out * ( 30. / 88.2 ), f_stop = i_out * ( 54. / 88.2 );
++    const double A = 90., beta = 0.1102 * ( A - 8.7 );
++    const double dw = 2. * M_PI * ( f_stop - f_pass ) / i_rate;
++    const unsigned n = (unsigned)ceil( ( A - 8. ) / ( 2.285 * dw ) ) | 1;
++    float *p_taps = malloc( n * sizeof(float) );
++    if( unlikely(p_taps == NULL) )
++        return VLC_ENOMEM;
++
++    const double fc = ( f_pass + f_stop ) / 2. / i_rate, m = ( n - 1 ) / 2.;
++    const double i0 = BesselI0( beta );
++    double h[n], sum = 0.;
++    for( unsigned i = 0; i < n; i++ )
++    {
++        const double t = i - m, r = t / m;
++        h[i] = t == 0. ? 2. * fc : sin( 2. * M_PI * fc * t ) / ( M_PI * t );
++        h[i] *= BesselI0( beta * sqrt( fmax( 0., 1. - r * r ) ) ) / i0;
++        sum += h[i];
++    }
++    for( unsigned i = 0; i < n; i++ )
++        p_taps[i] = h[i] / sum * 2.; /* +6 dB */
++
++    lp->p_taps = p_taps;
++    lp->i_taps = n;
++    lp->i_factor = i_factor;
++    lp->i_channels = i_channels;
++    lp->i_buf = 0;
++    msg_Dbg( p_dec, "DSD: %u Hz low-passed to %u Hz (%u taps), +6 dB",
++             i_rate, i_out, n );
++    return VLC_SUCCESS;
++}
++
++static inline float DsdKnee( float v )
++{
++    const float k = .891f; /* -1 dBFS */
++    float a = fabsf( v );
++    if( a <= k )
++        return v;
++    a = k + ( 1.f - k ) * tanhf( ( a - k ) / ( 1.f - k ) );
++    return copysignf( a, v );
++}
++
++/* interleaved FL32 at the DSD decoder's rate in, at its DsdOutRate out (NULL:
++ * none yet, the frames kept for the next block) */
++static block_t *DsdLpProcess( dsd_lp_t *lp, block_t *p_in )
++{
++    const unsigned ch = lp->i_channels, n = lp->i_taps, f = lp->i_factor;
++    const size_t i_need = lp->i_buf + p_in->i_nb_samples;
++
++    if( i_need > lp->i_alloc )
++    {
++        float *p_buf = realloc( lp->p_buf, i_need * ch * sizeof(float) );
++        if( unlikely(p_buf == NULL) )
++        {
++            block_Release( p_in );
++            return NULL;
++        }
++        lp->p_buf = p_buf;
++        lp->i_alloc = i_need;
++    }
++    memcpy( lp->p_buf + lp->i_buf * ch, p_in->p_buffer,
++            p_in->i_nb_samples * ch * sizeof(float) );
++    lp->i_buf = i_need;
++
++    const size_t i_outs = i_need >= n ? ( i_need - n ) / f + 1 : 0;
++    block_t *p_out = i_outs ? block_Alloc( i_outs * ch * sizeof(float) ) : NULL;
++    if( p_out )
++    {
++        float *o = (float *)p_out->p_buffer;
++        for( size_t k = 0; k < i_outs; k++ )
++        {
++            const float *x = lp->p_buf + k * f * ch;
++            for( unsigned c = 0; c < ch; c++ )
++            {
++                float acc = 0.f;
++                for( unsigned i = 0; i < n; i++ )
++                    acc += lp->p_taps[i] * x[i * ch + c];
++                *o++ = DsdKnee( acc );
++            }
++        }
++        p_out->i_nb_samples = i_outs;
++        p_out->i_flags = p_in->i_flags;
++    }
++    /* the next output starts at frame i_outs * f */
++    const size_t i_used = i_outs * f;
++    memmove( lp->p_buf, lp->p_buf + i_used * ch,
++             ( i_need - i_used ) * ch * sizeof(float) );
++    lp->i_buf = i_need - i_used;
++
++    block_Release( p_in );
++    return p_out;
++}
++
+ static void InitDecoderConfig( decoder_t *p_dec, AVCodecContext *p_context )
+ {
+     if( p_dec->fmt_in.i_extra > 0 )
+@@ -211,6 +379,7 @@ void EndAudioDec( vlc_object_t *obj )
+     decoder_sys_t *sys = p_dec->p_sys;
+     AVCodecContext *ctx = sys->p_context;
+ 
++    DsdLpClean( &sys->dsd );
+     avcodec_free_context( &ctx );
+     free( sys );
+ }
+@@ -239,6 +408,8 @@ int InitAudioDec( vlc_object_t *obj )
+     p_dec->p_sys = p_sys;
+     p_sys->p_context = avctx;
+     p_sys->p_codec = codec;
++    p_sys->b_dsd = DsdCodec( codec->id );
++    memset( &p_sys->dsd, 0, sizeof(p_sys->dsd) );
+ 
+     // Initialize decoder extradata
+     InitDecoderConfig( p_dec, avctx );
+@@ -290,6 +461,7 @@ static void Flush( decoder_t *p_dec )
+     if( avcodec_is_open( ctx ) )
+         avcodec_flush_buffers( ctx );
+     date_Set( &p_sys->end_date, VLC_TICK_INVALID );
++    DsdLpClean( &p_sys->dsd );
+ 
+     if( ctx->codec_id == AV_CODEC_ID_MP2 ||
+         ctx->codec_id == AV_CODEC_ID_MP3 )
+@@ -422,9 +594,11 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
+                           channels, ctx->sample_rate );
+                 goto drop;
+             }
+-            else if( p_dec->fmt_out.audio.i_rate != (unsigned int)ctx->sample_rate )
++            const unsigned i_rate = p_sys->b_dsd ? DsdOutRate( ctx->sample_rate )
++                                                 : (unsigned) ctx->sample_rate;
++            if( p_dec->fmt_out.audio.i_rate != i_rate )
+             {
+-                date_Init( &p_sys->end_date, ctx->sample_rate, 1 );
++                date_Init( &p_sys->end_date, i_rate, 1 );
+             }
+ 
+             SetupOutputFormat( p_dec, true );
+@@ -432,6 +606,18 @@ static int DecodeBlock( decoder_t *p_dec, block_t **pp_block )
+                 goto drop;
+ 
+             block_t *p_converted = ConvertAVFrame( p_dec, frame ); /* Consumes frame */
++            if( p_converted && i_rate != (unsigned) ctx->sample_rate )
++            {
++                if( p_dec->fmt_out.audio.i_format != VLC_CODEC_FL32
++                 || DsdLpSetup( p_dec, &p_sys->dsd, ctx->sample_rate,
++                                p_dec->fmt_out.audio.i_channels ) )
++                {
++                    block_Release( p_converted );
++                    p_converted = NULL;
++                }
++                else
++                    p_converted = DsdLpProcess( &p_sys->dsd, p_converted );
++            }
+             if( p_converted )
+             {
+                 /* Silent unwanted samples */
+@@ -598,6 +784,8 @@ static void SetupOutputFormat( decoder_t *p_dec, bool b_trust )
+     p_dec->fmt_out.audio.channel_type = p_dec->fmt_in.audio.channel_type;
+     p_dec->fmt_out.audio.i_format = p_dec->fmt_out.i_codec;
+     p_dec->fmt_out.audio.i_rate = p_sys->p_context->sample_rate;
++    if( p_sys->b_dsd )
++        p_dec->fmt_out.audio.i_rate = DsdOutRate( p_dec->fmt_out.audio.i_rate );
+ 
+     /* */
+ #if API_CHANNEL_LAYOUT_STRUCT
+-- 
+2.55.0.windows.3
+
