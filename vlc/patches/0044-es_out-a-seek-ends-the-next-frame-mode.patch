@@ -1,0 +1,36 @@
+From 959258a4adbe442b3362c2ada559d191fad933a3 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 11:43:53 +0100
+Subject: [PATCH] es_out: a seek ends the next-frame mode
+
+Paused, after next frames (frame stepping on), a precise seek (a frame
+back) ran in the next-frame mode, which only the end of the pause ends:
+it showed the picture after its target, another one after that for a
+moment, and the next seek went two back (Amlogic, Dolby Vision profile
+8: video_composer's frame index 115 -> 116 instead of 114, then 113).
+The seek now ends it; the next frame starts it again.
+
+Message-Id: <20261111-dvfel-es-out-seek-ends-next-frame@djnice>
+---
+ src/input/es_out.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index 981803c..b01aa0c 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -2978,6 +2978,11 @@ static int EsOutControlLocked( es_out_t *out, int i_query, va_list args )
+ 
+         assert( i_date == -1 );
+         EsOutChangePosition( out );
++        /* A seek ends the next-frame mode (the next frame starts it again):
++         * kept, the precise seek that follows frame steps (paused, a frame
++         * back) showed a picture after its target, and another one after
++         * that for a moment (Amlogic, measured), the next seek two back */
++        p_sys->p_next_frame_es = NULL;
+ 
+         return VLC_SUCCESS;
+     }
+-- 
+2.55.0.windows.3
+

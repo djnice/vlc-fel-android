@@ -1,0 +1,51 @@
+From 1021d98ffaf3285755cc77769f0a6bfcd3280add Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 14:30:23 +0100
+Subject: [PATCH] es_out: the buffering's end told after the decoders' first
+ picture
+
+The cache event at 100 % came before es_out waited for the decoders'
+first picture. A player that starts its next seek when the previous one
+is done (frame stepping while paused: steps counted meanwhile go in one
+seek) dropped the picture of the previous one, still being decoded. It
+is now sent after that wait.
+
+Message-Id: <20261111-dvfel-es-out-cache-after-decoder-wait@djnice>
+---
+ src/input/es_out.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index b01aa0c..bc8fbf0 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -715,7 +715,6 @@ static void EsOutDecodersStopBuffering( es_out_t *out, bool b_forced )
+ 
+         return;
+     }
+-    input_SendEventCache( p_sys->p_input, 1.0 );
+ 
+     msg_Dbg( p_sys->p_input, "Stream buffering done (%d ms in %d ms)",
+               (int)(i_stream_duration/1000), (int)(i_system_duration/1000) );
+@@ -725,6 +724,7 @@ static void EsOutDecodersStopBuffering( es_out_t *out, bool b_forced )
+ 
+     if( p_sys->i_buffering_extra_initial > 0 )
+     {
++        input_SendEventCache( p_sys->p_input, 1.0 );
+         /* FIXME wrong ? */
+         return;
+     }
+@@ -743,6 +743,10 @@ static void EsOutDecodersStopBuffering( es_out_t *out, bool b_forced )
+ 
+     msg_Dbg( p_sys->p_input, "Decoder wait done in %d ms",
+               (int)(mdate() - i_decoder_buffering_start)/1000 );
++    /* The buffering's end once the decoders have their first picture: a
++     * player waiting for a seek's picture (frame stepping, paused) learns it
++     * here - told before the wait, its next seek dropped that picture */
++    input_SendEventCache( p_sys->p_input, 1.0 );
+ 
+     /* Here is a good place to destroy unused vout with every demuxer */
+     input_resource_TerminateVout( input_priv(p_sys->p_input)->p_resource );
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,41 @@
+From 4fcc2fee7146b895e4d2ecb63966648afe250db1 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 13:20:35 +0100
+Subject: [PATCH] ts: a precise seek reads from 3 s before its time
+
+The packet of a time is in the middle of a group of pictures, the
+decoder starts at the next key frame: a precise seek showed that key
+frame (paused, a frame back on a Blu-ray m2ts jumped to it, then the
+same picture at every step). It now reads from 3 s before (a Blu-ray's
+GOP is about 1 s), the key frame before the time comes, the pictures up
+to the time are preroll.
+
+Message-Id: <20261111-dvfel-ts-precise-seek-from-before@djnice>
+---
+ modules/demux/mpeg/ts.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index f4e4492..302c586 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -1050,8 +1050,15 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
+         i64 = va_arg( args, int64_t );
+         b_bool = (bool) va_arg( args, int ); /* precise */
+ 
++        /* A precise seek reads from a while before the time: the time's
++         * packet is in the middle of a group of pictures, the decoder starts
++         * at the next key frame - the picture shown was that key frame (a
++         * frame back, paused: the same one again and again). From 3 s before
++         * (a Blu-ray's GOP is about 1 s) the key frame before it is read,
++         * the pictures up to the time are preroll. */
+         if( p_sys->b_canseek && p_pmt && p_pmt->pcr.i_first != VLC_TICK_INVALID &&
+-           !SeekToTime( p_demux, p_pmt, p_pmt->pcr.i_first + i64, b_bool ) )
++           !SeekToTime( p_demux, p_pmt, p_pmt->pcr.i_first +
++                        (b_bool ? __MAX( i64 - 3 * CLOCK_FREQ, 0 ) : i64), b_bool ) )
+         {
+             ReadyQueuesPostSeek( p_demux );
+             es_out_Control( p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME,
+-- 
+2.55.0.windows.3
+

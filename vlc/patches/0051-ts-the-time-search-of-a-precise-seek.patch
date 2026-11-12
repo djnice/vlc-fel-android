@@ -1,0 +1,62 @@
+From 1cec3798a2dab12036a5ad8a1f4c506f0a25a885 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 15:04:29 +0100
+Subject: [PATCH] ts: the time search of a precise seek
+
+The binary search for a time took a place only within 500 ms before the
+time. The times it reads are PCRs and the video's DTSs, on a Blu-ray m2ts
+some 0.9 s apart: near the time they jumped over that window (1.1 s
+before, then 41 ms after), the search failed about half the time and the
+seek went by byte position (paused, a frame back on a Blu-ray handed
+over at its middle showed a key frame far off). A precise seek now goes
+from the last place before the time; its preroll reaches the time.
+
+Message-Id: <20261111-dvfel-ts-seek-search-v2@djnice>
+---
+ modules/demux/mpeg/ts.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 302c586..234df18 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -2491,6 +2491,8 @@ static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_see
+         return VLC_EGENERIC;
+ 
+     bool b_found = false;
++    /* the last place read from whose time was before the time (precise) */
++    uint64_t i_before_pos = UINT64_MAX;
+     while( (i_head_pos + p_sys->i_packet_size) <= i_tail_pos && !b_found )
+     {
+         /* Round i_pos to a multiple of p_sys->i_packet_size */
+@@ -2557,7 +2559,10 @@ static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_see
+                 else if( i_diff < CLOCK_FREQ / 2 ) // 500ms
+                     b_found = true;
+                 else
++                {
+                     i_head_pos = i_pos;
++                    i_before_pos = i_splitpos;
++                }
+                 break;
+             }
+         }
+@@ -2566,6 +2571,16 @@ static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_see
+             i_tail_pos = (i_splitpos >= p_sys->i_packet_size) ? i_splitpos - p_sys->i_packet_size : 0;
+     }
+ 
++    /* A precise seek with no place within 500 ms before the time: from the
++     * last one before it (its preroll goes up to the time). The times read
++     * are PCRs and the video's DTSs, on a Blu-ray some 0.9 s apart: near the
++     * time they jumped over that window, the search failed half the time and
++     * the seek went by byte position (paused, a frame back showed a key
++     * frame far off). */
++    if( !b_found && b_precise && i_before_pos != UINT64_MAX &&
++        vlc_stream_Seek( p_sys->stream, i_before_pos ) == VLC_SUCCESS )
++        return VLC_SUCCESS;
++
+     if( !b_found )
+     {
+         msg_Dbg( p_demux, "Seek():cannot find a time position." );
+-- 
+2.55.0.windows.3
+

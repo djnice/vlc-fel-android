@@ -1,0 +1,42 @@
+From 9dbf970c8ad4d03ef14f5db7dc00a1d334ef4a64 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 11:16:31 +0100
+Subject: [PATCH] android: a picture way too early released at once with a time
+
+Paused, the picture of a seek (frame stepping back) or of a next frame
+is dated far ahead (the paused clock): Prepare left it to Display, which
+released it without a time. Amlogic's video layer then showed another
+picture for a vsync before it now and then (measured: two buffers 45 ms
+apart for the one picture VLC rendered). Now released at once with the
+current time, as a picture released at its time.
+
+Message-Id: <20261111-dvfel-android-way-too-early-release-now@djnice>
+---
+ modules/video_output/android/display.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/modules/video_output/android/display.c b/modules/video_output/android/display.c
+index 10d182d..013cbbe 100644
+--- a/modules/video_output/android/display.c
++++ b/modules/video_output/android/display.c
+@@ -1091,8 +1091,15 @@ static void Prepare(vout_display_t *vd, picture_t *picture,
+          * take the vsync of the frame before it (a drop). */
+         if (picture->date - now <= INT64_C(1000000))
+             AndroidOpaquePicture_ReleaseAtTime(picture->p_sys, picture->date);
+-        else /* The picture will be displayed from the Display callback */
+-            msg_Warn(vd, "picture way too early to release at time");
++        else
++        {
++            /* Way too early (paused: the picture of a seek, a next frame):
++             * at once, but with a time - released without one (from
++             * Display), Amlogic's video layer showed another picture for
++             * a vsync before it now and then */
++            msg_Dbg(vd, "picture way too early to release at time: now");
++            AndroidOpaquePicture_ReleaseAtTime(picture->p_sys, now);
++        }
+     }
+ 
+     if (subpicture && sys->p_sub_window) {
+-- 
+2.55.0.windows.3
+

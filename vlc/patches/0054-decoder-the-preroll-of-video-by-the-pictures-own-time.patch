@@ -1,0 +1,101 @@
+From d18a4673f74978df608db117d8d5b12c4e363d47 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 15:50:35 +0100
+Subject: [PATCH] decoder: the preroll of video by the pictures' own time
+
+Two things let a picture before a precise seek's time through the
+decoder core when the decoder does not drop the preroll itself (an m2ts:
+the packetizer's access units have no preroll flag for mediacodec):
+- it compared the end of the preroll with the picture's date, which
+  mediacodec moves early for Dolby Vision (lead time + release ahead, up
+  to 265 ms); decoder_t.i_picture_date_lead tells that now, the date +
+  it is compared;
+- a block that is not preroll lowered the end to its decode time, before
+  the time of pictures still preroll (B-frames).
+Paused, a frame back on a Blu-ray (ISO, BDMV m2ts) showed a picture some
+frames off, or the same one again.
+
+Message-Id: <20261111-dvfel-decoder-video-preroll-own-time@djnice>
+---
+ include/vlc_codec.h              |  7 +++++++
+ modules/codec/omxil/mediacodec.c |  2 ++
+ src/input/decoder.c              | 13 +++++++++++--
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/include/vlc_codec.h b/include/vlc_codec.h
+index 8fed2f4..2edad05 100644
+--- a/include/vlc_codec.h
++++ b/include/vlc_codec.h
+@@ -156,6 +156,13 @@ struct decoder_t
+      */
+     int             i_extra_picture_buffers;
+ 
++    /**
++     * How much earlier than its timestamp a picture's date is (a decoder that
++     * releases pictures ahead of their display: mediacodec's Dolby Vision lead
++     * time); the end of a preroll is compared with date + this.
++     */
++    vlc_tick_t      i_picture_date_lead;
++
+     /* Audio output callbacks */
+     int             (*pf_aout_format_update)( decoder_t * );
+ 
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 2d78fca..0ad61e4 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -1657,6 +1657,8 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+         if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns
+          && p_sys->api.b_direct_rendering && p_sys->api.release_out_ts)
+             p_pic->date -= DoviReleaseAhead(p_dec, p_sys->video.b_dovi);
++        /* (the decoder core compares the end of a preroll with date + this) */
++        p_dec->i_picture_date_lead = (forced_ts == VLC_TICK_INVALID ? p_out->buf.i_ts : forced_ts) - p_pic->date;
+         p_pic->b_progressive = true;
+         /* the first picture after a preroll (the ones before it were dropped
+          * above, by their time): forced, the decoder core compares its own
+diff --git a/src/input/decoder.c b/src/input/decoder.c
+index c0646f3..aa8e92c 100644
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -782,6 +782,12 @@ static inline void DecoderUpdatePreroll( int64_t *pi_preroll, const block_t *p,
+     else if( (p->i_flags & BLOCK_FLAG_DISCONTINUITY) &&
+              (p->i_buffer == 0 || (p->i_flags & BLOCK_FLAG_CORRUPTED)) )
+         *pi_preroll = INT64_MAX;
++    /* Video with its preroll's latest picture known: a block that is not
++     * preroll does not end it - its decode time is before the time of
++     * pictures still preroll (B-frames), they were shown (paused, a frame back
++     * on a Blu-ray m2ts showed one some frames before) */
++    else if( b_video && *pi_preroll != INT64_MAX )
++        return;
+     else if( p->i_dts > VLC_TICK_INVALID )
+         *pi_preroll = __MIN( *pi_preroll, p->i_dts );
+     else if( p->i_pts > VLC_TICK_INVALID )
+@@ -1016,7 +1022,8 @@ static int DecoderPlayVideo( decoder_t *p_dec, picture_t *p_picture,
+     vlc_mutex_lock( &p_owner->lock );
+     /* (a picture the decoder forces is past the preroll: it knows, mediacodec
+      * by the pictures' own times, the date may be moved early) */
+-    if( p_owner->i_preroll_end > p_picture->date && !p_picture->b_force )
++    if( p_owner->i_preroll_end > p_picture->date + p_dec->i_picture_date_lead
++     && !p_picture->b_force )
+     {
+         vlc_mutex_unlock( &p_owner->lock );
+         picture_Release( p_picture );
+@@ -1024,12 +1031,14 @@ static int DecoderPlayVideo( decoder_t *p_dec, picture_t *p_picture,
+     }
+ 
+     prerolled = p_owner->i_preroll_end > INT64_MIN;
++    const int64_t i_preroll_end = p_owner->i_preroll_end;
+     p_owner->i_preroll_end = INT64_MIN;
+     vlc_mutex_unlock( &p_owner->lock );
+ 
+     if( unlikely(prerolled) )
+     {
+-        msg_Dbg( p_dec, "end of video preroll" );
++        msg_Dbg( p_dec, "end of video preroll: picture %"PRId64" (preroll end %"PRId64")",
++                 p_picture->date + p_dec->i_picture_date_lead, i_preroll_end );
+ 
+         if( p_vout )
+             vout_Flush( p_vout, VLC_TICK_INVALID+1 );
+-- 
+2.55.0.windows.3
+

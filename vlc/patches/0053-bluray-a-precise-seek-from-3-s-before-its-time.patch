@@ -1,0 +1,41 @@
+From 1efa73c834893e38ea73c858f2342d8c06f8755d Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 15:42:22 +0100
+Subject: [PATCH] bluray: a precise seek from 3 s before its time
+
+On a seek the bluray module starts its ts parser anew; that drops the
+packets before its tables (PAT, PMT), the start of the key frame
+libbluray lands on with them: the decoder began at the next key frame,
+after the time, and no picture was preroll (paused, a frame back on an
+ISO showed that key frame every time). A precise seek now goes from
+3 s before (a Blu-ray's GOP is about 1 s), the preroll (0047) goes up to
+the time.
+
+Message-Id: <20261111-dvfel-bluray-precise-seek-from-before@djnice>
+---
+ modules/access/bluray.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/modules/access/bluray.c b/modules/access/bluray.c
+index 62c8c05..6ec483c 100644
+--- a/modules/access/bluray.c
++++ b/modules/access/bluray.c
+@@ -2374,7 +2374,14 @@ static int blurayControl(demux_t *p_demux, int query, va_list args)
+         int64_t i_time = va_arg(args, int64_t);
+         bool b_precise = (bool) va_arg(args, int);
+         p_sys->i_seek_preroll = 0;
+-        bd_seek_time(p_sys->bluray, TO_SCALE_NZ(i_time));
++        /* A precise seek from 3 s before: the ts parser starts anew, it drops
++         * the packets before its tables (PAT, PMT), the start of the key frame
++         * libbluray lands on with them - the decoder began at the next one,
++         * after the time (paused, a frame back showed that one every time). A
++         * Blu-ray's GOP is about 1 s: the key frame after 3 s before is before
++         * the time, the preroll goes up to it. */
++        bd_seek_time(p_sys->bluray, TO_SCALE_NZ(b_precise && i_time > 3 * CLOCK_FREQ
++                                                ? i_time - 3 * CLOCK_FREQ : i_time));
+         blurayRestartParser(p_demux, true, true);
+         notifyDiscontinuityToParser(p_sys);
+         p_sys->b_draining = false;
+-- 
+2.55.0.windows.3
+

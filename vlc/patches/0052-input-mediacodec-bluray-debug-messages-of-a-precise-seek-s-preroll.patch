@@ -1,0 +1,66 @@
+From 77172d7dfcc7c4c11e7bfe65b3ea17cf673fa2ef Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 15:35:03 +0100
+Subject: [PATCH] input, mediacodec, bluray: debug messages of a precise seek's
+ preroll
+
+Where a precise seek's preroll goes (es_out's next display time, the
+bluray module's time in its clip), when a position change ends it, and
+mediacodec's first picture after it: verbose only, to tell which
+picture a seek shows.
+
+Message-Id: <20261111-dvfel-preroll-debug-messages@djnice>
+---
+ modules/access/bluray.c          | 1 +
+ modules/codec/omxil/mediacodec.c | 1 +
+ src/input/es_out.c               | 3 +++
+ 3 files changed, 5 insertions(+)
+
+diff --git a/modules/access/bluray.c b/modules/access/bluray.c
+index 668e7b2..62c8c05 100644
+--- a/modules/access/bluray.c
++++ b/modules/access/bluray.c
+@@ -2394,6 +2394,7 @@ static int blurayControl(demux_t *p_demux, int query, va_list args)
+                     t < c->start_time + (c->out_time - c->in_time))
+                 {
+                     p_sys->i_seek_preroll = FROM_SCALE(c->in_time + (t - c->start_time));
++                    msg_Dbg(p_demux, "precise seek: time %"PRId64" in clip %u (start %"PRIu64" in %"PRIu64"): preroll to %"PRId64, i_time, i, c->start_time, c->in_time, p_sys->i_seek_preroll);
+                     es_out_Control(p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME,
+                                    p_sys->i_seek_preroll);
+                     break;
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 303a469..2d78fca 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -1667,6 +1667,7 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+         if (p_sys->b_preroll_pending)
+         {
+             p_pic->b_force = true;
++            msg_Dbg(p_dec, "first picture after a preroll: pts %"PRId64" (the preroll's latest %"PRId64")", p_out->buf.i_ts, p_sys->i_preroll_end);
+             p_sys->b_preroll_pending = false;
+         }
+ 
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index bc8fbf0..b8948c6 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -638,6 +638,8 @@ static void EsOutChangePosition( es_out_t *out )
+     es_out_sys_t      *p_sys = out->p_sys;
+ 
+     input_SendEventCache( p_sys->p_input, 0.0 );
++    if( p_sys->i_preroll_end >= 0 )
++        msg_Dbg( p_sys->p_input, "preroll to %"PRId64" ended by a position change", p_sys->i_preroll_end );
+ 
+     for( int i = 0; i < p_sys->i_es; i++ )
+     {
+@@ -2800,6 +2802,7 @@ static int EsOutControlLocked( es_out_t *out, int i_query, va_list args )
+         if( i_date < 0 )
+             return VLC_EGENERIC;
+ 
++        msg_Dbg( p_sys->p_input, "preroll to %"PRId64, i_date );
+         p_sys->i_preroll_end = i_date;
+ 
+         return VLC_SUCCESS;
+-- 
+2.55.0.windows.3
+

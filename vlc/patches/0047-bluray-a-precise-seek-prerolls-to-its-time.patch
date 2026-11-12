@@ -1,0 +1,83 @@
+From 8e4ad5536593cf5528f34d2f23a5d9b403b621ad Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 12:54:46 +0100
+Subject: [PATCH] bluray: a precise seek prerolls to its time
+
+libbluray seeks to the entry point (key frame) before the time; with no
+preroll the key frame was shown: paused, a frame back on a Blu-ray (ISO,
+BDMV folder) jumped to it, or stayed on it at the next steps. A precise
+seek now gives es_out the time's stream timestamp (its clip's in_time
+plus the time in the clip), the pictures before it are preroll, as the
+ts demuxer does.
+
+Message-Id: <20261111-dvfel-bluray-precise-seek-preroll@djnice>
+---
+ modules/access/bluray.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/modules/access/bluray.c b/modules/access/bluray.c
+index 5c81469..668e7b2 100644
+--- a/modules/access/bluray.c
++++ b/modules/access/bluray.c
+@@ -168,6 +168,9 @@ struct  demux_sys_t
+     vlc_mutex_t             pl_info_lock;
+     BLURAY_TITLE_INFO      *p_pl_info;
+     const BLURAY_CLIP_INFO *p_clip_info;
++    /* a precise seek's preroll end (stream time), again after its
++     * BD_EVENT_SEEK (its pcr reset ends the preroll); 0: none */
++    vlc_tick_t              i_seek_preroll;
+     enum
+     {
+         BD_CLIP_APP_TYPE_TS_MAIN_PATH_MOVIE = 1,
+@@ -2369,11 +2372,34 @@ static int blurayControl(demux_t *p_demux, int query, va_list args)
+     case DEMUX_SET_TIME:
+     {
+         int64_t i_time = va_arg(args, int64_t);
++        bool b_precise = (bool) va_arg(args, int);
++        p_sys->i_seek_preroll = 0;
+         bd_seek_time(p_sys->bluray, TO_SCALE_NZ(i_time));
+         blurayRestartParser(p_demux, true, true);
+         notifyDiscontinuityToParser(p_sys);
+         p_sys->b_draining = false;
+         es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_FLAG_DISCONTINUITY);
++        /* A precise seek: libbluray lands on the entry point (key frame)
++         * before the time, the pictures from there to the time are preroll -
++         * as the ts demuxer does. The time's stream timestamp: its clip's
++         * in_time + its time in the clip (paused, a frame back showed the key
++         * frame every time) */
++        if (b_precise && p_sys->p_pl_info)
++        {
++            const uint64_t t = TO_SCALE_NZ(i_time);
++            for (unsigned i = 0; i < p_sys->p_pl_info->clip_count; i++)
++            {
++                const BLURAY_CLIP_INFO *c = &p_sys->p_pl_info->clips[i];
++                if (t >= c->start_time &&
++                    t < c->start_time + (c->out_time - c->in_time))
++                {
++                    p_sys->i_seek_preroll = FROM_SCALE(c->in_time + (t - c->start_time));
++                    es_out_Control(p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME,
++                                   p_sys->i_seek_preroll);
++                    break;
++                }
++            }
++        }
+         return VLC_SUCCESS;
+     }
+     case DEMUX_GET_TIME:
+@@ -2799,6 +2825,13 @@ static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e, bool b_delaye
+         blurayRestartParser(p_demux, true, true);
+         notifyDiscontinuityToParser(p_sys);
+         es_out_Control(p_sys->p_out, ES_OUT_RESET_PCR);
++        /* (the pcr reset ended a precise seek's preroll: again) */
++        if (p_sys->i_seek_preroll != 0)
++        {
++            es_out_Control(p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME,
++                           p_sys->i_seek_preroll);
++            p_sys->i_seek_preroll = 0;
++        }
+         break;
+ #if BLURAY_VERSION >= BLURAY_VERSION_CODE(0,8,1)
+     case BD_EVENT_UO_MASK_CHANGED:
+-- 
+2.55.0.windows.3
+

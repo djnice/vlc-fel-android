@@ -1,0 +1,102 @@
+From 0f07c587cf4c450126bb5a3ff5ff75606eae8993 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 10:59:53 +0100
+Subject: [PATCH] input: a precise seek shows the target's picture (preroll of
+ video)
+
+A precise seek (paused: the picture it shows, frame stepping back) gave
+a picture before the target now and then:
+- mediacodec ended the preroll at the last preroll block's time; in
+  decode order (B-frames) a later block may have an earlier time, and
+  the pictures between were rendered. Now the latest one.
+- the decoder set the preroll to "until a block that is not preroll";
+  mediacodec gives its pictures asynchronously, the target's picture
+  could come before that block: dropped, the next one shown. For video
+  the preroll now ends after its latest picture.
+- es_out marked a block preroll by its end (pts + length): mp4 (blocks
+  with a length) showed the picture before the target, mkv / ts (no
+  length) the one at it. For video now by its time, the same for all.
+
+Message-Id: <20261111-dvfel-precise-seek-video-preroll@djnice>
+---
+ modules/codec/omxil/mediacodec.c |  6 +++++-
+ src/input/decoder.c              | 18 ++++++++++++++----
+ src/input/es_out.c               |  7 ++++++-
+ 3 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index d4f00a3..b571759 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -2109,8 +2109,12 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+             {
+                 if (!b_config && p_block != NULL)
+                 {
++                    /* the latest picture of the preroll, not the last
++                     * block's: in decode order (B-frames) a later block
++                     * may have an earlier time, and the pictures between
++                     * were shown (paused, a precise seek kept the first) */
+                     if (p_block->i_flags & BLOCK_FLAG_PREROLL)
+-                        p_sys->i_preroll_end = i_ts;
++                        p_sys->i_preroll_end = __MAX(p_sys->i_preroll_end, i_ts);
+ 
+                     /* the RPU and EL of the access unit belong to this pts */
+                     if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_dvfp)
+diff --git a/src/input/decoder.c b/src/input/decoder.c
+index 69488a6..f2910f6 100644
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -765,9 +765,18 @@ static int DecoderTimedWait( decoder_t *p_dec, vlc_tick_t deadline )
+     return ret;
+ }
+ 
+-static inline void DecoderUpdatePreroll( int64_t *pi_preroll, const block_t *p )
+-{
+-    if( p->i_flags & BLOCK_FLAG_PREROLL )
++static inline void DecoderUpdatePreroll( int64_t *pi_preroll, const block_t *p,
++                                         bool b_video )
++{
++    /* Video: the preroll ends after its latest picture. Not "until the next
++     * block that is not preroll": in decode order (B-frames) preroll blocks
++     * still come after the first one that is not, and a decoder giving its
++     * pictures asynchronously (mediacodec) may give the seek target's picture
++     * before that block arrives - it was dropped, a picture later shown. */
++    if( b_video && (p->i_flags & BLOCK_FLAG_PREROLL) && p->i_pts > VLC_TICK_INVALID
++     && *pi_preroll != INT64_MAX )
++        *pi_preroll = __MAX( *pi_preroll, p->i_pts + 1 );
++    else if( p->i_flags & BLOCK_FLAG_PREROLL )
+         *pi_preroll = INT64_MAX;
+     /* Check if we can use the packet for end of preroll */
+     else if( (p->i_flags & BLOCK_FLAG_DISCONTINUITY) &&
+@@ -1402,7 +1411,8 @@ static void DecoderProcess( decoder_t *p_dec, block_t *p_block )
+             goto error;
+ 
+         vlc_mutex_lock( &p_owner->lock );
+-        DecoderUpdatePreroll( &p_owner->i_preroll_end, p_block );
++        DecoderUpdatePreroll( &p_owner->i_preroll_end, p_block,
++                              p_dec->fmt_in.i_cat == VIDEO_ES );
+         vlc_mutex_unlock( &p_owner->lock );
+         if( unlikely( p_block->i_flags & BLOCK_FLAG_CORE_PRIVATE_RELOADED ) )
+         {
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index 6608f1f..981803c 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -2222,8 +2222,13 @@ static int EsOutSend( es_out_t *out, es_out_id_t *es, block_t *p_block )
+ 
+         /* If i_date is still invalid (first/all non dated), expect to be in preroll */
+ 
++        /* Video: a picture before the target is preroll, also when it would
++         * still be on the screen at the target - a precise seek shows the
++         * first picture at or after it, whether the demuxer gives the blocks'
++         * length (mp4) or not (mkv, ts) */
++        vlc_tick_t i_end = es->fmt.i_cat == VIDEO_ES ? i_date : es->i_pts_level;
+         if( i_date == VLC_TICK_INVALID ||
+-            es->i_pts_level < p_sys->i_preroll_end )
++            i_end < p_sys->i_preroll_end )
+             p_block->i_flags |= BLOCK_FLAG_PREROLL;
+     }
+ 
+-- 
+2.55.0.windows.3
+

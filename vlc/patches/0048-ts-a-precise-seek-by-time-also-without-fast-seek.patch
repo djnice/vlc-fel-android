@@ -1,0 +1,85 @@
+From a0e8e50cc19bfc79cf6a6a6031cebf6224813761 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 13:09:08 +0100
+Subject: [PATCH] ts: a precise seek by time also without fast seek
+
+The binary search for a time ran only on a stream with fast seek; smb2
+and http have none, so a seek by time over the network fell back to the
+byte position, without preroll: paused, a frame back on a Blu-ray played
+from its m2ts (a BDMV folder over SMB, an ISO through a local http
+server) showed the key frame before it. A precise seek now searches by
+time on any seekable stream (some 30 reads), a fast one as before.
+
+Message-Id: <20261111-dvfel-ts-precise-seek-without-fastseek@djnice>
+---
+ modules/demux/mpeg/ts.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 2d2ac76..f4e4492 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -198,7 +198,7 @@ static bool GatherPESData( demux_t *p_demux, ts_pid_t *, block_t *, size_t );
+ static void ProgramSetPCR( demux_t *p_demux, ts_pmt_t *p_prg, vlc_tick_t i_pcr );
+ 
+ static block_t* ReadTSPacket( demux_t *p_demux );
+-static int SeekToTime( demux_t *p_demux, const ts_pmt_t *, vlc_tick_t time );
++static int SeekToTime( demux_t *p_demux, const ts_pmt_t *, vlc_tick_t time, bool b_precise );
+ static void ReadyQueuesPostSeek( demux_t *p_demux );
+ static void PCRHandle( demux_t *p_demux, ts_pid_t *, ts_90khz_t );
+ static void PCRFixHandle( demux_t *, ts_pmt_t *, block_t * );
+@@ -1011,7 +1011,7 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
+             time_t i_time, i_length = 0;
+             vlc_tick_t i_seektime = VLC_TICK_0 + vlc_tick_from_sec( i_length * f );
+             if( !EITCurrentEventTime( p_pmt, p_sys, &i_time, &i_length ) &&
+-                 i_length > 0 && !SeekToTime( p_demux, p_pmt, i_seektime ) )
++                 i_length > 0 && !SeekToTime( p_demux, p_pmt, i_seektime, b_bool ) )
+             {
+                 ReadyQueuesPostSeek( p_demux );
+                 es_out_Control( p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME, i_seektime );
+@@ -1028,7 +1028,7 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
+             i64 = p_pmt->pcr.i_first + i_length * f;
+             if( i64 <= p_pmt->i_last_dts )
+             {
+-                if( !SeekToTime( p_demux, p_pmt, i64 ) )
++                if( !SeekToTime( p_demux, p_pmt, i64, b_bool ) )
+                 {
+                     ReadyQueuesPostSeek( p_demux );
+                     es_out_Control( p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME, i64 );
+@@ -1048,9 +1048,10 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
+ 
+     case DEMUX_SET_TIME:
+         i64 = va_arg( args, int64_t );
++        b_bool = (bool) va_arg( args, int ); /* precise */
+ 
+         if( p_sys->b_canseek && p_pmt && p_pmt->pcr.i_first != VLC_TICK_INVALID &&
+-           !SeekToTime( p_demux, p_pmt, p_pmt->pcr.i_first + i64 ) )
++           !SeekToTime( p_demux, p_pmt, p_pmt->pcr.i_first + i64, b_bool ) )
+         {
+             ReadyQueuesPostSeek( p_demux );
+             es_out_Control( p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME,
+@@ -2458,7 +2459,8 @@ static void ReadyQueuesPostSeek( demux_t *p_demux )
+         MVCSsifPrefetch( p_demux );
+ }
+ 
+-static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_seektime )
++static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_seektime,
++                       bool b_precise )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+ 
+@@ -2467,7 +2469,10 @@ static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_see
+         return vlc_stream_Seek( p_sys->stream, 0 );
+ 
+     const int64_t i_stream_size = stream_Size( p_sys->stream );
+-    if( !p_sys->b_canfastseek || i_stream_size < p_sys->i_packet_size )
++    /* (a precise seek also without fast seek - smb2, http: an m2ts of a
++     * Blu-ray over the network, a frame back while paused - its binary search
++     * is some 30 reads; by byte position it showed the key frame before) */
++    if( (!p_sys->b_canfastseek && !b_precise) || i_stream_size < p_sys->i_packet_size )
+         return VLC_EGENERIC;
+ 
+     const uint64_t i_initial_pos = vlc_stream_Tell( p_sys->stream );
+-- 
+2.55.0.windows.3
+

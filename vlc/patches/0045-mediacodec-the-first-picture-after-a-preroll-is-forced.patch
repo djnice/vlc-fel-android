@@ -1,0 +1,89 @@
+From e19a392f84c197f4d3988f0d04f323b38667dbe2 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 12:10:42 +0100
+Subject: [PATCH] mediacodec: the first picture after a preroll is forced
+
+The decoder core drops a picture as preroll by its date, which
+mediacodec moves early for Dolby Vision (FEL lead time 125 ms, release
+ahead 80 / 140 ms): after a precise seek it dropped the target and the
+pictures after it up to that much (paused, a frame back with FEL
+composition showed one 6-7 frames on: libdvfelplay got the base layer
+of pts + 270 ms). mediacodec drops the preroll's pictures itself, by
+their own times: its first picture after a preroll is now forced, the
+core does not drop a forced picture.
+
+Message-Id: <20261111-dvfel-mediacodec-preroll-first-forced-v3@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 18 ++++++++++++++++++
+ src/input/decoder.c              |  4 +++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index b571759..303a469 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -577,6 +577,9 @@ struct decoder_sys_t
+     bool b_has_format;
+ 
+     int64_t i_preroll_end;
++    /* a preroll since the flush: its first picture after it is forced (the
++     * decoder core does not drop it again, by a date moved early) */
++    bool    b_preroll_pending;
+     int     i_quirks;
+ 
+     /* Specific Audio/Video callbacks */
+@@ -1655,6 +1658,17 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+          && p_sys->api.b_direct_rendering && p_sys->api.release_out_ts)
+             p_pic->date -= DoviReleaseAhead(p_dec, p_sys->video.b_dovi);
+         p_pic->b_progressive = true;
++        /* the first picture after a preroll (the ones before it were dropped
++         * above, by their time): forced, the decoder core compares its own
++         * preroll end with the date, which a Dolby Vision picture has moved
++         * early (FEL lead time, release ahead: up to 265 ms) - it dropped the
++         * seek target and the pictures after it up to that (paused: a frame
++         * back showed one 6-7 frames on) */
++        if (p_sys->b_preroll_pending)
++        {
++            p_pic->b_force = true;
++            p_sys->b_preroll_pending = false;
++        }
+ 
+         if (p_sys->api.b_direct_rendering)
+         {
+@@ -1902,6 +1916,7 @@ static void DecodeFlushLocked(decoder_t *p_dec)
+     p_sys->b_input_dequeued = false;
+     p_sys->b_flush_out = true;
+     p_sys->i_preroll_end = 0;
++    p_sys->b_preroll_pending = false;
+     p_sys->b_output_ready = false;
+     /* Resend CODEC_CONFIG buffer after a flush */
+     p_sys->i_csd_send = 0;
+@@ -2114,7 +2129,10 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+                      * may have an earlier time, and the pictures between
+                      * were shown (paused, a precise seek kept the first) */
+                     if (p_block->i_flags & BLOCK_FLAG_PREROLL)
++                    {
+                         p_sys->i_preroll_end = __MAX(p_sys->i_preroll_end, i_ts);
++                        p_sys->b_preroll_pending = true;
++                    }
+ 
+                     /* the RPU and EL of the access unit belong to this pts */
+                     if (p_dec->fmt_in.i_cat == VIDEO_ES && p_sys->video.p_dvfp)
+diff --git a/src/input/decoder.c b/src/input/decoder.c
+index f2910f6..92f3e3b 100644
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -1014,7 +1014,9 @@ static int DecoderPlayVideo( decoder_t *p_dec, picture_t *p_picture,
+     bool prerolled;
+ 
+     vlc_mutex_lock( &p_owner->lock );
+-    if( p_owner->i_preroll_end > p_picture->date )
++    /* (a picture the decoder forces is past the preroll: it knows, mediacodec
++     * by the pictures' own times, the date may be moved early) */
++    if( p_owner->i_preroll_end > p_picture->date && !p_picture->b_force )
+     {
+         vlc_mutex_unlock( &p_owner->lock );
+         picture_Release( p_picture );
+-- 
+2.55.0.windows.3
+

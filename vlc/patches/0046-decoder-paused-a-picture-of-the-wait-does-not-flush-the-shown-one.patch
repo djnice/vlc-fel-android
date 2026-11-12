@@ -1,0 +1,46 @@
+From dc436219c1267b2f547b627ce9606e8414c6e0b5 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Wed, 11 Nov 2026 12:26:41 +0100
+Subject: [PATCH] decoder: paused, a picture of the wait does not flush the
+ shown one
+
+After a seek the decoder waits for the buffering; a picture coming
+after the first one in that wait flushed the vout ("not to display old
+picture after our own"), which also takes the picture on the screen.
+Paused (a frame back) the first picture, the seek target, was shown,
+then the next one replaced it: the frame stayed where it was, the next
+seek went two back (Dolby Vision FEL, whose decoder gives the next
+pictures before the buffering ends). Paused, that flush is not done.
+
+Message-Id: <20261111-dvfel-decoder-paused-wait-no-flush@djnice>
+---
+ src/input/decoder.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/input/decoder.c b/src/input/decoder.c
+index 92f3e3b..c0646f3 100644
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -1071,6 +1071,7 @@ static int DecoderPlayVideo( decoder_t *p_dec, picture_t *p_picture,
+     /* FIXME: The *input* FIFO should not be locked here. This will not work
+      * properly if/when pictures are queued asynchronously. */
+     vlc_fifo_Lock( p_owner->p_fifo );
++    const bool b_paused = p_owner->paused;
+     if( unlikely(p_owner->paused) && likely(p_owner->frames_countdown > 0) )
+         p_owner->frames_countdown--;
+     vlc_fifo_Unlock( p_owner->p_fifo );
+@@ -1082,7 +1083,10 @@ static int DecoderPlayVideo( decoder_t *p_dec, picture_t *p_picture,
+     if( p_picture->b_force || p_picture->date > VLC_TICK_INVALID )
+         /* FIXME: VLC_TICK_INVALID -- verify video_output */
+     {
+-        if( i_rate != p_owner->i_last_rate || b_first_after_wait )
++        /* (not paused for a picture after the first one of the wait: the
++         * flush also takes the picture on the screen, the first one - a
++         * seek while paused, a frame back, showed the picture after it) */
++        if( i_rate != p_owner->i_last_rate || (b_first_after_wait && !b_paused) )
+         {
+             /* Be sure to not display old picture after our own */
+             vout_Flush( p_vout, p_picture->date );
+-- 
+2.55.0.windows.3
+
