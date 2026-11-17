@@ -1,0 +1,125 @@
+From fdc8363994563bf79adbfed9886265727eb2315e Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Fri, 13 Nov 2026 17:41:22 +0000
+Subject: [PATCH] mediacodec: the release-ahead time by the decoder's own
+ output rate
+
+An interlaced stream comes out of the decoder deinterlaced at twice its
+frame rate (1080i 29.97 H.264 on a Dune HD Pro 8K Plus: 59.94 pictures/s).
+Its stream rate gave the 140 ms release-ahead time, which held 8-9 of the
+decoder's buffers: it stalled every 200 ms and 35 pictures a second came
+too late (player_drop 353 in 10 s; none with --no-mediacodec-release-ahead).
+At their own time, not snapped, the display dropped up to 108 a minute
+(two in one vsync: 59.94 pictures on a 59.94 Hz output).
+
+The decoder's output rate is measured: 4 pictures in a row closer than
+25 ms make it fast, 4 farther ones slow again. Fast Dolby Vision and 3D MVC
+pictures are released 80 ms ahead (as at 50 / 60 fps before), the others
+40 ms ahead (2-3 pictures held), snapped between the vsyncs all the same. The time each output
+buffer was released ahead is kept by its index and added back as taken off.
+
+Message-Id: <20261113-dvfel-mediacodec-release-ahead-output-rate-v3@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 59 ++++++++++++++++++++++++++++++--
+ 1 file changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index b83d56feee..28a1886563 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -128,8 +128,20 @@ static struct
+  * the picture after it as much, and a 4K 24p SDR stream lost one at about
+  * every seventh subtitle change (2.39:1 HEVC on a Dune HD Pro 8K Plus at
+  * 2160p24: 8 in 90 s, each at a subtitle change; the Dune's own player none).
++ *
++ * The time goes by the pictures the decoder really puts out, not by the
++ * stream's frame rate: an interlaced stream comes out deinterlaced at twice
++ * its rate (1080i 29.97 H.264 on an Amlogic box: 59.94 pictures/s), and 140 ms
++ * held 8-9 of the decoder's buffers - it stalled every 200 ms and 35 pictures
++ * a second came too late. Released at their own time (not snapped) the
++ * display dropped up to 108 a minute (two in one vsync: 59.94 pictures on a
++ * 59.94 Hz output, by the phase of the start). Pictures closer than
++ * DOVI_FAST_OUT: Dolby Vision and 3D MVC ones 80 ms ahead, the others 40 ms
++ * (2-3 pictures held), snapped all the same.
+  */
+ #define DOVI_RELEASE_AHEAD VLC_TICK_FROM_MS(80)
++#define DOVI_RELEASE_AHEAD_FAST VLC_TICK_FROM_MS(40)
++#define DOVI_FAST_OUT VLC_TICK_FROM_MS(25)
+ #define DOVI_RELEASE_AHEAD_SLOW VLC_TICK_FROM_MS(140)
+ 
+ static vlc_tick_t DoviReleaseAhead(const decoder_t *p_dec, bool b_mvc)
+@@ -635,6 +647,14 @@ struct decoder_sys_t
+             /* every picture released ahead (DOVI_RELEASE_AHEAD), not only
+              * Dolby Vision and 3D MVC ones */
+             bool b_release_ahead;
++            /* the decoder's output rate (DOVI_FAST_OUT): the last picture's
++             * time, pictures in a row closer / farther than that */
++            vlc_tick_t i_out_last_ts;
++            unsigned i_out_short, i_out_long;
++            bool b_out_fast;
++            /* the time each output buffer was released ahead, by its index
++             * (added back in ReleasePictureTs as taken off) */
++            vlc_tick_t release_lead[DVINFO_RING];
+             bool b_hdr10plus; /* for an HDR10+ stream converted to profile 8.1 */
+             /* a stream with its own RPU and HDR10+ (a "hybrid" file): the
+              * HDR10+ SEI messages taken out for the Dolby Vision decoder */
+@@ -1581,7 +1601,7 @@ static void ReleasePictureTs(decoder_t *p_dec, unsigned i_index, vlc_tick_t i_ts
+      * that clock jitter never puts two frames into one vsync (a drop) */
+     if ((p_sys->video.b_dovi || p_sys->video.p_mvc || p_sys->video.b_release_ahead)
+      && dvfp_api.snap_present_ns)
+-        i_ns = dvfp_api.snap_present_ns(i_ns + DoviReleaseAhead(p_dec, p_sys->video.p_mvc && !p_sys->video.b_dovi) * INT64_C(1000));
++        i_ns = dvfp_api.snap_present_ns(i_ns + p_sys->video.release_lead[i_index % DVINFO_RING] * INT64_C(1000));
+     p_sys->api.release_out_ts(&p_sys->api, i_index, i_ns);
+     /* the information panel: the picture is shown at i_ns, FEL a lead time later */
+     if (p_sys->video.b_dovi && p_sys->video.psz_dvinfo && p_sys->video.b_dvinfo_on)
+@@ -1677,11 +1697,46 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+         /* 3D MVC: the same (the mvc3d module holds the frame packed picture) */
+         if (p_sys->video.p_mvc && mvc_api.present_lead_ns)
+             p_pic->date -= mvc_api.present_lead_ns(p_sys->video.p_mvc) / 1000;
++        /* the decoder's own output rate: 4 pictures in a row closer than
++         * DOVI_FAST_OUT make it fast, 4 farther ones slow again */
++        {
++            const vlc_tick_t i_d = p_out->buf.i_ts - p_sys->video.i_out_last_ts;
++            if (i_d > 0 && i_d < DOVI_FAST_OUT)
++            {
++                p_sys->video.i_out_long = 0;
++                if (++p_sys->video.i_out_short >= 4 && !p_sys->video.b_out_fast)
++                {
++                    p_sys->video.b_out_fast = true;
++                    msg_Dbg(p_dec, "decoder output every %"PRId64" us: %s",
++                            i_d, p_sys->video.b_dovi || p_sys->video.p_mvc
++                            ? "released 80 ms ahead" : "released 40 ms ahead");
++                }
++            }
++            else if (i_d >= DOVI_FAST_OUT && i_d < VLC_TICK_FROM_MS(200))
++            {
++                p_sys->video.i_out_short = 0;
++                if (++p_sys->video.i_out_long >= 4 && p_sys->video.b_out_fast)
++                {
++                    p_sys->video.b_out_fast = false;
++                    msg_Dbg(p_dec, "decoder output every %"PRId64" us: released by the frame rate", i_d);
++                }
++            }
++            p_sys->video.i_out_last_ts = p_out->buf.i_ts;
++        }
+         /* released ahead (DoviReleaseAhead, added back in ReleasePictureTs) */
++        vlc_tick_t i_lead = 0;
+         if ((p_sys->video.b_dovi || p_sys->video.p_mvc || p_sys->video.b_release_ahead)
+          && dvfp_api.snap_present_ns
+          && p_sys->api.b_direct_rendering && p_sys->api.release_out_ts)
+-            p_pic->date -= DoviReleaseAhead(p_dec, p_sys->video.p_mvc && !p_sys->video.b_dovi);
++        {
++            if (p_sys->video.b_out_fast)
++                i_lead = p_sys->video.b_dovi || p_sys->video.p_mvc
++                       ? DOVI_RELEASE_AHEAD : DOVI_RELEASE_AHEAD_FAST;
++            else
++                i_lead = DoviReleaseAhead(p_dec, p_sys->video.p_mvc && !p_sys->video.b_dovi);
++            p_pic->date -= i_lead;
++        }
++        p_sys->video.release_lead[p_out->buf.i_index % DVINFO_RING] = i_lead;
+         /* (the decoder core compares the end of a preroll with date + this) */
+         p_dec->i_picture_date_lead = (forced_ts == VLC_TICK_INVALID ? p_out->buf.i_ts : forced_ts) - p_pic->date;
+         p_pic->b_progressive = true;
+-- 
+2.47.3
+

@@ -1,0 +1,122 @@
+From 5f91c574c4e21f9f3af986dcf9c2a5d19f1fcc74 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Thu, 12 Nov 2026 14:39:49 +0000
+Subject: [PATCH] mediacodec: every picture released ahead, as Dolby Vision
+ ones
+
+A subtitle change takes the vout 20-60 ms (freetype); the picture after it
+is prepared that late. Dolby Vision and 3D MVC pictures are released ahead
+of their time (80 / 140 ms) for a time snapped between the vsyncs, the
+others were released at their time: a 4K 24p SDR stream with subtitles lost
+a picture at about every seventh subtitle change (2.39:1 HEVC, Dune HD Pro
+8K Plus at 2160p24: 8 in 90 s, each at a subtitle change; the Dune's own
+player none).
+
+Every picture of a direct rendering decoder is now released the same way
+when libdvfelplay knows the display's vsyncs (its snap); option
+mediacodec-release-ahead (on) switches it off.
+
+Message-Id: <20261112-dvfel-mediacodec-release-ahead-all@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 37 ++++++++++++++++++++++++++------
+ 1 file changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 0ad61e48ab..b83d56feee 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -122,13 +122,19 @@ static struct
+  * 2160p output the display needs its picture earlier than with 1080p (drops
+  * with 80 ms there). At 50 / 60 fps 80 ms are 4-5 pictures held already; 3D
+  * MVC (not measured with more) keeps 80 ms.
++ *
++ * Every other picture the same, when the display's vsyncs are known
++ * (libdvfelplay, option mediacodec-release-ahead): a subtitle change delays
++ * the picture after it as much, and a 4K 24p SDR stream lost one at about
++ * every seventh subtitle change (2.39:1 HEVC on a Dune HD Pro 8K Plus at
++ * 2160p24: 8 in 90 s, each at a subtitle change; the Dune's own player none).
+  */
+ #define DOVI_RELEASE_AHEAD VLC_TICK_FROM_MS(80)
+ #define DOVI_RELEASE_AHEAD_SLOW VLC_TICK_FROM_MS(140)
+ 
+-static vlc_tick_t DoviReleaseAhead(const decoder_t *p_dec, bool b_dovi)
++static vlc_tick_t DoviReleaseAhead(const decoder_t *p_dec, bool b_mvc)
+ {
+-    if (!b_dovi)
++    if (b_mvc)
+         return DOVI_RELEASE_AHEAD;
+     const video_format_t *fmt = &p_dec->fmt_out.video;
+     if (fmt->i_frame_rate == 0 || fmt->i_frame_rate_base == 0)
+@@ -626,6 +632,9 @@ struct decoder_sys_t
+             int i_profile; /* the HEVC profile the decoder was chosen for */
+             dvfp *p_dvfp;
+             bool b_dovi; /* the Dolby Vision decoder is in use */
++            /* every picture released ahead (DOVI_RELEASE_AHEAD), not only
++             * Dolby Vision and 3D MVC ones */
++            bool b_release_ahead;
+             bool b_hdr10plus; /* for an HDR10+ stream converted to profile 8.1 */
+             /* a stream with its own RPU and HDR10+ (a "hybrid" file): the
+              * HDR10+ SEI messages taken out for the Dolby Vision decoder */
+@@ -741,6 +750,11 @@ static void RemoveInflightPictures(decoder_t *);
+     "The frame rate the video decoder is told (0: the stream's). An Amlogic " \
+     "box's decoder and the firmware's automatic frame rate take the display " \
+     "mode from it."
++#define MEDIACODEC_RELEASE_AHEAD_TEXT "Release pictures ahead of their time"
++#define MEDIACODEC_RELEASE_AHEAD_LONGTEXT \
++    "Every picture is handed to the display ahead of its time, for its time " \
++    "between two vsyncs (as Dolby Vision ones), when libdvfelplay knows the " \
++    "display's vsyncs: a subtitle change no longer makes the next picture late."
+ #define MEDIACODEC_MVC_TEXT "3D MVC (Blu-ray 3D)"
+ #define MEDIACODEC_MVC_LONGTEXT \
+     "Show H.264 MVC streams in 3D, both views at full resolution (frame " \
+@@ -793,6 +807,8 @@ vlc_module_begin ()
+         change_integer_list(pi_mvc_hw_values, ppsz_mvc_hw_names)
+     add_float(CFG_PREFIX "fps", 0.f,
+               MEDIACODEC_FPS_TEXT, MEDIACODEC_FPS_LONGTEXT, true)
++    add_bool(CFG_PREFIX "release-ahead", true,
++             MEDIACODEC_RELEASE_AHEAD_TEXT, MEDIACODEC_RELEASE_AHEAD_LONGTEXT, true)
+     set_callbacks(OpenDecoderNdk, CloseDecoder)
+     add_shortcut("mediacodec_ndk")
+     add_submodule ()
+@@ -1355,6 +1371,13 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+              * the surface attached to it */
+             p_dec->fmt_out.i_codec = VLC_CODEC_ANDROID_OPAQUE;
+ 
++            /* every picture released ahead, snapped between the vsyncs */
++            p_sys->video.b_release_ahead =
++                var_InheritBool(p_dec, CFG_PREFIX "release-ahead")
++                && DoviLoad() && dvfp_api.snap_present_ns;
++            if (p_sys->video.b_release_ahead)
++                msg_Dbg(p_dec, "pictures released ahead of their time");
++
+             if (p_sys->api.b_support_rotation)
+             {
+                 switch (p_dec->fmt_in.video.orientation)
+@@ -1556,8 +1579,9 @@ static void ReleasePictureTs(decoder_t *p_dec, unsigned i_index, vlc_tick_t i_ts
+     int64_t i_ns = i_ts * INT64_C(1000);
+     /* Dolby Vision decoder: render times between the display's vsyncs, so
+      * that clock jitter never puts two frames into one vsync (a drop) */
+-    if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns)
+-        i_ns = dvfp_api.snap_present_ns(i_ns + DoviReleaseAhead(p_dec, p_sys->video.b_dovi) * INT64_C(1000));
++    if ((p_sys->video.b_dovi || p_sys->video.p_mvc || p_sys->video.b_release_ahead)
++     && dvfp_api.snap_present_ns)
++        i_ns = dvfp_api.snap_present_ns(i_ns + DoviReleaseAhead(p_dec, p_sys->video.p_mvc && !p_sys->video.b_dovi) * INT64_C(1000));
+     p_sys->api.release_out_ts(&p_sys->api, i_index, i_ns);
+     /* the information panel: the picture is shown at i_ns, FEL a lead time later */
+     if (p_sys->video.b_dovi && p_sys->video.psz_dvinfo && p_sys->video.b_dvinfo_on)
+@@ -1654,9 +1678,10 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+         if (p_sys->video.p_mvc && mvc_api.present_lead_ns)
+             p_pic->date -= mvc_api.present_lead_ns(p_sys->video.p_mvc) / 1000;
+         /* released ahead (DoviReleaseAhead, added back in ReleasePictureTs) */
+-        if ((p_sys->video.b_dovi || p_sys->video.p_mvc) && dvfp_api.snap_present_ns
++        if ((p_sys->video.b_dovi || p_sys->video.p_mvc || p_sys->video.b_release_ahead)
++         && dvfp_api.snap_present_ns
+          && p_sys->api.b_direct_rendering && p_sys->api.release_out_ts)
+-            p_pic->date -= DoviReleaseAhead(p_dec, p_sys->video.b_dovi);
++            p_pic->date -= DoviReleaseAhead(p_dec, p_sys->video.p_mvc && !p_sys->video.b_dovi);
+         /* (the decoder core compares the end of a preroll with date + this) */
+         p_dec->i_picture_date_lead = (forced_ts == VLC_TICK_INVALID ? p_out->buf.i_ts : forced_ts) - p_pic->date;
+         p_pic->b_progressive = true;
+-- 
+2.47.3
+

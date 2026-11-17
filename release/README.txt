@@ -87,8 +87,8 @@ S905X4 (DUNE HD)
 - Tekerés után néhány képkocka (legfeljebb kb. egy másodperc, az EL következő kulcsképéig) EL nélkül
   jelenik meg. Szünet közben az EL-dekóder néhány
   „wait fence” időtúllépést ír a naplóba.
-- Demó mód nincs (lásd fent). 3D MVC csak S928X-en: az mvc3d modul S905X4-en nem töltődik be;
-  3D-s kijelzővel a telepítő egyszer rákérdezhet a rootra, utána hibát jelez, az MVC 2D-ben megy.
+- Demó mód nincs (lásd fent). 3D MVC S905X4-en a 0.2.21 óta: csak hardveres dekóderrel, ezzel az
+  appal még nem próbálva (ugyanez a lib és modul a CineFuze-zal igen).
 
 KÉTSÁVOS (DTDL) FEL
 -------------------
@@ -109,7 +109,10 @@ KÉTSÁVOS (DTDL) FEL
   A firmware AFR-je vált, 1080p-s és 2160p-s asztalról is működik.
 - 2D-s kijelzőn a bázisnézet 2D-ben megy, mint eddig. Kézzel: Beállítások → Speciális → Egyéni
   libVLC opciók: --mediacodec-mvc=1 (mindig 2D) vagy --mediacodec-mvc=2 (mindig 3D).
-- Az első 3D-s lejátszáskor a VLC FEL telepíti (vagy frissíti) az mvc3d kernelmodult (2026.10.12.3),
+- Dekóder (0.2.21 óta): S928X-en Beállítások / Videó / „3D MVC: hardware decoder”: alapból ki (szoftveres),
+  bekapcsolva a SoC hardveres dekódere. S905X4-en csak hardveres, kapcsoló nélkül; ha nem indul, 2D.
+- Az első 3D-s lejátszáskor a VLC FEL telepíti (vagy frissíti) az mvc3d kernelmodult (S928X 2026.11.06.1,
+  S905X4 2026.11.06.8-sc2); a Dune HD „mvc3d” plugin ezt root-kérdés nélkül elintézi bootkor,
   a dvfel-hez hasonlóan (config/boot/mvc3d.sh, ha kell, root-kérdéssel).
 - A GUI (VLC vezérlők, felirat) 3D-ben csak a bal szem képén látszik. Blu-ray ISO / mappa 2D-ben megy
   (a VLC Blu-ray-kezelője csak a bázisnézetet adja).
@@ -163,9 +166,27 @@ TUDNIVALÓK
   képkockák egy vsync-kel késhetnek, amíg a lánc feltelik.
 - A FEL-kompozíció kikapcsolható: Beállítások → Speciális → Egyéni libVLC opciók:
   --no-mediacodec-dovi-fel
+- Ugyanott (0.2.22 óta): --mediacodec-dovi-hdr10plus (HDR10+ filmek Dolby Visionként, profile 8.1;
+  alapból ki), --no-mediacodec-release-ahead (a nem Dolby Vision-képek a saját idejükben, mint
+  0.2.22 előtt).
 
 VÁLTOZÁSOK
 ----------
+0.2.22-poc (libdvfelplay 2026.11.17.1, 0035–0058-as VLC- és 0002-es libvlcjni-javítás; a kernelmodulok, a
+          libmvc3dplay és az app-javítások változatlanok) – S928X-en ~22%-kal gyorsabb FEL-kompozíció, bitre
+          ugyanazzal a képpel: a GPU a képpuffereket RGB10_A2-ként olvassa, az EL külön kicsomagolása elmaradt
+          (4K P7 FEL: ~35 helyett ~27 ms képkockánként, 41,7 ms fölötti kép 90 s alatt 18 helyett 1; ha a meghajtó
+          nem fogadja, a régi RGBA8-as út megy). A Dune HD lejátszója a 2026.11.17.1-0.2.22-es Dune HD pluginnel
+          kapja meg. A libVLC a CineFuze 1.3.8-é (3.0.24-93-g0cb8157d28): ugrás után a cél képe látszik
+          (0042–0054); feliratváltáskor nem vész el kép 4K SDR / HDR10 filmeknél sem, minden képet idő előtt
+          ad ki (0055); váltottsoros (1080i) adás eldobás nélkül (0056); fejezetugrás után nincs elveszett kép
+          a Dolby Vision-dekóderen (0057); indításkor eggyel kevesebb SMB-kapcsolat (0058). Új: DSD / DST hang
+          (DSF / DSDIFF, 88,2 / 96 kHz-es PCM-ként), AV1 hardveres dekóderrel, HDR10+ Dolby Vision 8.1-ként
+          (--mediacodec-dovi-hdr10plus, alapból ki).
+0.2.21-poc (mvc3d S928X 2026.11.06.1, S905X4 2026.11.06.8-sc2, libmvc3dplay 2026.11.06.5, 0034-es VLC- és 0004-es
+          app-javítás; a libdvfelplay és a dvfel változatlan) – S928X-en választható 3D MVC dekóder (alap: szoftveres),
+          S905X4-en 3D MVC hardveres dekóderrel. Új Dune HD plugin: mvc3d. Hardveres dekóderrel a frame packing
+          kb. 8 s-mal a kép után indul. Ezzel az appal S905X4-en, és hardveresen egész filmen még nem próbálva.
 0.2.20-poc (0033-as VLC-javítás; a libdvfelplay, a kernelmodulok, a libmvc3dplay és az
           app-javítások változatlanok) – 3D MVC .ssif-ből jobb szemes hibák nélkül. A Blu-ray 3D .ssif
           a függő (jobb) és a bázisnézetet szakaszokban (extentekben) váltogatja. A VLC ts-demuxa a
@@ -400,8 +421,8 @@ S905X4 (DUNE HD)
 - After a seek a few frames (up to about a second, until the EL's next key picture) show without the
   EL. During a pause the EL decoder logs a few "wait fence"
   timeouts.
-- No demo mode (see above). 3D MVC on the S928X only: the mvc3d module does not load on the S905X4;
-  with a 3D display the installer may ask for root once and then report a failure, MVC plays in 2D.
+- No demo mode (see above). 3D MVC on the S905X4 since 0.2.21: hardware decoder only, not tried with this app yet
+  (the same library and module were, with CineFuze).
 
 DUAL TRACK (DTDL) FEL
 ---------------------
@@ -474,9 +495,28 @@ NOTES
   be a vsync late while the chain fills.
 - FEL composition can be switched off: Settings → Advanced → Custom libVLC options:
   --no-mediacodec-dovi-fel
+- There as well (since 0.2.22): --mediacodec-dovi-hdr10plus (HDR10+ films as Dolby Vision profile 8.1;
+  off by default), --no-mediacodec-release-ahead (pictures other than Dolby Vision at their own time,
+  as before 0.2.22).
 
 CHANGES
 -------
+0.2.22-poc (libdvfelplay 2026.11.17.1, VLC patches 0035–0058, libvlcjni patch 0002; the kernel modules,
+          libmvc3dplay and the app patches unchanged) - S928X: FEL composition ~22% faster, the same picture bit
+          for bit: the GPU reads the frame buffers as RGB10_A2, the separate EL unpack passes are gone (4K P7 FEL:
+          ~27 ms a frame instead of ~35, frames over 41.7 ms 1 instead of 18 per 90 s; if the driver refuses it,
+          the former RGBA8 path is used). The Dune HD player gets it with the Dune HD plugin 2026.11.17.1-0.2.22.
+          The libVLC is CineFuze 1.3.8's (3.0.24-93-g0cb8157d28): a seek shows its target's picture (0042-0054);
+          no picture lost at subtitle changes in 4K SDR / HDR10 films either, every picture is released ahead
+          (0055); interlaced (1080i) streams without drops (0056); no lost pictures after a chapter jump on the
+          Dolby Vision decoder (0057); one SMB connection less at each start (0058). New: DSD / DST audio (DSF /
+          DSDIFF, as 88.2 / 96 kHz PCM), AV1 with the hardware decoder, HDR10+ as Dolby Vision 8.1
+          (--mediacodec-dovi-hdr10plus, off by default).
+0.2.21-poc (mvc3d S928X 2026.11.06.1, S905X4 2026.11.06.8-sc2, libmvc3dplay 2026.11.06.5, VLC patch 0034, app patch 0004;
+          libdvfelplay and dvfel unchanged) - a 3D MVC decoder setting on the S928X (software by default: Settings /
+          Video / "3D MVC: hardware decoder"), 3D MVC with the hardware decoder on the S905X4. New Dune HD plugin: mvc3d.
+          With the hardware decoder frame packing starts about 8 s after the picture. Not tried with this app on the
+          S905X4, nor a whole film with the hardware decoder.
 0.2.20-poc (VLC patch 0033; libdvfelplay, the kernel modules, libmvc3dplay and the app patches
           unchanged) – 3D MVC from .ssif without right eye glitches. A Blu-ray 3D .ssif interleaves the
           dependent (right) view and the base view in extents. VLC's ts demux took the right view's

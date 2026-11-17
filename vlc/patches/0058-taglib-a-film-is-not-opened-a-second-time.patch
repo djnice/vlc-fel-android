@@ -1,0 +1,51 @@
+From 0cb8157d28176882d40c54fea204633b1c19f6a6 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sun, 15 Nov 2026 07:01:04 +0000
+Subject: [PATCH] taglib: a film is not opened a second time
+
+The Matroska and MP4 demuxers report unsupported meta data, so every film
+asked TagLib, which opened its URI again: over SMB one more connection and
+login at each start (~0.3 s from a NAS, more from a PC's USB disk) while
+the film's own buffer filled - and TagLib reads no Matroska / MPEG-TS / disc
+image tags at all. Films' extensions are refused before the open.
+
+Message-Id: <20261115-dvfel-taglib-no-film-reopen@djnice>
+---
+ modules/meta_engine/taglib.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/modules/meta_engine/taglib.cpp b/modules/meta_engine/taglib.cpp
+index ada5cb7ab2..6c3c384fc1 100644
+--- a/modules/meta_engine/taglib.cpp
++++ b/modules/meta_engine/taglib.cpp
+@@ -1004,6 +1004,27 @@ static int ReadMeta( vlc_object_t* p_this)
+         return VLC_EGENERIC;
+     }
+ 
++    /* a film: not opened a second time for tags TagLib does not read
++     * (Matroska, MPEG-TS, a disc image) or a player does not show - every
++     * Matroska / MP4 demux asks for a meta reader, over SMB that was one
++     * more connection and login at each start (~0.3 s from a NAS) while
++     * the film's own buffer filled */
++    static const char *const film_exts[] = {
++        "mkv", "mk3d", "webm", "ts", "m2ts", "mts", "m2t", "tp", "trp",
++        "iso", "vob", "mpg", "mpeg", "avi", "ssif", "evo", "divx",
++        "mp4", "m4v", "mov", "wmv", "flv",
++    };
++    const char *psz_ext = strrchr( psz_uri, '.' );
++    if( psz_ext != NULL && strchr( psz_ext, '/' ) == NULL )
++    {
++        for( size_t i = 0; i < ARRAY_SIZE( film_exts ); i++ )
++            if( !strcasecmp( psz_ext + 1, film_exts[i] ) )
++            {
++                free( psz_uri );
++                return VLC_EGENERIC;
++            }
++    }
++
+     if( !b_extensions_registered )
+     {
+ #if TAGLIB_VERSION >= TAGLIB_VERSION_1_11
+-- 
+2.47.3
+

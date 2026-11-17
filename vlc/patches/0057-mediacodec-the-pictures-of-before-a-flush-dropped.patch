@@ -1,0 +1,94 @@
+From afee304486d071780a4c39dd39e275e290fc0648 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Sun, 15 Nov 2026 07:01:03 +0000
+Subject: [PATCH] mediacodec: the pictures of before a flush dropped
+
+After a chapter jump (a seek of a decoder that had input) the Amlogic Dolby
+Vision decoder (OMX.amlogic.dolby-vision.dvhe.decoder.awesome2, an HDR10+
+film converted by libdvfelplay) still gave 9 pictures decoded before the
+flush, with their old times. The first of them was the decoder's "first
+picture": the buffering ended at once, the clock started ~280 ms before the
+new position's pictures came, 9 of them were too late as well (a Dune HD Pro
+8K Plus, an MKV from SMB: 18 pictures lost at each jump).
+
+The times queued since the flush are kept (32); an output picture with none
+of them is dropped before the timestamp fifo (emptied by the flush). The
+check ends with the first match, 32 dropped or 32 times queued without one.
+
+Message-Id: <20261115-dvfel-mediacodec-stale-after-flush@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 37 ++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 28a1886563..c9176ce5c4 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -598,6 +598,15 @@ struct decoder_sys_t
+     /* a preroll since the flush: its first picture after it is forced (the
+      * decoder core does not drop it again, by a date moved early) */
+     bool    b_preroll_pending;
++    /* a flush of a decoder that had input: its first outputs may still be
++     * pictures decoded before it (the Amlogic Dolby Vision decoder gave 9
++     * of the old time after a chapter jump, the first taken for the new
++     * position's, the clock started 280 ms early). Dropped until one of
++     * the times queued since the flush comes */
++    bool    b_stale_check;
++    unsigned i_stale_in;
++    unsigned i_stale_dropped;
++    vlc_tick_t stale_in_ts[32];
+     int     i_quirks;
+ 
+     /* Specific Audio/Video callbacks */
+@@ -1657,6 +1666,27 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+     {
+         picture_t *p_pic = NULL;
+ 
++        /* a picture of before the flush (its time none of the ones queued
++         * since): dropped before the timestamp fifo, which the flush emptied.
++         * Not for ever: 32 dropped, or 32 times queued without a match (a
++         * decoder that changes the times) end the check */
++        if (p_sys->b_stale_check)
++        {
++            bool b_new = false;
++            for (unsigned i = 0; i < p_sys->i_stale_in && !b_new; i++)
++                b_new = p_sys->stale_in_ts[i] == p_out->buf.i_ts;
++            if (!b_new && p_sys->i_stale_dropped < 32
++             && p_sys->i_stale_in < ARRAY_SIZE(p_sys->stale_in_ts))
++            {
++                p_sys->i_stale_dropped++;
++                return p_sys->api.release_out(&p_sys->api, p_out->buf.i_index, false);
++            }
++            if (p_sys->i_stale_dropped > 0)
++                msg_Dbg(p_dec, "%u pictures of before the flush dropped (first new pts %"PRId64"%s)",
++                        p_sys->i_stale_dropped, p_out->buf.i_ts, b_new ? "" : ", no match");
++            p_sys->b_stale_check = false;
++        }
++
+         /* If the oldest input block had no PTS, the timestamp of
+          * the frame returned by MediaCodec might be wrong so we
+          * overwrite it with the corresponding dts. Call FifoGet
+@@ -2000,6 +2030,9 @@ static void DecodeFlushLocked(decoder_t *p_dec)
+     p_sys->b_flush_out = true;
+     p_sys->i_preroll_end = 0;
+     p_sys->b_preroll_pending = false;
++    p_sys->b_stale_check = b_had_input && p_dec->fmt_in.i_cat == VIDEO_ES;
++    p_sys->i_stale_in = 0;
++    p_sys->i_stale_dropped = 0;
+     p_sys->b_output_ready = false;
+     /* Resend CODEC_CONFIG buffer after a flush */
+     p_sys->i_csd_send = 0;
+@@ -2207,6 +2240,10 @@ static int QueueBlockLocked(decoder_t *p_dec, block_t *p_in_block,
+             {
+                 if (!b_config && p_block != NULL)
+                 {
++                    if (p_sys->b_stale_check && i_ts > 0
++                     && p_sys->i_stale_in < ARRAY_SIZE(p_sys->stale_in_ts))
++                        p_sys->stale_in_ts[p_sys->i_stale_in++] = i_ts;
++
+                     /* the latest picture of the preroll, not the last
+                      * block's: in decode order (B-frames) a later block
+                      * may have an earlier time, and the pictures between
+-- 
+2.47.3
+
