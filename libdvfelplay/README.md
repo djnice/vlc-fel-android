@@ -58,7 +58,29 @@ times, 2: frame times and the player's release lead, every 5 s), `debug.dvfp.lea
 off), `debug.dvfp.dump` (frames for `tools/felbench`), `debug.dvfp.vsync` (1: render time snapping and the
 video composer's counters every second: `dvfelplay: vsync P ...`; `slots 0:` counts two frames given one vsync),
 `debug.dvfp.snap_chain` (0: the nearest vsync only, as before 2026.10.30.1), `debug.dvfp.snap_phase` (µs: the
-frames moved this far from the middle between two vsyncs, 0 the worst case; read at a playback's start or seek).
+frames moved this far from the middle between two vsyncs, 0 the worst case; read at a playback's start or seek),
+`debug.dvfp.rgb10` (0: the frame buffers imported as RGBA8, the composer's slower path, 2: as if the driver had
+refused RGB10_A2; read at a playback's start).
+
+## GPU composer: buffers as RGB10_A2 (2026.11.17.1)
+
+The frame buffers' pixel word (`Cr | Cb << 10 | Y << 20`) is `DRM_FORMAT_ABGR2101010`. The library imports them
+so (the log's `GPU compositor ready` line names the format); a driver that does not take the format for a render
+target, seen on the first display buffer, gets them as RGBA8 as before. `felgpu` then
+composes the same picture, bit for bit, with fewer texture operations (see `src/felgpu.c`). Measured with
+`tools/felbench` on a Dune HD Pro 8K Plus (S928X, Mali-G57 at 830 MHz, idle), ms a 4K frame, median:
+
+| Frame | RGBA8 | RGB10_A2 |
+|---|---|---|
+| film pictures, MMR chroma (3 frames) | 33.5 – 33.7 | 25.9 – 26.4 |
+| film picture, polynomial chroma | 30.0 | 24.9 |
+| noise, MMR / polynomial chroma | 35.8 / 34.7 | 28.7 / 28.9 |
+
+`tools/felbench` runs the composer on frames of `<prefix>_bl.bin`, `_el.bin`, `_meta.bin` and compares its output
+with `_out.bin`: frames dumped by a playback (`debug.dvfp.dump`) or made by `tools/felframes.py` from a decoded
+picture or noise and an RPU, their references written by `felbench -r` with the composer to compare against.
+`-f 10` selects the RGB10_A2 path, `-p` the pass times, `-s`, `-D`, `-P`, `-d`, `-t` the other modes; run it as
+root (the buffers are ION allocations of the codec_mm heap) with nothing playing.
 
 `test/au_check.sh dvfptest.apk test.au [seek s]` plays the file to its end and fails on frames shown without
 their RPU, a stalled EL decoder or late frames (e.g. Dune HD's `MP4_P7_FEL_STDL.mp4`, whose access units from

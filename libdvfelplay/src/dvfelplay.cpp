@@ -88,8 +88,11 @@
 #ifndef DRM_FORMAT_ABGR8888
 #define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 #endif
+#ifndef DRM_FORMAT_ABGR2101010
+#define DRM_FORMAT_ABGR2101010 0x30334241 /* 'AB30' */
+#endif
 
-#define DVFP_VERSION "2026.11.10.1"
+#define DVFP_VERSION "2026.11.17.1"
 
 namespace
 {
@@ -147,6 +150,8 @@ constexpr const char* PROP_DITHER = "debug.dvfp.dither";   // 0 round, 1 dither 
 constexpr const char* PROP_PATTERN = "debug.dvfp.pattern"; // 1: grey ramps
 constexpr const char* PROP_DEMO = "debug.dvfp.demo";       // 1: left half composed only
 constexpr const char* PROP_NOGPU = "debug.dvfp.nogpu";     // 1: dvfel path without GPU work
+// 0: the buffers imported as RGBA8, 2: as if the driver had refused RGB10_A2 (tests); read at a playback's start
+constexpr const char* PROP_RGB10 = "debug.dvfp.rgb10";
 constexpr const char* PROP_PROFILE = "debug.dvfp.profile"; // 1: GPU pass times every 5 s to the log, 2: frame times only
 constexpr const char* PROP_NICE = "debug.dvfp.nice";       // nice value of the GPU and EL threads (test)
 constexpr const char* PROP_DUMP = "debug.dvfp.dump";       // n: dump n composed frames for tools/felbench
@@ -2401,9 +2406,12 @@ void dvfp::GpuThread(std::promise<bool> ready)
   auto destroyImage = PFNEGLDESTROYIMAGEKHRPROC(eglGetProcAddress("eglDestroyImageKHR"));
   auto targetTexture =
       PFNGLEGLIMAGETARGETTEXTURE2DOESPROC(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+  // how the buffers are imported: their word in four bytes or as its 10-bit components (see below)
+  EGLint fourcc = DRM_FORMAT_ABGR8888;
+  bool quiet = false; // a refused import is no error: the RGB10_A2 attempt
   auto importTex = [&](int fd, int width, int height) -> GLuint {
     const EGLint attr[] = {EGL_WIDTH, width, EGL_HEIGHT, height,
-                           EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
+                           EGL_LINUX_DRM_FOURCC_EXT, fourcc,
                            EGL_DMA_BUF_PLANE0_FD_EXT, fd,
                            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
                            EGL_DMA_BUF_PLANE0_PITCH_EXT, width * 4,
@@ -2411,7 +2419,9 @@ void dvfp::GpuThread(std::promise<bool> ready)
     EGLImageKHR img = createImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attr);
     if (img == EGL_NO_IMAGE_KHR)
     {
-      LOGE("eglCreateImageKHR(fd %d, %dx%d) failed: %#x", fd, width, height, eglGetError());
+      const EGLint e = eglGetError();
+      if (!quiet)
+        LOGE("eglCreateImageKHR(fd %d, %dx%d) failed: %#x", fd, width, height, e);
       return 0;
     }
     images[nimg++] = img;
@@ -2421,10 +2431,26 @@ void dvfp::GpuThread(std::promise<bool> ready)
     targetTexture(GL_TEXTURE_2D, img);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    // felgpu's gathers reach over the edges of RGB10_A2 buffers
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     const GLenum err = glGetError();
-    if (err != GL_NO_ERROR)
+    if (err == GL_NO_ERROR)
+      return tex;
+    if (!quiet)
       LOGE("binding the EGL image of fd %d failed: %#x", fd, err);
-    return err == GL_NO_ERROR ? tex : 0;
+    glDeleteTextures(1, &tex);
+    return 0;
+  };
+  // display buffer i (reg2.lin_fd) as the texture and the framebuffer the GPU writes
+  auto importTarget = [&](int i) -> bool {
+    tlin[i] = reg2.lin_fd[i] >= 0 ? importTex(reg2.lin_fd[i], m_width, m_height) : 0;
+    if (!tlin[i])
+      return false;
+    glGenFramebuffers(1, &flin[i]);
+    glBindFramebuffer(GL_FRAMEBUFFER, flin[i]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tlin[i], 0);
+    return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
   };
 
   do
@@ -2457,20 +2483,60 @@ void dvfp::GpuThread(std::promise<bool> ready)
       break;
     }
 
-    // test: debug.dvfp.taps 4 (Lanczos-2 EL upsampling, not bit exact with 6)
-    fel = felgpu_create(m_width, m_height, PropInt("debug.dvfp.taps", EL_TAPS) == 4 ? 4 : EL_TAPS);
-    if (!fel)
-    {
-      fail("felgpu_create failed");
-      break;
-    }
-
     dev = open(DVFEL_DEV, O_RDWR | O_CLOEXEC);
     ion = open(ION_DEV, O_RDONLY | O_CLOEXEC);
     const int heapId = ion >= 0 ? IonHeapId(ion) : -1;
     if (dev < 0 || heapId < 0)
     {
       fail("cannot open /dev/dvfel or find the codec_mm ION heap");
+      break;
+    }
+
+    // The buffers' word Cr | Cb << 10 | Y << 20 is DRM_FORMAT_ABGR2101010 (GL_RGB10_A2 with R = Cr,
+    // G = Cb, B = Y). Imported so, felgpu composes the same picture with fewer texture operations
+    // (felgpu.h, FELGPU_BUF_RGB10A2; on the S928X 26 instead of 33.5 ms a 4K frame). The GPU can;
+    // whether a firmware's driver imports the format for a render target shows on the first display
+    // buffer. If it does not (or felgpu's shaders for it fail there), the buffers are RGBA8 as before.
+    const int want10 = PropInt(PROP_RGB10, 1);
+    const int firstImage = nimg;
+    bool imported10 = false;
+    if (want10)
+    {
+      fourcc = DRM_FORMAT_ABGR2101010;
+      quiet = true;
+      reg2.lin_fd[0] = IonAlloc(ion, heapId, DVFEL_BUF_SIZE(m_width, m_height));
+      imported10 = importTarget(0);
+      quiet = false;
+    }
+    // test: debug.dvfp.taps 4 (Lanczos-2 EL upsampling, not bit exact with 6)
+    const int taps = PropInt("debug.dvfp.taps", EL_TAPS) == 4 ? 4 : EL_TAPS;
+    bool rgb10 = imported10 && want10 != 2;
+    if (rgb10)
+      fel = felgpu_create_fmt(m_width, m_height, taps, FELGPU_BUF_RGB10A2);
+    if (!fel)
+    {
+      if (want10)
+      {
+        LOGI("the buffers stay RGBA8: %s",
+             !imported10 ? "the driver does not import RGB10_A2 render targets"
+                         : want10 == 2 ? "debug.dvfp.rgb10 2" : "felgpu's RGB10_A2 shaders failed");
+        // what the attempt left; the buffer itself is imported again below
+        glDeleteFramebuffers(1, &flin[0]);
+        glDeleteTextures(1, &tlin[0]);
+        flin[0] = tlin[0] = 0;
+        while (nimg > firstImage)
+          destroyImage(dpy, images[--nimg]);
+        while (glGetError() != GL_NO_ERROR)
+        {
+        }
+        fourcc = DRM_FORMAT_ABGR8888;
+        rgb10 = false;
+      }
+      fel = felgpu_create(m_width, m_height, taps);
+    }
+    if (!fel)
+    {
+      fail("felgpu_create failed");
       break;
     }
     reg.width = m_width;
@@ -2483,20 +2549,14 @@ void dvfp::GpuThread(std::promise<bool> ready)
       tin[i] = reg.in_fd[i] >= 0 ? importTex(reg.in_fd[i], m_width, m_height) : 0;
       ok = tin[i] != 0;
     }
-    // the display buffers the GPU writes
+    // the display buffers the GPU writes (the first may be there already)
     for (int i = 0; i < nLin && ok; i++)
     {
-      reg2.lin_fd[i] = IonAlloc(ion, heapId, DVFEL_BUF_SIZE(m_width, m_height));
-      tlin[i] = reg2.lin_fd[i] >= 0 ? importTex(reg2.lin_fd[i], m_width, m_height) : 0;
-      if (!tlin[i])
-      {
-        ok = false;
-        break;
-      }
-      glGenFramebuffers(1, &flin[i]);
-      glBindFramebuffer(GL_FRAMEBUFFER, flin[i]);
-      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tlin[i], 0);
-      ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+      if (tlin[i])
+        continue;
+      if (reg2.lin_fd[i] < 0)
+        reg2.lin_fd[i] = IonAlloc(ion, heapId, DVFEL_BUF_SIZE(m_width, m_height));
+      ok = importTarget(i);
     }
     // the pool the kernel decompresses the EL pictures into
     for (int i = 0; i < EL_POOL && ok; i++)
@@ -2532,8 +2592,8 @@ void dvfp::GpuThread(std::promise<bool> ready)
     }
     ready.set_value(true);
     announced = true;
-    LOGI("GPU compositor ready (%s), %d display buffers (direct)",
-         reinterpret_cast<const char*>(glGetString(GL_RENDERER)), nLin);
+    LOGI("GPU compositor ready (%s), %d display buffers (direct), buffers imported as %s",
+         reinterpret_cast<const char*>(glGetString(GL_RENDERER)), nLin, rgb10 ? "RGB10_A2" : "RGBA8");
 
     std::shared_ptr<felgpu_meta> current;
     int dither = -1, pattern = -1, demo = -1, noGpu = 0, profile = -1;

@@ -21,6 +21,18 @@
  * Luma prediction and the NLQ are functions of a single 10-bit code, so
  * they are evaluated on the CPU into a lookup texture once per frame;
  * polynomial-only chroma mappings use the same table.
+ *
+ * The buffers' pixel word Cr | Cb << 10 | Y << 20 is GL_RGB10_A2 (R = Cr,
+ * G = Cb, B = Y). Imported so (FELGPU_BUF_RGB10A2, shaders built with P10)
+ * a texel is the three codes / 1023 and textureGather reads four Y samples
+ * at once. The S928X's Mali-G57 spends a frame's time in its texture unit,
+ * so the P10 path is built to need fewer texture operations: the EL is
+ * filtered straight from its picture (hardware decoded EL: no unpacking
+ * passes), the luma an MMR needs comes from two gathers, pass 1 is a
+ * compute shader that weaves its columns for pass 4 (ELWEAVE), and passes 3
+ * and 4 have variants without the test modes' branches (PLAIN). The output
+ * is the same, bit for bit: 4K with MMR chroma in 26 instead of 33.5 ms
+ * (tools/felbench, GPU at 830 MHz).
  */
 #include <math.h>
 #include <stdio.h>
@@ -35,15 +47,24 @@
 
 struct felgpu {
     int w, h, taps;
+    int p10;                        /* buffers imported as GL_RGB10_A2 */
     GLuint p_vert1, p_vert2, p_chroma, p_luma;
+    GLuint p_vert1p, p_vert2p;      /* p10: the vertical passes from the packed EL picture */
+    int fastco;                     /* p10: shaders built with FASTCO */
+    int weave;                      /* p10: el_yv is woven (ELWEAVE) */
+    GLuint p_vert1c[2];             /* ELWEAVE: the vertical luma pass in compute (planes, packed); 0: by fragments */
+    /* p10: PLAIN programs by chroma mapping, residual and dither; 0: not built yet, ~0: failed */
+    GLuint pv_chroma[3][2][2], pv_luma[2][2];
+    GLuint el_tex;                  /* p10: the EL picture of felgpu_set_el_tex, 0: the uploaded planes */
     GLuint el_y, el_cb, el_cr;      /* uploaded EL planes, R16UI */
-    GLuint el_yv, el_cv;            /* vertically upsampled, R32F / RG32F */
+    GLuint el_yv, el_cv;            /* vertically upsampled, R32F (ELWEAVE: w/4 + 4 x 2 h) / RG32F */
     GLuint p_unpack_y, p_unpack_c;  /* hardware decoded EL: packed words -> el_y, el_cb, el_cr */
     GLuint fbo_el_y, fbo_el_c;
     GLuint fbo_yv, fbo_cv;
-    GLuint chroma, fbo_chroma;      /* composed 4:2:0 chroma, RG16UI */
+    GLuint chroma, fbo_chroma;      /* composed 4:2:0 chroma, RG16UI (p10: RGB10_A2, .r Cr .g Cb) */
     GLuint lut;                     /* R32F LUT_W x LUT_ROWS */
     GLuint dither;                  /* R32F BN x BN blue noise thresholds */
+    GLuint dither2;                 /* p10: RG16UI, the ranks of the chroma pass' two thresholds */
     int dither_mode;                /* 0 off, 1 on, 2 left half only */
     int demo;                       /* EL on the left half only */
     int pattern;                    /* 1: grey ramp test pattern instead of the video */
@@ -88,9 +109,18 @@ struct felgpu {
 
 
 /*
- * program() prepends "#version 320 es" and "#define TAPS n". Mali loads
- * uniform array elements with a per fragment index from memory: filter
+ * program() prepends "#version 320 es", "#define TAPS n" and its defines
+ * (P10: RGB10_A2 buffers, ELPACK: the EL read from its packed picture). Mali
+ * loads uniform array elements with a per fragment index from memory: filter
  * weights and bases are picked per phase with constant indices instead.
+ *
+ * P10 programs come in variants (plain_program) for what a film plays with
+ * all the time: PLAIN, without the test modes (demo, pattern, half dither),
+ * with the residual (EL 0 / 1), the dither (DITHER 0 / 1) and the chroma
+ * mapping (CHROMA 1: both polynomial, 2: both one MMR piece, 0: any) fixed
+ * when the shader is built. The chroma pass spends most of its time on
+ * arithmetic, and a branch on a uniform costs every fragment. FASTCO: texture
+ * coordinates straight from gl_FragCoord (see el_hg_frag).
  */
 #define GLSL_HEAD \
     "precision highp float;\n" \
@@ -120,16 +150,44 @@ struct felgpu {
     "uniform int pattern;\n" \
     "uniform int pass_h;\n" \
     "float dth(ivec2 p, ivec2 off) {\n" \
+    "#ifdef PLAIN\n" \
+    "#if DITHER\n" \
+    "  return texelFetch(dither, (p + off) & 63, 0).x;\n" \
+    "#else\n" \
+    "  return 0.5;\n" \
+    "#endif\n" \
+    "#else\n" \
     "  bool on = pattern != 0 ? dither_split > 0 && ((p.y * 4 / pass_h) & 1) == 0\n" \
     "                         : p.x < dither_split;\n" \
     "  return on ? texelFetch(dither, (p + off) & 63, 0).x : 0.5;\n" \
+    "#endif\n" \
     "}\n" \
     /* 10-bit (limited range) codes 160..240 and 330..410, in 12-bit steps */ \
     "float pattern_v(ivec2 p, ivec2 size) {\n" \
     "  float lo = p.y * 4 / size.y < 2 ? 160.0 : 330.0;\n" \
     "  return floor((lo + 80.0 * float(p.x) / float(size.x)) * 4.0) / 4096.0;\n" \
     "}\n" \
-    "uint out10d(float v, float t) { return uint(clamp(floor(v * 1024.0 + t), 0.0, 1023.0)); }\n"
+    "uint out10d(float v, float t) { return uint(clamp(floor(v * 1024.0 + t), 0.0, 1023.0)); }\n" \
+    /* \
+     * P10: a texel of a dma-buf is (Cr, Cb, Y) / 1023; codes are kept as \
+     * floats. Written as (code + 0.25) / 1023: exact whether the conversion \
+     * to 10 bits rounds or truncates. \
+     */ \
+    "#ifdef P10\n" \
+    "vec3 codes_at(sampler2D t, ivec2 p) { return floor(texelFetch(t, p, 0).rgb * 1023.0 + 0.5); }\n" \
+    "vec4 codes4(vec4 g) { return floor(g * 1023.0 + 0.5); }\n" \
+    "float lut_f(int row, float c) { return texelFetch(lut, ivec2(int(min(c, 1023.0)), row), 0).x; }\n" \
+    "float out10f(float v, float t) { return clamp(floor(v * 1024.0 + t), 0.0, 1023.0); }\n" \
+    "#ifdef PLAIN\n" \
+    "#define USE_EL (EL != 0)\n" \
+    "#define PATTERN false\n" \
+    "#define KIND CHROMA\n" \
+    "#else\n" \
+    "#define USE_EL use_el\n" \
+    "#define PATTERN (pattern != 0)\n" \
+    "#define KIND 0\n" \
+    "#endif\n" \
+    "#endif\n"
 
 /* horizontal 2x EL step + rounding to an integer EL code */
 #define GLSL_EL_H \
@@ -156,7 +214,89 @@ struct felgpu {
     "    acc += WSEL(hwt, ph, k) * g.w + WSEL(hwt, ph, k + 1) * g.z;\n" \
     "  }\n" \
     "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
-    "}\n"
+    "}\n" \
+    /* \
+     * FASTCO (the phases' bases are -TAPS / 2 and -TAPS / 2 + 1, see \
+     * felgpu_create_fmt): el_hg and el_h for the fragment's own pixel. Its \
+     * centre is at texel x / 2 + 0.25 or + 0.75 of the half width texture, \
+     * so one coordinate linear in gl_FragCoord serves both phases: the \
+     * gathers' lower left column (the nearest texel of el_h_frag) is the \
+     * phase's base + k, a quarter texel from picking a neighbour. No \
+     * integer arithmetic or division per tap; the textures clamp to edge. \
+     */ \
+    "#ifdef FASTCO\n" \
+    "uniform vec2 el_isz;\n" \
+    "#ifdef ELWEAVE\n" \
+    /* \
+     * ELWEAVE (6 taps). Measured on the Mali-G57, a 4K pass pays about \
+     * 1.2 ms for every fetch of a 32-bit texel and 2.4 ms for a gather or a \
+     * fetch of a 64-bit texel, far more than for its arithmetic: the taps \
+     * have to come in fewer texture operations. The vertical pass weaves \
+     * its columns into a texture of half the width and twice the height: \
+     * texel (i, 2 y + r) is column 2 (i - 2) + r of row y (two texels of the \
+     * edge column on either side). A gather then brings four neighbouring \
+     * columns of a row, in .w .x .z .y, and the six taps of a pixel are in \
+     * two gathers instead of three: columns 2 (i - 2) .. + 7 from texel \
+     * i = floor(x / 4 + 0.875 .. 1.625), the first tap its first or second. \
+     */ \
+    "float el_hg_frag(sampler2D t) {\n" \
+    "  int q = int(gl_FragCoord.x) & 3, ph = q & 1;\n" \
+    "  bool odd = q == 0 || q == 3;\n" \
+    "  vec2 uv = (gl_FragCoord.xy * vec2(0.25, 2.0) + vec2(1.25, 0.0)) * el_isz;\n" \
+    "  vec4 a = textureGather(t, uv);\n" \
+    "  vec4 b = textureGatherOffset(t, uv, ivec2(2, 0));\n" \
+    "  vec2 s0 = odd ? a.xz : a.wx;\n" \
+    "  vec2 s1 = odd ? vec2(a.y, b.w) : a.zy;\n" \
+    "  vec2 s2 = odd ? b.xz : b.wx;\n" \
+    "  float acc = 0.0;\n" \
+    "  acc += WSEL(hwt, ph, 0) * s0.x + WSEL(hwt, ph, 1) * s0.y;\n" \
+    "  acc += WSEL(hwt, ph, 2) * s1.x + WSEL(hwt, ph, 3) * s1.y;\n" \
+    "  acc += WSEL(hwt, ph, 4) * s2.x + WSEL(hwt, ph, 5) * s2.y;\n" \
+    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
+    "}\n" \
+    /* el_hg for any pixel (the measurement) */ \
+    "float el_weave_at(sampler2D t, int x, int y) {\n" \
+    "  return texelFetch(t, ivec2((x >> 1) + 2, 2 * y + (x & 1)), 0).x;\n" \
+    "}\n" \
+    "float el_hg_any(sampler2D t, ivec2 p) {\n" \
+    "  int ph = p.x & 1, b = (p.x >> 1) + BSEL(hbase, ph);\n" \
+    "  float acc = 0.0;\n" \
+    "  for (int k = 0; k < TAPS; k += 2)\n" \
+    "    acc += WSEL(hwt, ph, k) * el_weave_at(t, b + k, p.y) + WSEL(hwt, ph, k + 1) * el_weave_at(t, b + k + 1, p.y);\n" \
+    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
+    "}\n" \
+    "#else\n" \
+    "#define el_hg_any el_hg\n" \
+    "float el_hg_frag(sampler2D t) {\n" \
+    "  int ph = int(gl_FragCoord.x) & 1;\n" \
+    "  vec2 uv = (gl_FragCoord.xy * vec2(0.5, 1.0) + vec2(-float(TAPS / 2 - 1), 0.5)) * el_isz;\n" \
+    "  float acc = 0.0;\n" \
+    "  for (int k = 0; k < TAPS; k += 2) {\n" \
+    "    vec4 g = textureGatherOffset(t, uv, ivec2(k, 0));\n" \
+    "    acc += WSEL(hwt, ph, k) * g.w + WSEL(hwt, ph, k + 1) * g.z;\n" \
+    "  }\n" \
+    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
+    "}\n" \
+    "#endif\n" \
+    "vec2 el_h_frag(sampler2D t) {\n" \
+    "  int ph = int(gl_FragCoord.x) & 1;\n" \
+    "  vec2 uv = (gl_FragCoord.xy * vec2(0.5, 1.0) + vec2(0.5 - float(TAPS / 2), 0.0)) * el_isz;\n" \
+    "  vec2 acc = vec2(0.0);\n" \
+    /* the offset has to be a constant expression: no loop */ \
+    "#define EL_H_TAP(k) acc += WSEL(hwt, ph, k) * textureLodOffset(t, uv, 0.0, ivec2(k, 0)).xy;\n" \
+    "  EL_H_TAP(0) EL_H_TAP(1) EL_H_TAP(2) EL_H_TAP(3)\n" \
+    "#if TAPS == 6\n" \
+    "  EL_H_TAP(4) EL_H_TAP(5)\n" \
+    "#endif\n" \
+    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
+    "}\n" \
+    "#define EL_HG(t, p) el_hg_frag(t)\n" \
+    "#define EL_H(t, p) el_h_frag(t)\n" \
+    "#else\n" \
+    "#define EL_HG(t, p) el_hg(t, p)\n" \
+    "#define EL_H(t, p) el_h(t, p)\n" \
+    "#define el_hg_any el_hg\n" \
+    "#endif\n"
 
 /*
  * hardware decoded EL (felgpu_set_el_tex): the packed words of the EL picture,
@@ -246,33 +386,83 @@ static const char *vs_src =
     "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
     "}\n";
 
-/* vertical 2x upsampling of the EL chroma: src0 (Cb) -> .x, src1 (Cr) -> .y */
+/*
+ * vertical 2x upsampling of the EL chroma: src0 (Cb) -> .x, src1 (Cr) -> .y.
+ * ELPACK: both from the EL picture src0, whose chroma at even x/y is the
+ * original 4:2:0 sample (see dvfel_uapi.h) - one fetch a tap.
+ */
 static const char *fs_el_vert2 =
     GLSL_HEAD
+    "#ifdef ELPACK\n"
+    "uniform sampler2D src0;\n"
+    "#else\n"
     "uniform usampler2D src0;\n"
     "uniform usampler2D src1;\n"
+    "#endif\n"
     "uniform float wt[12];\n"
     "uniform int base[2];\n"
     "out vec2 o;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  int ph = p.y & 1;\n"
+    "#ifdef ELPACK\n"
+    "  int h = textureSize(src0, 0).y >> 1;\n"
+    "#else\n"
     "  int h = textureSize(src0, 0).y;\n"
+    "#endif\n"
     "  int b = (p.y >> 1) + BSEL(base, ph);\n"
     "  vec2 acc = vec2(0.0);\n"
     "  for (int t = 0; t < TAPS; t++) {\n"
     "    ivec2 q = ivec2(p.x, clamp(b + t, 0, h - 1));\n"
+    "#ifdef ELPACK\n"
+    "    acc += WSEL(wt, ph, t) * floor(texelFetch(src0, q * 2, 0).gr * 1023.0 + 0.5);\n"
+    "#else\n"
     "    acc += WSEL(wt, ph, t) * vec2(float(texelFetch(src0, q, 0).x), float(texelFetch(src1, q, 0).x));\n"
+    "#endif\n"
     "  }\n"
     "  o = acc;\n"
     "}\n";
 
-/* vertical 2x upsampling of the EL luma */
+/* vertical 2x upsampling of the EL luma; ELPACK: the Y (.b) of the EL picture */
 static const char *fs_el_vert1 =
     GLSL_HEAD
+    "#ifdef ELPACK\n"
+    "uniform sampler2D src0;\n"
+    "#else\n"
     "uniform usampler2D src0;\n"
+    "#endif\n"
     "uniform float wt[12];\n"
     "uniform int base[2];\n"
+    "#ifdef FASTCO\n"
+    "uniform vec2 isz;\n"
+    "#endif\n"
+    "#ifdef ELWEAVE\n"
+    /*
+     * the woven target (see el_hg_frag): texel (i, j) is column
+     * 2 (i - 2) + (j & 1) of the output row j >> 1. The gathers sit on the
+     * corner between the columns 2 (i - 2) and 2 (i - 2) + 1 (the edge
+     * columns repeat: the source clamps), .w .x the first, .z .y the second;
+     * their lower row floor(j / 4 + 0.125 .. 0.875 - 2.5 + t) is the base of
+     * the output row's phase + t.
+     */
+    "out float o;\n"
+    "void main() {\n"
+    "  int j = int(gl_FragCoord.y), ph = (j >> 1) & 1;\n"
+    "  bool second = (j & 1) != 0;\n"
+    "  vec2 uv = (gl_FragCoord.xy * vec2(2.0, 0.25) + vec2(-4.0, -float(TAPS / 2 - 1))) * isz;\n"
+    /* both columns of the gathers are filtered, one is written: cheaper than picking per tap */
+    "  vec2 acc = vec2(0.0);\n"
+    "  for (int t = 0; t < TAPS; t += 2) {\n"
+    "#ifdef ELPACK\n"
+    "    vec4 g = floor(textureGatherOffset(src0, uv, ivec2(0, t), 2) * 1023.0 + 0.5);\n"
+    "#else\n"
+    "    vec4 g = vec4(textureGatherOffset(src0, uv, ivec2(0, t), 0));\n"
+    "#endif\n"
+    "    acc += WSEL(wt, ph, t) * g.wz + WSEL(wt, ph, t + 1) * g.xy;\n"
+    "  }\n"
+    "  o = second ? acc.y : acc.x;\n"
+    "}\n"
+    "#else\n"
     "out float o;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
@@ -281,11 +471,62 @@ static const char *fs_el_vert1 =
     "  vec2 sz = vec2(textureSize(src0, 0));\n"
     "  float acc = 0.0;\n"
     /* a gather per tap pair, footprint lower-left (x, b + t): .w (x, b + t), .x (x, b + t + 1) */
+    "#ifdef FASTCO\n"
+    /* as el_hg_frag, on rows: the gathers' lower row is the phase's base + t */
+    "  vec2 uv = (gl_FragCoord.xy * vec2(1.0, 0.5) + vec2(0.5, -float(TAPS / 2 - 1))) * isz;\n"
+    "#endif\n"
     "  for (int t = 0; t < TAPS; t += 2) {\n"
+    "#ifdef ELPACK\n"
+    "#ifdef FASTCO\n"
+    "    vec4 g = floor(textureGatherOffset(src0, uv, ivec2(0, t), 2) * 1023.0 + 0.5);\n"
+    "#else\n"
+    "    vec4 g = floor(textureGather(src0, (vec2(p.x, b + t) + 1.0) / sz, 2) * 1023.0 + 0.5);\n"
+    "#endif\n"
+    "    acc += WSEL(wt, ph, t) * g.w + WSEL(wt, ph, t + 1) * g.x;\n"
+    "#else\n"
     "    uvec4 g = textureGather(src0, (vec2(p.x, b + t) + 1.0) / sz, 0);\n"
     "    acc += WSEL(wt, ph, t) * float(g.w) + WSEL(wt, ph, t + 1) * float(g.x);\n"
+    "#endif\n"
     "  }\n"
     "  o = acc;\n"
+    "}\n"
+    "#endif\n";
+
+/*
+ * ELWEAVE: the vertical luma pass as a compute shader. A fragment writes
+ * one texel, so the fragment shader above filters both columns of its
+ * gathers for each of the two texels they belong to; an invocation here
+ * filters them once and stores both (7.5 instead of 12.4 M gathers a 4K
+ * frame). Same arithmetic, same result.
+ */
+static const char *cs_el_vert1 =
+    GLSL_HEAD
+    "precision highp image2D;\n"
+    "layout(local_size_x = 8, local_size_y = 8) in;\n"
+    "#ifdef ELPACK\n"
+    "uniform sampler2D src0;\n"
+    "#else\n"
+    "uniform usampler2D src0;\n"
+    "#endif\n"
+    "uniform float wt[12];\n"
+    "uniform vec2 isz;\n"
+    "layout(r32f, binding = 0) writeonly uniform image2D dst;\n"
+    "void main() {\n"
+    "  ivec2 id = ivec2(gl_GlobalInvocationID.xy);\n"
+    "  int ph = id.y & 1;\n"
+    /* id.y the output row; (id + 0.5) is the fragment coordinate of the pair in an unwoven target */
+    "  vec2 uv = ((vec2(id) + 0.5) * vec2(2.0, 0.5) + vec2(-4.0, -float(TAPS / 2 - 1))) * isz;\n"
+    "  vec2 acc = vec2(0.0);\n"
+    "  for (int t = 0; t < TAPS; t += 2) {\n"
+    "#ifdef ELPACK\n"
+    "    vec4 g = floor(textureGatherOffset(src0, uv, ivec2(0, t), 2) * 1023.0 + 0.5);\n"
+    "#else\n"
+    "    vec4 g = vec4(textureGatherOffset(src0, uv, ivec2(0, t), 0));\n"
+    "#endif\n"
+    "    acc += WSEL(wt, ph, t) * g.wz + WSEL(wt, ph, t + 1) * g.xy;\n"
+    "  }\n"
+    "  imageStore(dst, ivec2(id.x, 2 * id.y), vec4(acc.x));\n"
+    "  imageStore(dst, ivec2(id.x, 2 * id.y + 1), vec4(acc.y));\n"
     "}\n";
 
 /*
@@ -305,7 +546,21 @@ static const char *fs_chroma =
     "uniform bool cpoly[2];\n"
     "uniform bool use_el;\n"
     "uniform float inv_bl;\n"
+    "#ifdef P10\n"
+    "uniform vec2 bl_isz;\n"
+    "#ifdef PLAIN\n"
+    /*
+     * the ranks of the Cb (.x) and Cr (.y) thresholds, their offsets applied,
+     * in one 32-bit texel: one fetch instead of two. Polynomial chroma only:
+     * measured, it takes 0.4 ms off that pass (1.9 ms on noise) but adds
+     * 0.6 ms to the MMR one.
+     */
+    "uniform usampler2D dither2;\n"
+    "#endif\n"
+    "out vec4 o;\n"
+    "#else\n"
     "out uvec2 o;\n"
+    "#endif\n"
     "float mmr_eval(int b, float c0, vec3 sig) {\n"
     "  vec4 xx = vec4(sig.x * sig.y, sig.x * sig.z, sig.y * sig.z, sig.x * sig.y * sig.z);\n"
     "  vec3 x2 = sig * sig; vec4 xx2 = xx * xx;\n"
@@ -327,10 +582,59 @@ static const char *fs_chroma =
     "void main() {\n"
     "  ivec2 c = ivec2(gl_FragCoord.xy);\n"
     "  ivec2 p = c * 2;\n"
+    "  float vcb, vcr;\n"
+    "#ifdef P10\n"
+    "  vec2 w0 = floor(texelFetch(bl, p, 0).rg * 1023.0 + 0.5);\n"
+    "  float cb = w0.y, cr = w0.x;\n"
+    "#if KIND == 1\n"
+    "  vcb = lut_f(4, cb);\n"
+    "  vcr = lut_f(5, cr);\n"
+    "#else\n"
+    "#if KIND == 0\n"
+    "  if (cpoly[0] && cpoly[1]) {\n"
+    "    vcb = lut_f(4, cb);\n"
+    "    vcr = lut_f(5, cr);\n"
+    "  } else\n"
+    "#endif\n"
+    "  {\n"
+    /*
+     * luma for MMR, as below: the Y of columns x - 1, x and x, x + 1 on the
+     * rows y, y + 1 in two gathers (.w .z the lower row, .x .y the upper;
+     * the texture clamps to edge), the first at the corner (p.x, p.y + 1)
+     */
+    "    vec2 uv = (gl_FragCoord.xy * 2.0 - vec2(1.0, 0.0)) * bl_isz;\n"
+    "    vec4 ga = codes4(textureGather(bl, uv, 2));\n"
+    "    vec4 gb = codes4(textureGatherOffset(bl, uv, ivec2(1, 0), 2));\n"
+    "    float h0 = floor((ga.w + 2.0 * ga.z + gb.z + 2.0) * 0.25);\n"
+    "    float h1 = floor((ga.x + 2.0 * ga.y + gb.y + 2.0) * 0.25);\n"
+    "    vec3 sig = vec3(min(floor((h0 + h1 + 1.0) * 0.5), 1023.0), cb, cr) * inv_bl;\n"
+    "#if KIND == 2\n"
+    "    vcb = mmr_eval(0, mmrc[0], sig);\n"
+    "    vcr = mmr_eval(48, mmrc[8], sig);\n"
+    "#else\n"
+    "    vcb = cpoly[0] ? lut_f(4, cb) : predict_mmr(0, sig.y, sig);\n"
+    "    vcr = cpoly[1] ? lut_f(5, cr) : predict_mmr(1, sig.z, sig);\n"
+    "#endif\n"
+    "  }\n"
+    "#endif\n"
+    "  if (USE_EL) {\n"
+    "    vec2 el = EL_H(elc, c);\n"
+    "    vcb += lut_f(2, el.x);\n"
+    "    vcr += lut_f(3, el.y);\n"
+    "  }\n"
+    "  if (PATTERN)\n"
+    "    vcb = vcr = 0.5;\n"
+    "#if defined(PLAIN) && DITHER && KIND == 1\n"
+    "  vec2 t = (vec2(texelFetch(dither2, c & 63, 0).xy) + 0.5) / 4096.0;\n"
+    "  o = vec4((vec2(out10f(vcr, t.y), out10f(vcb, t.x)) + 0.25) / 1023.0, 0.0, 0.0);\n"
+    "#else\n"
+    "  o = vec4((vec2(out10f(vcr, dth(c, ivec2(41, 7))), out10f(vcb, dth(c, ivec2(17, 31)))) + 0.25) / 1023.0,\n"
+    "           0.0, 0.0);\n"
+    "#endif\n"
+    "#else\n"
     "  int W = textureSize(bl, 0).x;\n"
     "  uint w0 = word_at(bl, p);\n"
     "  uint cb = cb_of(w0), cr = cr_of(w0);\n"
-    "  float vcb, vcr;\n"
     "  if (cpoly[0] && cpoly[1]) {\n"
     "    vcb = lut_at(4, cb);\n"
     "    vcr = lut_at(5, cr);\n"
@@ -354,6 +658,7 @@ static const char *fs_chroma =
     "  if (pattern != 0)\n"
     "    vcb = vcr = 0.5;\n"
     "  o = uvec2(out10d(vcb, dth(c, ivec2(17, 31))), out10d(vcr, dth(c, ivec2(41, 7))));\n"
+    "#endif\n"
     "}\n";
 
 /* luma + packing: one fragment per output pixel word */
@@ -361,12 +666,45 @@ static const char *fs_luma =
     GLSL_HEAD GLSL_WORD GLSL_EL_H GLSL_OVERLAY
     "uniform sampler2D bl;\n"
     "uniform sampler2D ely;\n"
+    "#ifdef P10\n"
+    "uniform sampler2D chroma;\n"
+    "#else\n"
     "uniform usampler2D chroma;\n"
+    "#endif\n"
     "uniform bool use_el;\n"
     "uniform int el_split;\n"   /* demo: the composition only left of this column */
     "out vec4 o;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "#ifdef P10\n"
+    "  float yb = floor(texelFetch(bl, p, 0).b * 1023.0 + 0.5);\n"
+    /* the composed chroma (Cr, Cb) / 1023 goes out as it is */
+    "  vec2 c = texelFetch(chroma, p >> 1, 0).rg;\n"
+    "  float v = lut_f(0, yb);\n"
+    "#ifdef PLAIN\n"
+    "#if EL\n"
+    "  v += lut_f(1, EL_HG(ely, p));\n"
+    "#endif\n"
+    "  o = vec4(c, (out10f(v, dth(p, ivec2(0))) + 0.25) / 1023.0, 0.0);\n"
+    "#else\n"
+    "  if (p.x >= el_split) {\n"
+    "    v = yb / 1024.0;\n"
+    "    c = pattern != 0 ? vec2(512.25 / 1023.0) : texelFetch(bl, (p >> 1) << 1, 0).rg;\n"
+    "  } else if (use_el)\n"
+    "    v += lut_f(1, EL_HG(ely, p));\n"
+    "  if (pattern != 0)\n"
+    "    v = pattern_v(p, textureSize(bl, 0));\n"
+    "  float y = out10f(v, dth(p, ivec2(0)));\n"
+    "  if (ovl_on) {\n"
+    "    uint yi = uint(y);\n"
+    "    uvec2 ci = uvec2(floor(c.gr * 1023.0 + 0.5));\n"
+    "    overlay(p, textureSize(bl, 0).x, yi, ci);\n"
+    "    y = float(yi);\n"
+    "    c = (vec2(ci.yx) + 0.25) / 1023.0;\n"
+    "  }\n"
+    "  o = vec4(c, (y + 0.25) / 1023.0, 0.0);\n"
+    "#endif\n"
+    "#else\n"
     "  uint w = word_at(bl, p);\n"
     "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
     "  float v = lut_at(0, y_of(w));\n"
@@ -382,6 +720,7 @@ static const char *fs_luma =
     "  if (ovl_on)\n"
     "    overlay(p, textureSize(bl, 0).x, y, c);\n"
     "  o = pack_px(y, c.x, c.y);\n"
+    "#endif\n"
     "}\n";
 
 /*
@@ -394,7 +733,11 @@ static const char *fs_stats =
     "#define STATS_STEP " STR(STATS_STEP) "\n"
     "uniform sampler2D bl;\n"
     "uniform sampler2D ely;\n"
+    "#ifdef P10\n"
+    "uniform sampler2D chroma;\n"
+    "#else\n"
     "uniform usampler2D chroma;\n"
+    "#endif\n"
     "uniform bool use_el;\n"
     "uniform ivec2 act_x;\n"   /* sample columns of the active area; zero outside */
     "out uvec2 o;\n"
@@ -411,6 +754,14 @@ static const char *fs_stats =
     "    return;\n"
     "  }\n"
     "  ivec2 p = g * STATS_STEP + STATS_STEP / 2;\n"
+    "#ifdef P10\n"
+    "  vec3 w = codes_at(bl, p);\n"
+    "  float v = lut_f(0, w.b);\n"
+    "  if (use_el)\n"
+    "    v += lut_f(1, el_hg_any(ely, p));\n"
+    "  vec2 c = floor(texelFetch(chroma, p >> 1, 0).rg * 1023.0 + 0.5);\n"
+    "  o = uvec2(pq_max(clamp(floor(v * 1024.0 + 0.5), 0.0, 1023.0), c.g, c.r), pq_max(w.b, w.g, w.r));\n"
+    "#else\n"
     "  uint w = word_at(bl, p);\n"
     "  float v = lut_at(0, y_of(w));\n"
     "  if (use_el)\n"
@@ -418,6 +769,7 @@ static const char *fs_stats =
     "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
     "  o = uvec2(pq_max(clamp(floor(v * 1024.0 + 0.5), 0.0, 1023.0), float(c.x), float(c.y)),\n"
     "            pq_max(float(y_of(w)), float(cb_of(w)), float(cr_of(w))));\n"
+    "#endif\n"
     "}\n";
 
 /* one fragment per REDUCE_W samples of a row: max and sum of both values */
@@ -492,10 +844,10 @@ static GLuint compile(GLenum type, const char *src)
     return s;
 }
 
-static GLuint program(const char *fs, int taps)
+static GLuint program(const char *fs, int taps, const char *defs)
 {
     char *src = NULL;
-    if (asprintf(&src, "#version 320 es\n#define TAPS %d\n%s", taps, fs) < 0)
+    if (asprintf(&src, "#version 320 es\n#define TAPS %d\n%s%s", taps, defs, fs) < 0)
         return 0;
     GLuint v = compile(GL_VERTEX_SHADER, vs_src), f = compile(GL_FRAGMENT_SHADER, src);
     free(src);
@@ -513,6 +865,31 @@ static GLuint program(const char *fs, int taps)
         char log[4096];
         glGetProgramInfoLog(p, sizeof(log), NULL, log);
         fprintf(stderr, "felgpu: link failed:\n%s\n", log);
+        return 0;
+    }
+    return p;
+}
+
+static GLuint program_compute(const char *cs, int taps, const char *defs)
+{
+    char *src = NULL;
+    if (asprintf(&src, "#version 320 es\n#define TAPS %d\n%s%s", taps, defs, cs) < 0)
+        return 0;
+    GLuint c = compile(GL_COMPUTE_SHADER, src);
+    free(src);
+    if (!c)
+        return 0;
+    GLuint p = glCreateProgram();
+    glAttachShader(p, c);
+    glLinkProgram(p);
+    glDeleteShader(c);
+    GLint ok;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetProgramInfoLog(p, sizeof(log), NULL, log);
+        fprintf(stderr, "felgpu: link failed:\n%s\n", log);
+        glDeleteProgram(p);
         return 0;
     }
     return p;
@@ -549,6 +926,10 @@ static void bind_tex(GLuint p, const char *name, int unit, GLuint tex)
     glUniform1i(glGetUniformLocation(p, name), unit);
 }
 
+/*
+ * No glInvalidateFramebuffer before the draw: measured on the S928X
+ * (Mali-G57, driver r37p0), it changes nothing (33.7 ms a frame with and without).
+ */
 static void draw(GLuint fbo, int w, int h)
 {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -686,7 +1067,31 @@ static void prof_mark(struct felgpu *f, int pass)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * p10: the PLAIN chroma program of a mapping kind (see CHROMA), or the luma
+ * one (kind -1), built at its first use; 0: use the general program
+ */
+static GLuint plain_program(struct felgpu *f, int kind, int el, int dither)
+{
+    GLuint *slot = kind < 0 ? &f->pv_luma[el][dither] : &f->pv_chroma[kind][el][dither];
+    if (!*slot) {
+        char defs[160];
+        snprintf(defs, sizeof(defs), "#define P10\n%s%s#define PLAIN\n#define EL %d\n#define DITHER %d\n#define CHROMA %d\n",
+                 f->fastco ? "#define FASTCO\n" : "", f->weave ? "#define ELWEAVE\n" : "", el, dither,
+                 kind < 0 ? 0 : kind);
+        *slot = program(kind < 0 ? fs_luma : fs_chroma, f->taps, defs);
+        if (!*slot)
+            *slot = ~0u;
+    }
+    return *slot == ~0u ? 0 : *slot;
+}
+
 struct felgpu *felgpu_create(int w, int h, int taps)
+{
+    return felgpu_create_fmt(w, h, taps, FELGPU_BUF_RGBA8);
+}
+
+struct felgpu *felgpu_create_fmt(int w, int h, int taps, int buf_format)
 {
     struct felgpu *f = calloc(1, sizeof(*f));
     if (!f)
@@ -696,25 +1101,57 @@ struct felgpu *felgpu_create(int w, int h, int taps)
     f->w = w;
     f->h = h;
     f->taps = taps;
-    f->p_vert1 = program(fs_el_vert1, taps);
-    f->p_vert2 = program(fs_el_vert2, taps);
-    f->p_chroma = program(fs_chroma, taps);
-    f->p_luma = program(fs_luma, taps);
-    f->p_unpack_y = program(fs_el_unpack_y, taps);
-    f->p_unpack_c = program(fs_el_unpack_c, taps);
-    f->p_stats = program(fs_stats, taps);
-    f->p_reduce = program(fs_reduce, taps);
-    if (!f->p_vert1 || !f->p_vert2 || !f->p_chroma || !f->p_luma || !f->p_unpack_y ||
-        !f->p_unpack_c || !f->p_stats || !f->p_reduce) {
+    f->p10 = buf_format == FELGPU_BUF_RGB10A2;
+
+    /* EL sample phase: centered 2x (see fel_compose.c); chroma top-left sited */
+    const double ce = 0.5;
+    kernel(-ce / 2, taps, f->vwt_y, f->vbase_y);
+    kernel(-ce / 2, taps, f->hwt_y, f->hbase_y);
+    kernel(-ce / 4, taps, f->vwt_c, f->vbase_c);
+    kernel(-ce / 4, taps, f->hwt_c, f->hbase_c);
+    /* what the FASTCO coordinates take for granted */
+    const int b0 = -(taps / 2);
+    f->fastco = f->p10 && f->vbase_y[0] == b0 && f->vbase_y[1] == b0 + 1 && f->hbase_y[0] == b0 &&
+                f->hbase_y[1] == b0 + 1 && f->hbase_c[0] == b0 && f->hbase_c[1] == b0 + 1;
+
+    f->weave = f->fastco && taps == 6;
+    const char *fast = !f->fastco ? "" : f->weave ? "#define FASTCO\n#define ELWEAVE\n" : "#define FASTCO\n";
+    char defs[96] = "", vdefs[96];
+    if (f->p10)
+        snprintf(defs, sizeof(defs), "#define P10\n%s", fast);
+    snprintf(vdefs, sizeof(vdefs), "#define ELPACK\n%s", fast);
+    /* the uploaded planes: as the consumers of el_yv expect it */
+    f->p_vert1 = program(fs_el_vert1, taps, f->weave ? fast : "");
+    f->p_vert2 = program(fs_el_vert2, taps, "");
+    f->p_chroma = program(fs_chroma, taps, defs);
+    f->p_luma = program(fs_luma, taps, defs);
+    f->p_stats = program(fs_stats, taps, defs);
+    f->p_reduce = program(fs_reduce, taps, "");
+    int ok = f->p_vert1 && f->p_vert2 && f->p_chroma && f->p_luma && f->p_stats && f->p_reduce;
+    if (f->p10) {
+        /* the EL picture is read where it is: no unpacking */
+        f->p_vert1p = program(fs_el_vert1, taps, vdefs);
+        if (f->weave && !getenv("FELGPU_NOCOMPUTE")) {
+            f->p_vert1c[0] = program_compute(cs_el_vert1, taps, "");
+            f->p_vert1c[1] = program_compute(cs_el_vert1, taps, "#define ELPACK\n");
+        }
+        f->p_vert2p = program(fs_el_vert2, taps, "#define ELPACK\n");
+        ok = ok && f->p_vert1p && f->p_vert2p;
+    } else {
+        f->p_unpack_y = program(fs_el_unpack_y, taps, "");
+        f->p_unpack_c = program(fs_el_unpack_c, taps, "");
+        ok = ok && f->p_unpack_y && f->p_unpack_c;
+    }
+    if (!ok) {
         free(f);
         return NULL;
     }
     f->el_y = make_tex(GL_R16UI, w / 2, h / 2);
     f->el_cb = make_tex(GL_R16UI, w / 4, h / 4);
     f->el_cr = make_tex(GL_R16UI, w / 4, h / 4);
-    f->el_yv = make_tex(GL_R32F, w / 2, h);
+    f->el_yv = f->weave ? make_tex(GL_R32F, w / 4 + 4, 2 * h) : make_tex(GL_R32F, w / 2, h);
     f->el_cv = make_tex(GL_RG32F, w / 4, h / 2);
-    f->chroma = make_tex(GL_RG16UI, w / 2, h / 2);
+    f->chroma = make_tex(f->p10 ? GL_RGB10_A2 : GL_RG16UI, w / 2, h / 2);
     f->lut = make_tex(GL_R32F, LUT_W, LUT_ROWS);
     f->dither = make_tex(GL_R32F, BN, BN);
     {
@@ -722,6 +1159,19 @@ struct felgpu *felgpu_create(int w, int h, int taps)
         blue_noise(bn);
         glBindTexture(GL_TEXTURE_2D, f->dither);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, BN, BN, GL_RED, GL_FLOAT, bn);
+        if (f->p10) {
+            /* bn is (rank + 0.5) / BN_N; Cb at offset (17, 31), Cr at (41, 7), see fs_chroma */
+            static uint16_t rk[BN_N * 2];
+            for (int y = 0; y < BN; y++)
+                for (int x = 0; x < BN; x++) {
+                    rk[(y * BN + x) * 2] = (uint16_t)(bn[((y + 31) & (BN - 1)) * BN + ((x + 17) & (BN - 1))] * BN_N);
+                    rk[(y * BN + x) * 2 + 1] = (uint16_t)(bn[((y + 7) & (BN - 1)) * BN + ((x + 41) & (BN - 1))] * BN_N);
+                }
+            f->dither2 = make_tex(GL_RG16UI, BN, BN);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, BN, BN, GL_RG_INTEGER, GL_UNSIGNED_SHORT, rk);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        }
     }
     f->fbo_yv = make_fbo(f->el_yv);
     f->fbo_cv = make_fbo(f->el_cv);
@@ -764,12 +1214,13 @@ struct felgpu *felgpu_create(int w, int h, int taps)
         f->font[2 * g + 1] = rows2;
     }
 
-    /* EL sample phase: centered 2x (see fel_compose.c); chroma top-left sited */
-    const double ce = 0.5;
-    kernel(-ce / 2, taps, f->vwt_y, f->vbase_y);
-    kernel(-ce / 2, taps, f->hwt_y, f->hbase_y);
-    kernel(-ce / 4, taps, f->vwt_c, f->vbase_c);
-    kernel(-ce / 4, taps, f->hwt_c, f->hbase_c);
+    /* the variants a film usually plays with now, not at their first frame */
+    if (f->p10)
+        for (int el = 0; el < 2; el++) {
+            plain_program(f, -1, el, 1);
+            plain_program(f, 1, el, 1);
+            plain_program(f, 2, el, 1);
+        }
     return f;
 }
 
@@ -782,11 +1233,22 @@ void felgpu_destroy(struct felgpu *f)
     GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_chroma, f->fbo_el_y, f->fbo_el_c, f->fbo_stats,
                      f->fbo_red };
     glDeleteTextures(10, tex);
+    glDeleteTextures(1, &f->dither2);
     glDeleteFramebuffers(7, fbo);
     glDeleteProgram(f->p_unpack_y);
     glDeleteProgram(f->p_unpack_c);
     glDeleteProgram(f->p_vert1);
     glDeleteProgram(f->p_vert2);
+    glDeleteProgram(f->p_vert1p);
+    glDeleteProgram(f->p_vert2p);
+    glDeleteProgram(f->p_vert1c[0]);
+    glDeleteProgram(f->p_vert1c[1]);
+    for (int i = 0; i < 3 * 2 * 2; i++)
+        if ((&f->pv_chroma[0][0][0])[i] != ~0u)
+            glDeleteProgram((&f->pv_chroma[0][0][0])[i]);
+    for (int i = 0; i < 2 * 2; i++)
+        if ((&f->pv_luma[0][0])[i] != ~0u)
+            glDeleteProgram((&f->pv_luma[0][0])[i]);
     glDeleteProgram(f->p_chroma);
     glDeleteProgram(f->p_luma);
     glDeleteProgram(f->p_stats);
@@ -812,10 +1274,19 @@ void felgpu_set_el(struct felgpu *f, const uint16_t *y, int y_stride,
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f->w / 4, f->h / 4, GL_RED_INTEGER, GL_UNSIGNED_SHORT, cr);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    f->el_tex = 0;
 }
 
 void felgpu_set_el_tex(struct felgpu *f, GLuint el)
 {
+    if (f->p10) {
+        /* read by the vertical passes, which filter over its edges */
+        f->el_tex = el;
+        glBindTexture(GL_TEXTURE_2D, el);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        return;
+    }
     prof_mark(f, -1);
     glUseProgram(f->p_unpack_y);
     bind_tex(f->p_unpack_y, "src", 0, el);
@@ -1095,25 +1566,45 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
 
     prof_mark(f, -1);
     if (f->use_el) {
-        p = f->p_vert1;
+        const int packed = f->p10 && f->el_tex;
+        const int compute = f->weave && f->p_vert1c[packed];
+        p = compute ? f->p_vert1c[packed] : packed ? f->p_vert1p : f->p_vert1;
         glUseProgram(p);
         glUniform1fv(glGetUniformLocation(p, "wt"), 12, f->vwt_y);
         glUniform1iv(glGetUniformLocation(p, "base"), 2, f->vbase_y);
-        bind_tex(p, "src0", 0, f->el_y);
-        draw(f->fbo_yv, f->w / 2, f->h);
+        glUniform2f(glGetUniformLocation(p, "isz"), 1.0f / (f->w / 2), 1.0f / (f->h / 2));
+        bind_tex(p, "src0", 0, packed ? f->el_tex : f->el_y);
+        if (compute) {
+            /* 8 x 8 invocations a group; stores beyond the texture's width are dropped */
+            glBindImageTexture(0, f->el_yv, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+            glDispatchCompute((f->w / 4 + 4 + 7) / 8, (f->h + 7) / 8, 1);
+            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+        } else if (f->weave)
+            draw(f->fbo_yv, f->w / 4 + 4, 2 * f->h);
+        else
+            draw(f->fbo_yv, f->w / 2, f->h);
         prof_mark(f, 0);
-        p = f->p_vert2;
+        p = packed ? f->p_vert2p : f->p_vert2;
         glUseProgram(p);
         glUniform1fv(glGetUniformLocation(p, "wt"), 12, f->vwt_c);
         glUniform1iv(glGetUniformLocation(p, "base"), 2, f->vbase_c);
-        bind_tex(p, "src0", 0, f->el_cb);
-        bind_tex(p, "src1", 1, f->el_cr);
+        bind_tex(p, "src0", 0, packed ? f->el_tex : f->el_cb);
+        if (!packed)
+            bind_tex(p, "src1", 1, f->el_cr);
         draw(f->fbo_cv, f->w / 4, f->h / 2);
         prof_mark(f, 1);
     }
 
-    p = f->p_chroma;
+    /* p10: the programs without the test modes' branches */
+    const int plain = f->p10 && !f->demo && !f->pattern && f->dither_mode != 2;
+    const int kind = f->cpoly[0] && f->cpoly[1] ? 1
+                   : !f->cpoly[0] && !f->cpoly[1] && f->npiv[1] == 2 && f->npiv[2] == 2 ? 2 : 0;
+    p = plain ? plain_program(f, kind, f->use_el != 0, f->dither_mode == 1) : 0;
+    if (!p)
+        p = f->p_chroma;
     glUseProgram(p);
+    glUniform2f(glGetUniformLocation(p, "bl_isz"), 1.0f / f->w, 1.0f / f->h);
+    glUniform2f(glGetUniformLocation(p, "el_isz"), 1.0f / (f->w / 4), 1.0f / (f->h / 2));
     glUniform1fv(glGetUniformLocation(p, "piv"), 27, f->piv);
     glUniform1iv(glGetUniformLocation(p, "npiv"), 3, f->npiv);
     glUniform4fv(glGetUniformLocation(p, "mmr"), 96, &f->mmr[0][0]);
@@ -1125,9 +1616,16 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
     glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_c);
     glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_c);
     bind_tex(p, "bl", 0, bl_tex);
+    if (f->p10) {
+        /* the MMR's luma gathers reach over the left edge */
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     bind_tex(p, "elc", 1, f->el_cv);
     bind_tex(p, "lut", 2, f->lut);
     bind_tex(p, "dither", 3, f->dither);
+    if (f->p10)
+        bind_tex(p, "dither2", 4, f->dither2);
     glUniform1i(glGetUniformLocation(p, "dither_split"), dither_split(f, f->w / 2));
     glUniform1i(glGetUniformLocation(p, "pattern"), f->pattern);
     glUniform1i(glGetUniformLocation(p, "pass_h"), f->h / 2);
@@ -1137,8 +1635,14 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
     if (f->demo && !f->pattern)
         measure(f, bl_tex);
 
-    p = f->p_luma;
+    p = plain ? plain_program(f, -1, f->use_el != 0, f->dither_mode == 1) : 0;
+    if (!p)
+        p = f->p_luma;
     glUseProgram(p);
+    if (f->weave)
+        glUniform2f(glGetUniformLocation(p, "el_isz"), 1.0f / (f->w / 4 + 4), 0.5f / f->h);
+    else
+        glUniform2f(glGetUniformLocation(p, "el_isz"), 1.0f / (f->w / 2), 1.0f / f->h);
     glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
     glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
     glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);

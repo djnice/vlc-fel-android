@@ -55,6 +55,18 @@ struct felgpu;
 /* w, h: base layer size; the EL is w/2 x h/2 */
 /* taps: EL upsampling filter, 6 (Lanczos-3) or 4 (Lanczos-2) */
 struct felgpu *felgpu_create(int w, int h, int taps);
+/*
+ * How the caller imported the dma-bufs (base layer, output and the EL picture
+ * of felgpu_set_el_tex), all the same way:
+ *   FELGPU_BUF_RGBA8    DRM_FORMAT_ABGR8888, the pixel word in four bytes
+ *                       (felgpu_create)
+ *   FELGPU_BUF_RGB10A2  DRM_FORMAT_ABGR2101010, which is the word's layout:
+ *                       R = Cr, G = Cb, B = Y. Same output, fewer texture
+ *                       operations (no EL unpacking passes); needs a driver
+ *                       that imports the format as a render target too.
+ */
+enum { FELGPU_BUF_RGBA8, FELGPU_BUF_RGB10A2 };
+struct felgpu *felgpu_create_fmt(int w, int h, int taps, int buf_format);
 void felgpu_destroy(struct felgpu *f);
 
 /* EL planes, yuv420p10 (16-bit samples), strides in samples */
