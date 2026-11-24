@@ -2,17 +2,17 @@
 
 New in 0.2.23:
 
-- **The libVLC of CineFuze 1.7** (`3.0.24-101-gd9645d814c`, VLC patches 0060–0067):
+- **libVLC with VLC patches 0060–0067** (`3.0.24-101-gd9645d814c`):
   - **HDR10+ on every picture** (0060): files whose encoder sends the HDR10+ metadata only now and then (x265 `--dhdr10-opt`) played as plain HDR10 on some TVs; the last metadata is now repeated on every picture.
   - **DTS-HD MA / DTS:X in MP4** goes through the DTS packetizer, so it can be passed through as DTS-HD (0061).
   - **Blu-ray menus:** a menu highlight whose picture changes is redrawn (0062); libbluray 1.5.0 with SamuriHL's libbluray fixes for menus, BD-J and seeks (0063).
   - **Fast seeks in TS / m2ts files** land on their time with *Always fast seek* off too (0065).
-  - 0064 (`--mediacodec-flush-restart`), 0066 (`--ts-seek-index`) and 0067 (subtitles in both views of a frame packed output) are in the build for CineFuze but not used by this app.
-- **mvc3d `2026.11.24.2`** (S928X) and **libmvc3dplay `2026.11.24.2`:** the module can put the player's GUI into both eyes' views of a frame packed 3D picture when the player asks for it (`gui2` on `/dev/mvc3dhw`). CineFuze 1.7 uses this for its menus, INFO panel and subtitles. VLC FEL itself does not ask for it yet, so its controls and subtitles still show in the left eye only. The first 3D film installs the new module (root question), unless the new Dune HD plugin `mvc3d 2026.11.24.2-0.2.23` already loads it at boot.
+  - 0064 (`--mediacodec-flush-restart`), 0066 (`--ts-seek-index`) and 0067 (subtitles in both views of a frame packed output) are in the build but not used by this app (0067 switches itself on only for a player that asks the module for the GUI in both views).
+- **mvc3d `2026.11.24.2`** (S928X) and **libmvc3dplay `2026.11.24.2`:** the module can put the player's GUI into both eyes' views of a frame packed 3D picture when the player asks for it (`gui2` on `/dev/mvc3dhw`). VLC FEL itself does not ask for it yet, so its controls and subtitles still show in the left eye only. The first 3D film installs the new module (root question), unless the new Dune HD plugin `mvc3d 2026.11.24.2-0.2.23` already loads it at boot.
 
 libdvfelplay (`2026.11.17.1`), the dvfel kernel modules (S928X `2026.10.29.2`, S905X4 `2026.10.31.1`), the S905X4 mvc3d (`2026.11.06.8-sc2`) and the app patches are unchanged.
 
-**Tested** on a Dune HD Pro 8K Plus (S928X, firmware `261101_0347_r25`) with this APK: a profile 7 FEL film and a 3D MVC film played; the 3D module was loaded at boot by the new mvc3d plugin, with root access off. The libVLC changes were tested in CineFuze 1.7, which has the same libVLC. Not tested: this build on the S905X4.
+**Tested** on a Dune HD Pro 8K Plus (S928X, firmware `261101_0347_r25`) with this APK: a profile 7 FEL film and a 3D MVC film played; the 3D module was loaded at boot by the new mvc3d plugin, with root access off. The libVLC changes were tested beforehand with the same libVLC in a test player. Not tested: this build on the S905X4.
 
 ### Install / update
 Install `VLC-FEL-0.2.23-poc-armeabi-v7a.apk` over an older version, or as a new install. `README.txt` (Hungarian / English) has the details, notes and uninstall steps.
