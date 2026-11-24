@@ -1,0 +1,93 @@
+From 14ffa5701e30120181a6ff75febfde4cc09e261d Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 23 Nov 2026 11:24:20 +0000
+Subject: [PATCH 62/67] android: display: redraw a subpicture whose region
+ pictures changed
+
+A BD-J menu (libbluray's ARGB overlay through the Blu-ray module) moved
+its highlight on the remote's keys - libbluray drew the button anew and
+the module updated its subpicture - but the screen kept the first
+picture: SubpicturePrepare drew the subtitle surface again only when the
+subpicture's order or its regions' bounds changed, and an overlay drawn
+anew in place keeps both (its region pictures, freed and allocated again,
+even come back at the same address).
+
+A sparse checksum of the region pictures (every 16th line, every 16th
+pixel: a few thousand reads for a full HD overlay) and their places is
+now compared too: an overlay drawn anew is drawn again, a subtitle that
+stays keeps its pixels and is still not redrawn on every video picture.
+
+Message-Id: <20261123-android-display-spu-region-pictures@djnice>
+---
+ modules/video_output/android/display.c | 36 +++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/modules/video_output/android/display.c b/modules/video_output/android/display.c
+index 013cbbefbe..a19acedd31 100644
+--- a/modules/video_output/android/display.c
++++ b/modules/video_output/android/display.c
+@@ -135,6 +135,7 @@ struct vout_display_sys_t
+     buffer_bounds *p_sub_buffer_bounds;
+     int64_t i_sub_last_order;
+     ARect sub_last_region;
++    uint32_t sub_last_pictures; /* the region pictures last drawn: a sparse checksum */
+ 
+     bool b_has_subpictures;
+ 
+@@ -1029,6 +1030,33 @@ static void SubtitleGetDirtyBounds(vout_display_t *vd,
+         SubtitleRegionToBounds(subpicture, &sys->p_sub_buffer_bounds[i].bounds);
+ }
+ 
++/* A sparse checksum of the subpicture's region pictures: every 16th line, every
++ * 16th pixel (a few thousand reads for a full HD overlay), and their places */
++static uint32_t SubpictureSample(subpicture_t *subpicture)
++{
++    uint32_t h = 2166136261u;
++    for (subpicture_region_t *r = subpicture->p_region; r != NULL; r = r->p_next)
++    {
++        h = (h ^ (uint32_t) (r->i_x * 65599 + r->i_y)) * 16777619u;
++        const picture_t *pic = r->p_picture;
++        if (pic == NULL || pic->i_planes < 1)
++            continue;
++        const plane_t *p = &pic->p[0];
++        const int step = 16 * (p->i_pixel_pitch > 0 ? p->i_pixel_pitch : 4);
++        for (int y = 0; y < p->i_visible_lines; y += 16)
++        {
++            const uint8_t *line = p->p_pixels + (size_t) y * p->i_pitch;
++            for (int x = 0; x + 4 <= p->i_visible_pitch; x += step)
++            {
++                uint32_t v;
++                memcpy(&v, line + x, 4);
++                h = (h ^ v) * 16777619u;
++            }
++        }
++    }
++    return h;
++}
++
+ static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
+ {
+     vout_display_sys_t *sys = vd->sys;
+@@ -1038,12 +1066,18 @@ static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
+ 
+     if( subpicture )
+     {
++        /* the region pictures too: a BD-J menu (libbluray's ARGB overlay)
++         * draws its highlight anew in the same place - the same order and
++         * bounds; a subtitle that stays keeps its pixels */
++        const uint32_t pictures = SubpictureSample(subpicture);
+         if( subpicture->i_order == sys->i_sub_last_order
+-         && memcmp( &memset_bounds, &sys->sub_last_region, sizeof(ARect) ) == 0 )
++         && memcmp( &memset_bounds, &sys->sub_last_region, sizeof(ARect) ) == 0
++         && pictures == sys->sub_last_pictures )
+             return;
+ 
+         sys->i_sub_last_order = subpicture->i_order;
+         sys->sub_last_region = memset_bounds;
++        sys->sub_last_pictures = pictures;
+     }
+ 
+     if (AndroidWindow_LockPicture(sys, sys->p_sub_window, sys->p_sub_pic) != 0)
+-- 
+2.47.3
+

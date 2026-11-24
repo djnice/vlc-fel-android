@@ -1,0 +1,244 @@
+From d9645d814c6ab24bd97d63a15817c53b0726e558 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 23 Nov 2026 16:48:40 +0000
+Subject: [PATCH 67/67] android: the subtitles in both views of a frame packed
+ 3D output
+
+With the mvc3d kernel module's frame packed output (HDMI 1.4 3D) the
+GUI can cover both views: the OSD then spans the whole frame packed
+picture (left view, 45 lines of active space, right view) and the
+player draws its GUI twice, squeezed, into each view's rows. The
+module says so on /dev/mvc3dhw ("on=1", "gui=1"; read at most every
+250 ms). While so the subtitles surface gets the subtitles twice
+too: blended into a picture of their own, then each output row the
+mean of the rows it covers - the upper 1080/2205 of the surface for
+the left view, from 1125/2205 down for the right one. Without the
+module, or in 2D, nothing changes.
+
+Message-Id: <20261123-sub-stereo@djnice>
+---
+ modules/video_output/android/display.c | 157 ++++++++++++++++++++++++-
+ 1 file changed, 156 insertions(+), 1 deletion(-)
+
+diff --git a/modules/video_output/android/display.c b/modules/video_output/android/display.c
+index a19acedd31..21162ac640 100644
+--- a/modules/video_output/android/display.c
++++ b/modules/video_output/android/display.c
+@@ -38,6 +38,8 @@
+ #include <GLES2/gl2.h>  /* for ClearSurface */
+ 
+ #include <dlfcn.h>
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #include "display.h"
+ #include "utils.h"
+@@ -137,6 +139,13 @@ struct vout_display_sys_t
+     ARect sub_last_region;
+     uint32_t sub_last_pictures; /* the region pictures last drawn: a sparse checksum */
+ 
++    /* the GUI in both views of a frame packed 3D output (the mvc3d module):
++     * the subtitles twice, squeezed, once in each view's rows (SubStereo) */
++    bool b_sub_stereo;
++    bool b_sub_last_stereo;
++    vlc_tick_t sub_stereo_checked;
++    picture_t *p_sub_stereo;
++
+     bool b_has_subpictures;
+ 
+     uint8_t hash[16];
+@@ -838,6 +847,8 @@ static void Close(vlc_object_t *p_this)
+ 
+     if (sys->p_sub_pic)
+         picture_Release(sys->p_sub_pic);
++    if (sys->p_sub_stereo)
++        picture_Release(sys->p_sub_stereo);
+     if (sys->p_spu_blend)
+         filter_DeleteBlend(sys->p_spu_blend);
+     free(sys->p_sub_buffer_bounds);
+@@ -1057,10 +1068,141 @@ static uint32_t SubpictureSample(subpicture_t *subpicture)
+     return h;
+ }
+ 
++/* The GUI in both views of a frame packed 3D output: the mvc3d module's
++ * status (/dev/mvc3dhw: "on=1" frame packed, "gui=1" the OSD over the whole
++ * frame packed picture - the screen's upper 1080/2205 is the left view, its
++ * lower 1080/2205 the right one). Read at most every 250 ms. */
++static bool SubStereo(vout_display_sys_t *sys)
++{
++    const vlc_tick_t now = mdate();
++    if (sys->sub_stereo_checked != 0 && now - sys->sub_stereo_checked < INT64_C(250000))
++        return sys->b_sub_stereo;
++    sys->sub_stereo_checked = now;
++    bool on = false;
++    int fd = open("/dev/mvc3dhw", O_RDONLY | O_CLOEXEC);
++    if (fd >= 0)
++    {
++        char b[96];
++        ssize_t n = read(fd, b, sizeof(b) - 1);
++        close(fd);
++        if (n > 0)
++        {
++            b[n] = 0;
++            on = strstr(b, "on=1") != NULL && strstr(b, "gui=1") != NULL;
++        }
++    }
++    sys->b_sub_stereo = on;
++    return on;
++}
++
++/* rows [y0, y0 + h) of s squeezed into the rows [to, to + n) of d, the bytes
++ * [x0, x1) of each: an output row is the mean of the rows it covers; only the
++ * output rows of the source rows [top, bottom) (the others are clear) */
++static void SubSqueeze(const plane_t *s, plane_t *d, int y0, int h, int to, int n,
++                       int x0, int x1, int top, int bottom)
++{
++    if (n <= 0 || h <= 0 || x1 <= x0)
++        return;
++    int i0 = (int)((int64_t)(top - y0) * n / h) - 1;
++    int i1 = (int)(((int64_t)(bottom - y0) * n + h - 1) / h) + 1;
++    if (i0 < 0)
++        i0 = 0;
++    if (i1 > n)
++        i1 = n;
++    for (int i = i0; i < i1; i++)
++    {
++        int a = y0 + (int)((int64_t)i * h / n);
++        int b = y0 + (int)((int64_t)(i + 1) * h / n);
++        if (b <= a)
++            b = a + 1;
++        if (b > y0 + h)
++            b = y0 + h;
++        uint8_t *dl = d->p_pixels + (size_t)(to + i) * d->i_pitch;
++        const uint8_t *sl = s->p_pixels + (size_t)a * s->i_pitch;
++        const int cnt = b - a;
++        if (cnt <= 1)
++        {
++            memcpy(dl + x0, sl + x0, x1 - x0);
++            continue;
++        }
++        for (int x = x0; x < x1; x++)
++        {
++            unsigned sum = 0;
++            for (int k = 0; k < cnt; k++)
++                sum += sl[(size_t)k * s->i_pitch + x];
++            dl[x] = (uint8_t)((sum + cnt / 2) / cnt);
++        }
++    }
++}
++
++/* The subtitles twice, squeezed: blended into a picture of their own, then
++ * into the rows of each view. The locked buffer is cleared all, and so is
++ * it after (its bounds: all of it) */
++static void SubStereoDraw(vout_display_t *vd, subpicture_t *subpicture)
++{
++    vout_display_sys_t *sys = vd->sys;
++    picture_t *dst = sys->p_sub_pic;
++    plane_t *dp = &dst->p[0];
++
++    if (sys->p_sub_buffer_bounds)
++        for (int i = 0; sys->p_sub_buffer_bounds[i].p_pixels != NULL; ++i)
++            if (sys->p_sub_buffer_bounds[i].p_pixels == dp->p_pixels)
++            {
++                sys->p_sub_buffer_bounds[i].bounds.left = 0;
++                sys->p_sub_buffer_bounds[i].bounds.top = 0;
++                sys->p_sub_buffer_bounds[i].bounds.right = dst->format.i_width;
++                sys->p_sub_buffer_bounds[i].bounds.bottom = dst->format.i_height;
++            }
++    for (int y = 0; y < dp->i_lines; y++)
++        memset(dp->p_pixels + (size_t)y * dp->i_pitch, 0, dp->i_pitch);
++    if (!subpicture)
++        return;
++
++    if (!sys->p_sub_stereo)
++    {
++        sys->p_sub_stereo = picture_NewFromFormat(&dst->format);
++        if (!sys->p_sub_stereo)
++            return;
++        for (int y = 0; y < sys->p_sub_stereo->p[0].i_lines; y++)
++            memset(sys->p_sub_stereo->p[0].p_pixels
++                   + (size_t)y * sys->p_sub_stereo->p[0].i_pitch, 0,
++                   sys->p_sub_stereo->p[0].i_pitch);
++    }
++    picture_t *src = sys->p_sub_stereo;
++    plane_t *sp = &src->p[0];
++
++    ARect r;
++    SubtitleRegionToBounds(subpicture, &r);
++    const int y0 = dst->format.i_y_offset;
++    const int h = dst->format.i_visible_height;
++    const int px = dp->i_pixel_pitch;
++    if (r.left < 0) r.left = 0;
++    if (r.top < y0) r.top = y0;
++    if (r.right > (int)dst->format.i_width) r.right = dst->format.i_width;
++    if (r.bottom > y0 + h) r.bottom = y0 + h;
++    if (r.bottom > sp->i_lines) r.bottom = sp->i_lines;
++    if (r.right <= r.left || r.bottom <= r.top)
++        return;
++
++    /* its place cleared (the last subtitle's pixels elsewhere are not read) */
++    for (int y = r.top; y < r.bottom; y++)
++        memset(sp->p_pixels + (size_t)y * sp->i_pitch + r.left * px, 0,
++               (r.right - r.left) * px);
++    picture_BlendSubpicture(src, sys->p_spu_blend, subpicture);
++
++    /* the left view: the upper 1080/2205 of the screen; the right one: from
++     * 1125/2205 down (45 lines of active space between) */
++    const int lh = (h * 1080 + 1102) / 2205;
++    const int r0 = (h * 1125 + 1102) / 2205;
++    SubSqueeze(sp, dp, y0, h, y0, lh, r.left * px, r.right * px, r.top, r.bottom);
++    SubSqueeze(sp, dp, y0, h, y0 + r0, h - r0, r.left * px, r.right * px, r.top, r.bottom);
++}
++
+ static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
+ {
+     vout_display_sys_t *sys = vd->sys;
+     ARect memset_bounds;
++    const bool stereo = SubStereo(sys);
+ 
+     SubtitleRegionToBounds(subpicture, &memset_bounds);
+ 
+@@ -1072,19 +1214,28 @@ static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
+         const uint32_t pictures = SubpictureSample(subpicture);
+         if( subpicture->i_order == sys->i_sub_last_order
+          && memcmp( &memset_bounds, &sys->sub_last_region, sizeof(ARect) ) == 0
+-         && pictures == sys->sub_last_pictures )
++         && pictures == sys->sub_last_pictures
++         && stereo == sys->b_sub_last_stereo )
+             return;
+ 
+         sys->i_sub_last_order = subpicture->i_order;
+         sys->sub_last_region = memset_bounds;
+         sys->sub_last_pictures = pictures;
+     }
++    if (stereo != sys->b_sub_last_stereo)
++        msg_Dbg(vd, "subtitles in %s", stereo ? "both views (frame packed GUI)" : "one picture");
++    sys->b_sub_last_stereo = stereo;
+ 
+     if (AndroidWindow_LockPicture(sys, sys->p_sub_window, sys->p_sub_pic) != 0)
+         return;
+ 
+     /* Clear the subtitles surface. */
+     SubtitleGetDirtyBounds(vd, subpicture, &memset_bounds);
++    if (stereo)
++    {
++        SubStereoDraw(vd, subpicture);
++        return;
++    }
+     const int x_pixels_offset = memset_bounds.left
+                                 * sys->p_sub_pic->p[0].i_pixel_pitch;
+     const int i_line_size = (memset_bounds.right - memset_bounds.left)
+@@ -1149,6 +1300,10 @@ static void Prepare(vout_display_t *vd, picture_t *picture,
+             }
+             free(sys->p_sub_buffer_bounds);
+             sys->p_sub_buffer_bounds = NULL;
++            if (sys->p_sub_stereo) {
++                picture_Release(sys->p_sub_stereo);
++                sys->p_sub_stereo = NULL;
++            }
+         }
+ 
+         if (!sys->p_sub_pic
+-- 
+2.47.3
+

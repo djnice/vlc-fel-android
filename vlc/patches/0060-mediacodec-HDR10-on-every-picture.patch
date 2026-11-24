@@ -1,0 +1,272 @@
+From 66289e079b7b93b8ce26b7f142c2d30c81e35d11 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 17 Nov 2026 14:07:48 +0000
+Subject: [PATCH 60/67] mediacodec: HDR10+ on every picture
+
+x265's --dhdr10-opt writes the HDR10+ (ST 2094-40) SEI only at key frames
+and where the metadata changes: a UHD BD encode had it on 18 of 1540
+pictures. The MediaTek decoder of a Philips TV (2021/22, MT5895, Android 11)
+showed such a film as HDR10 - its own (tunneled) player as well - and a
+film with the SEI on every picture as HDR10+. With the last SEI repeated on
+every access unit without one, the same stream played as HDR10+ (measured
+on the TV: g_video__hdr_detect 1 -> 4, the TV's "HDR10+" note).
+
+For the HEVC decoder (not the Dolby Vision one): the last HDR10+ message is
+kept as a prefix SEI NAL unit of its own and put in front of the first
+slice of every access unit that has none (in decode order); a flush forgets
+it, the key frame decoding starts at has its own. Streams with HDR10+ on
+every picture, and streams without it, are left as they are. Option
+mediacodec-hdr10plus-repeat (default on).
+
+Message-Id: <20261117-dvfel-mediacodec-hdr10plus-repeat@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 177 +++++++++++++++++++++++++++++++
+ 1 file changed, 177 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index c9176ce5c4..1cfb98bacb 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -669,6 +669,13 @@ struct decoder_sys_t
+              * HDR10+ SEI messages taken out for the Dolby Vision decoder */
+             bool b_strip_hdr10plus;
+             unsigned i_hdr10plus_stripped;
++            /* an HEVC stream with HDR10+ only on some pictures (x265
++             * --dhdr10-opt): the last HDR10+ SEI NAL unit (with its start
++             * code), repeated on the pictures without one (Hdr10PlusRepeat) */
++            bool b_hdr10plus_repeat;
++            uint8_t *p_hdr10plus_sei;
++            size_t i_hdr10plus_sei;
++            unsigned i_hdr10plus_repeated;
+             int i_dovi_mc_profile; /* its profile constant for the stream */
+             /* the player's information panel: the live level 1 (DoviInfo) */
+             char *psz_dvinfo; /* <app files>/ */
+@@ -714,6 +721,7 @@ static void DoviProbe(decoder_t *, const block_t *);
+ static void Hdr10PlusProbe(decoder_t *);
+ static int DoviFilter(decoder_t *, block_t **);
+ static void DoviStripHdr10Plus(decoder_t *, block_t *);
++static void Hdr10PlusRepeat(decoder_t *, block_t **);
+ static void DoviInfo(decoder_t *, const block_t *);
+ static void DoviInfoShown(decoder_t *, unsigned, int64_t);
+ static char *DoviInfoDir(void);
+@@ -774,6 +782,12 @@ static void RemoveInflightPictures(decoder_t *);
+     "A stream with both Dolby Vision (its own RPU) and HDR10+ goes to the " \
+     "Dolby Vision decoder without its HDR10+ metadata: a display that takes " \
+     "HDR10+ before Dolby Vision (some MediaTek TVs) shows it as Dolby Vision."
++#define MEDIACODEC_HDR10PLUS_REPEAT_TEXT "HDR10+ metadata on every picture"
++#define MEDIACODEC_HDR10PLUS_REPEAT_LONGTEXT \
++    "An HEVC stream with HDR10+ metadata only on some pictures (x265 " \
++    "--dhdr10-opt: at key frames and where it changes) gets the last one " \
++    "repeated on the pictures without it: a decoder that wants it on every " \
++    "picture (MediaTek TVs) shows the film as HDR10+ instead of HDR10."
+ #define MEDIACODEC_FPS_TEXT "Video frame rate"
+ #define MEDIACODEC_FPS_LONGTEXT \
+     "The frame rate the video decoder is told (0: the stream's). An Amlogic " \
+@@ -828,6 +842,8 @@ vlc_module_begin ()
+              MEDIACODEC_DOVI_HDR10PLUS_TEXT, MEDIACODEC_DOVI_HDR10PLUS_LONGTEXT, true)
+     add_bool(CFG_PREFIX "dovi-no-hdr10plus", false,
+              MEDIACODEC_DOVI_NO_HDR10PLUS_TEXT, MEDIACODEC_DOVI_NO_HDR10PLUS_LONGTEXT, true)
++    add_bool(CFG_PREFIX "hdr10plus-repeat", true,
++             MEDIACODEC_HDR10PLUS_REPEAT_TEXT, MEDIACODEC_HDR10PLUS_REPEAT_LONGTEXT, true)
+     add_integer(CFG_PREFIX "mvc", MVC_MODE_AUTO,
+                 MEDIACODEC_MVC_TEXT, MEDIACODEC_MVC_LONGTEXT, true)
+         change_integer_list(pi_mvc_values, ppsz_mvc_names)
+@@ -1378,6 +1394,8 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+         p_sys->video.b_dovi_probe = p_dec->fmt_in.i_codec == VLC_CODEC_HEVC
+             && var_InheritBool(p_dec, CFG_PREFIX "dovi")
+             && var_InheritBool(p_dec, CFG_PREFIX "dr");
++        p_sys->video.b_hdr10plus_repeat = p_dec->fmt_in.i_codec == VLC_CODEC_HEVC
++            && var_InheritBool(p_dec, CFG_PREFIX "hdr10plus-repeat");
+         /* 3D MVC: only with direct rendering (the picture is replaced on its
+          * way to the display) */
+         p_sys->video.i_mvc_probe = p_dec->fmt_in.i_codec == VLC_CODEC_H264
+@@ -1557,6 +1575,7 @@ static void CleanDecoder(decoder_t *p_dec)
+         if (p_sys->video.psz_dvinfo)
+             vlc_mutex_destroy(&p_sys->video.dvinfo_lock);
+         free(p_sys->video.psz_dvinfo);
++        free(p_sys->video.p_hdr10plus_sei);
+         if (p_sys->video.p_mvc)
+             mvc_api.close(p_sys->video.p_mvc);
+ 
+@@ -2532,6 +2551,9 @@ static int VideoHXXX_OnNewBlock(decoder_t *p_dec, block_t **pp_block)
+     /* HDR10+: the levels of the RPU generated for the picture */
+     if (p_sys->video.b_hdr10plus && p_sys->video.psz_dvinfo && *pp_block)
+         DoviInfo(p_dec, *pp_block);
++    /* HEVC (not to the Dolby Vision decoder): HDR10+ on every picture */
++    if (p_sys->video.b_hdr10plus_repeat && !p_sys->video.b_dovi && *pp_block)
++        Hdr10PlusRepeat(p_dec, pp_block);
+ 
+     return Video_OnNewBlock(p_dec, pp_block);
+ }
+@@ -2877,6 +2899,156 @@ static void DoviStripHdr10Plus(decoder_t *p_dec, block_t *p_block)
+     free(sei);
+ }
+ 
++/*
++ * The HDR10+ message of a prefix SEI NAL unit's payload ([p, p + n), escaped,
++ * after its 2-byte header) as a prefix SEI NAL unit of its own: start code,
++ * header, the message, rbsp_trailing_bits, escaped. Allocated into *pp_unit,
++ * its size returned; 0: no HDR10+ message in it (or not parsed).
++ */
++static size_t SeiHdr10PlusUnit(const uint8_t *p, size_t n, uint8_t **pp_unit)
++{
++    uint8_t *rbsp = malloc(n ? n : 1);
++    if (!rbsp)
++        return 0;
++    size_t r = 0;
++    unsigned zeros = 0;
++    for (size_t i = 0; i < n; i++)
++    {
++        if (zeros >= 2 && p[i] == 0x03)
++        {
++            zeros = 0;
++            continue;
++        }
++        zeros = p[i] == 0 ? zeros + 1 : 0;
++        rbsp[r++] = p[i];
++    }
++    size_t i = 0, i_unit = 0;
++    while (i < r && !(rbsp[i] == 0x80 && i + 1 == r)) /* rbsp_trailing_bits */
++    {
++        unsigned i_type = 0, i_size = 0;
++        while (i < r && rbsp[i] == 0xFF) i_type += rbsp[i++];
++        if (i >= r) break;
++        i_type += rbsp[i++];
++        while (i < r && rbsp[i] == 0xFF) i_size += rbsp[i++];
++        if (i >= r) break;
++        i_size += rbsp[i++];
++        if (i_size > r - i) break;
++        if (!SeiIsHdr10Plus(i_type, &rbsp[i], i_size))
++        {
++            i += i_size;
++            continue;
++        }
++        /* the message alone: type 4, its size, the payload, trailing bits */
++        const size_t i_msg = 1 + i_size / 255 + 1 + i_size + 1;
++        uint8_t *msg = malloc(i_msg);
++        uint8_t *unit = malloc(6 + 2 * i_msg);
++        if (!msg || !unit)
++        {
++            free(msg);
++            free(unit);
++            break;
++        }
++        size_t m = 0;
++        msg[m++] = 4;
++        unsigned s = i_size;
++        for (; s >= 255; s -= 255)
++            msg[m++] = 0xFF;
++        msg[m++] = s;
++        memcpy(&msg[m], &rbsp[i], i_size);
++        m += i_size;
++        msg[m++] = 0x80;
++        static const uint8_t head[6] = { 0, 0, 0, 1, 39 << 1, 1 };
++        memcpy(unit, head, sizeof(head));
++        size_t o = sizeof(head);
++        zeros = 0;
++        for (size_t j = 0; j < m; j++)
++        {
++            if (zeros >= 2 && msg[j] <= 0x03)
++            {
++                unit[o++] = 0x03;
++                zeros = 0;
++            }
++            unit[o++] = msg[j];
++            zeros = msg[j] == 0 ? zeros + 1 : 0;
++        }
++        free(msg);
++        *pp_unit = unit;
++        i_unit = o;
++        break;
++    }
++    free(rbsp);
++    return i_unit;
++}
++
++/*
++ * An HEVC access unit (Annex-B) for the HEVC decoder: HDR10+ on every picture
++ * (option mediacodec-hdr10plus-repeat). x265's --dhdr10-opt writes the HDR10+
++ * SEI only at key frames and where the metadata changes (a UHD BD encode: 18
++ * of 1540 pictures); the MediaTek decoder of a Philips TV (MT5895) showed such
++ * a film as HDR10, as the TV's own player did. The last HDR10+ SEI is kept and
++ * put in front of the first slice of every access unit without one - what
++ * the encoder left out as "the same as before". Kept from the stream's own
++ * order of access units (decode order); forgotten at a flush.
++ */
++static void Hdr10PlusRepeat(decoder_t *p_dec, block_t **pp_block)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    block_t *p_block = *pp_block;
++    const uint8_t *p = p_block->p_buffer;
++    const size_t n = p_block->i_buffer;
++    size_t i_vcl = n; /* the first slice's start code */
++    bool b_own = false;
++
++    /* the units before the first slice (only those: the slices' data are
++     * not looked at) */
++    for (size_t s = AnnexBNext(p, 0, n); s + 3 < n; )
++    {
++        const size_t i_nal = s + 3;
++        const unsigned i_type = (p[i_nal] >> 1) & 0x3F;
++        if (i_type < 32) /* VCL */
++        {
++            i_vcl = s;
++            break;
++        }
++        const size_t i_next = AnnexBNext(p, i_nal, n);
++        if (i_type == 39) /* prefix SEI */
++        {
++            size_t i_end = i_next;
++            while (i_end > i_nal && p[i_end - 1] == 0)
++                i_end--;
++            uint8_t *p_unit;
++            const size_t i_unit = i_end - i_nal > 2
++                ? SeiHdr10PlusUnit(&p[i_nal + 2], i_end - i_nal - 2, &p_unit) : 0;
++            if (i_unit > 0)
++            {
++                free(p_sys->video.p_hdr10plus_sei);
++                p_sys->video.p_hdr10plus_sei = p_unit;
++                p_sys->video.i_hdr10plus_sei = i_unit;
++                b_own = true;
++            }
++        }
++        s = i_next;
++    }
++    if (b_own || i_vcl == n || !p_sys->video.p_hdr10plus_sei)
++        return;
++
++    /* in front of the slice's 4-byte start code (00 00 00 01) as a whole */
++    if (i_vcl > 0 && p[i_vcl - 1] == 0)
++        i_vcl--;
++    const size_t i_sei = p_sys->video.i_hdr10plus_sei;
++    block_t *p_new = block_Alloc(n + i_sei);
++    if (!p_new)
++        return;
++    memcpy(p_new->p_buffer, p, i_vcl);
++    memcpy(&p_new->p_buffer[i_vcl], p_sys->video.p_hdr10plus_sei, i_sei);
++    memcpy(&p_new->p_buffer[i_vcl + i_sei], &p[i_vcl], n - i_vcl);
++    block_CopyProperties(p_new, p_block);
++    block_Release(p_block);
++    *pp_block = p_new;
++    if (p_sys->video.i_hdr10plus_repeated++ == 0)
++        msg_Info(p_dec, "HDR10+ not on every picture: the last HDR10+ metadata repeated");
++}
++
+ /*
+  * First access units of an H.264 stream: 3D MVC (subset SPS or slice
+  * extension NAL units)? libmvc3dplay then gets every buffer queued from now
+@@ -3408,6 +3580,11 @@ static void Video_OnFlush(decoder_t *p_dec)
+     decoder_sys_t *p_sys = p_dec->p_sys;
+ 
+     timestamp_FifoEmpty(p_sys->video.timestamp_fifo);
++    /* a seek: the HDR10+ metadata of before it is not repeated (the key frame
++     * decoding starts at has its own) */
++    free(p_sys->video.p_hdr10plus_sei);
++    p_sys->video.p_hdr10plus_sei = NULL;
++    p_sys->video.i_hdr10plus_sei = 0;
+     /* Invalidate all pictures that are currently in flight
+      * since flushing make all previous indices returned by
+      * MediaCodec invalid. */
+-- 
+2.47.3
+

@@ -1,0 +1,43 @@
+From a825f11dfa8b9067aa2e2bc898f1256b885f7091 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Fri, 20 Nov 2026 12:02:43 +0000
+Subject: [PATCH 61/67] mp4: DTS through the packetizer
+
+A DTS-HD MA + DTS:X track of an MP4 (mp4a, esds object type 0xa9) was
+passed through as DTS: the INFO panel said "bitstream dts", the receiver
+got the core. The mp4 demuxer gives its esds tracks as packetized, so no
+DTS packetizer looked at the frames, the profile stayed PROFILE_DTS and
+the decoder told the audio output "dtshd" = false. The object type does
+not tell either: this one (and other muxers') mark DTS-HD MA as 0xa9.
+
+The esds DTS tracks now go through the packetizer, as the Matroska ones
+do: it finds the extension substream after the core and sets
+PROFILE_DTS_HD, the audio output takes the DTS-HD (HBR) path. The dtse /
+dtsh / dtsl sample entries keep their own profile.
+
+Message-Id: <20261120-dvfel-mp4-dts-packetizer@djnice>
+---
+ modules/demux/mp4/essetup.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/modules/demux/mp4/essetup.c b/modules/demux/mp4/essetup.c
+index cd176f372f..2fc56ce2a9 100644
+--- a/modules/demux/mp4/essetup.c
++++ b/modules/demux/mp4/essetup.c
+@@ -88,6 +88,13 @@ static void SetupESDS( demux_t *p_demux, mp4_track_t *p_track, const MP4_descrip
+         return;
+     }
+ 
++    /* DTS: its frames through the packetizer, which tells DTS-HD (MA, DTS:X)
++     * from a core by the frames themselves (an extension substream after the
++     * core) and sets the profile the audio output passes DTS-HD by. The object
++     * type does not tell it: DTS-HD MA tracks are muxed as 0xa9 (DTS) too */
++    if( p_track->fmt.i_cat == AUDIO_ES && p_track->fmt.i_codec == VLC_CODEC_DTS )
++        p_track->fmt.b_packetized = false;
++
+     p_track->fmt.i_original_fourcc = 0; /* so we don't have MP4A as original fourcc */
+     p_track->fmt.i_bitrate = p_decconfig->i_avg_bitrate;
+ 
+-- 
+2.47.3
+

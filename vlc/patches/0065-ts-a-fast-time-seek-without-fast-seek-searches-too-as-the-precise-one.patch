@@ -1,0 +1,38 @@
+From df815d3c2395af3a92bda5ebb112736695a1b374 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 23 Nov 2026 14:43:51 +0000
+Subject: [PATCH 65/67] ts: a fast time seek without fast seek searches too (as
+ the precise one)
+
+A fast time seek on a stream that cannot seek fast (http, smb2: a
+Blu-ray's m2ts over the network, our loopback server's 3D film) failed
+at once - nothing happened. It now finds its place by the same binary
+search as the precise one, only without the 3 s preroll: a
+Blu-ray chapter starts on a key frame, landing at its time shows it
+directly. The precise seek's preroll of 3D MVC took seconds.
+
+Message-Id: <20261123-ts-fast-seek-without-fastseek@djnice>
+---
+ modules/demux/mpeg/ts.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 234df1894e..3c0e802c5a 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -2479,7 +2479,11 @@ static int SeekToTime( demux_t *p_demux, const ts_pmt_t *p_pmt, vlc_tick_t i_see
+     /* (a precise seek also without fast seek - smb2, http: an m2ts of a
+      * Blu-ray over the network, a frame back while paused - its binary search
+      * is some 30 reads; by byte position it showed the key frame before) */
+-    if( (!p_sys->b_canfastseek && !b_precise) || i_stream_size < p_sys->i_packet_size )
++    /* (a fast one too: it found its place as the precise one, landing on
++     * the time's own packets without the 3 s preroll - a Blu-ray chapter's
++     * start, a key frame, over our loopback http: the precise seek's preroll
++     * of 3D MVC took seconds; it failed before, nothing happened) */
++    if( i_stream_size < p_sys->i_packet_size )
+         return VLC_EGENERIC;
+ 
+     const uint64_t i_initial_pos = vlc_stream_Tell( p_sys->stream );
+-- 
+2.47.3
+

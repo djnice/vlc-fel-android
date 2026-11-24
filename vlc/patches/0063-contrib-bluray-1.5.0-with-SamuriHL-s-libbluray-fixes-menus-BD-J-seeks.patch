@@ -1,0 +1,2091 @@
+From 04af33abed5e7368050b9374d74e82c8aef546b1 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 23 Nov 2026 11:44:14 +0000
+Subject: [PATCH 63/67] contrib: bluray: 1.5.0 with SamuriHL's libbluray fixes
+ (menus, BD-J, seeks)
+
+libbluray 1.5.0 (from 1.4.1) with the fixes SamuriHL keeps for CoreELEC's Kodi
+(github.com/SamuriHL/CoreELEC, packages/multimedia/libbluray/patches):
+HDMV menus (the BC compare, button programs ending at a link command,
+always-on pages, cleared planes flushed at a page change, composition
+crops), BD-J (screen configuration matching, xlets stopped in order,
+present xlets left unloaded until started, selectLanguage, the JVM run
+with -Xrs so it leaves the signals to the player - here Android's ART in
+the same process), seeks (limited to the title, the starting packet kept,
+the end of a playlist raised again), the playitem connection condition
+and the clip infos exposed, 3D subtitle depth info, 2160p video size.
+
+Left out: the Kodi tmpdir (1.5.0 already runs AWT not headless), the
+BD-J background plane (a third overlay plane the player must draw) and
+the presentation timing (opt-in, driven by the player); 40 and 44 taken
+without the context of those. download.videolan.org publishes no
+checksum for 1.5.0: SHA512SUMS has the one of the tarball used.
+
+Message-Id: <20261123-contrib-bluray-samurihl@djnice>
+---
+ contrib/src/bluray/SHA512SUMS               |    2 +-
+ contrib/src/bluray/libbluray-samurihl.patch | 2024 +++++++++++++++++++
+ contrib/src/bluray/rules.mak                |    3 +-
+ 3 files changed, 2027 insertions(+), 2 deletions(-)
+ create mode 100755 contrib/src/bluray/libbluray-samurihl.patch
+
+diff --git a/contrib/src/bluray/SHA512SUMS b/contrib/src/bluray/SHA512SUMS
+index 3b98944b5a..e29a74b5f1 100644
+--- a/contrib/src/bluray/SHA512SUMS
++++ b/contrib/src/bluray/SHA512SUMS
+@@ -1 +1 @@
+-76d686260b7cceb9e9e0272e4b9c4a815511925240dc4b69107c0816131728912f5cf3d08d5eab769024e024377f6591d1bbd51a459039a521639d569473cec6  libbluray-1.4.1.tar.xz
++f35d89097ad0c263ffa2102aba0068e7fe9b85afe27b14cf3c34ed6eff5876d1528aa8a62c3941b767353be2e1de4ae765f1402bd44af4544d922ffb69cea354  libbluray-1.5.0.tar.xz
+diff --git a/contrib/src/bluray/libbluray-samurihl.patch b/contrib/src/bluray/libbluray-samurihl.patch
+new file mode 100755
+index 0000000000..682f3bee06
+--- /dev/null
++++ b/contrib/src/bluray/libbluray-samurihl.patch
+@@ -0,0 +1,2024 @@
++diff --git a/src/libbluray/bdj/bdj.c b/src/libbluray/bdj/bdj.c
++index 359bc8f..c91dbe0 100644
++--- a/src/libbluray/bdj/bdj.c
+++++ b/src/libbluray/bdj/bdj.c
++@@ -535,52 +535,24 @@ void bdj_config_cleanup(BDJ_CONFIG *p)
++     X_FREE(p->classpath[1]);
++ }
++ 
++-static char *_find_libbluray_jar0()
+++/* jar installed together with this libbluray: next to the loaded library, or
+++ * in the pre-defined system directories */
+++static char *_find_installed_jar(void)
++ {
+++#ifndef _WIN32
++     // pre-defined search paths for libbluray.jar
++     static const char * const jar_paths[] = {
++-#ifndef _WIN32
++ #  if defined(__FreeBSD__) || defined(__OpenBSD__)
++         "/usr/local/share/java/" BDJ_JARFILE,
++ #  else
++         "/usr/share/java/" BDJ_JARFILE,
++         "/usr/share/libbluray/lib/" BDJ_JARFILE,
++ #  endif
++-#endif
++-        BDJ_JARFILE,
++     };
+++#endif
++ 
++     unsigned i;
++ 
++-    // check if overriding the classpath
++-    const char *classpath = getenv("LIBBLURAY_CP");
++-    if (classpath) {
++-        size_t cp_len = strlen(classpath);
++-        char *jar;
++-
++-        // directory or file ?
++-        if (cp_len > 0 && (classpath[cp_len - 1] == '/' || classpath[cp_len - 1] == '\\')) {
++-            jar = str_printf("%s%s", classpath, BDJ_JARFILE);
++-        } else {
++-            jar = str_dup(classpath);
++-        }
++-
++-        if (!jar) {
++-            BD_DEBUG(DBG_CRIT, "out of memory\n");
++-            return NULL;
++-        }
++-
++-        if (_can_read_file(jar)) {
++-            return jar;
++-        }
++-
++-        X_FREE(jar);
++-        BD_DEBUG(DBG_BDJ | DBG_CRIT, "invalid LIBBLURAY_CP %s\n", classpath);
++-        return NULL;
++-    }
++-
++-    BD_DEBUG(DBG_BDJ, "LIBBLURAY_CP not set, searching for "BDJ_JARFILE" ...\n");
++-
++     // check directory where libbluray.so was loaded from
++     const char *lib_path = dl_get_path();
++     if (lib_path) {
++@@ -595,21 +567,72 @@ static char *_find_libbluray_jar0()
++ 
++             BD_DEBUG(DBG_BDJ, "Checking %s ...\n", cp);
++             if (_can_read_file(cp)) {
++-                BD_DEBUG(DBG_BDJ, "using %s\n", cp);
++                 return cp;
++             }
++             X_FREE(cp);
++         }
++     }
++ 
+++#ifndef _WIN32
++     // check pre-defined directories
++     for (i = 0; i < sizeof(jar_paths) / sizeof(jar_paths[0]); i++) {
++         BD_DEBUG(DBG_BDJ, "Checking %s ...\n", jar_paths[i]);
++         if (_can_read_file(jar_paths[i])) {
++-            BD_DEBUG(DBG_BDJ, "using %s\n", jar_paths[i]);
++             return str_dup(jar_paths[i]);
++         }
++     }
+++#endif
+++
+++    return NULL;
+++}
+++
+++static char *_find_libbluray_jar0()
+++{
+++    char *jar;
+++
+++    /* The jar installed with this libbluray is built from the same (patched)
+++     * sources as the native side. A JRE addon points LIBBLURAY_CP at its own
+++     * copy of the jar, which carries the same file name but may come from an
+++     * older or differently patched build, so the installed jar wins. */
+++    BD_DEBUG(DBG_BDJ, "searching for "BDJ_JARFILE" ...\n");
+++    jar = _find_installed_jar();
+++    if (jar) {
+++        BD_DEBUG(DBG_BDJ, "using %s\n", jar);
+++        return jar;
+++    }
+++
+++    // check if overriding the classpath
+++    const char *classpath = getenv("LIBBLURAY_CP");
+++    if (classpath) {
+++        size_t cp_len = strlen(classpath);
+++
+++        // directory or file ?
+++        if (cp_len > 0 && (classpath[cp_len - 1] == '/' || classpath[cp_len - 1] == '\\')) {
+++            jar = str_printf("%s%s", classpath, BDJ_JARFILE);
+++        } else {
+++            jar = str_dup(classpath);
+++        }
+++
+++        if (!jar) {
+++            BD_DEBUG(DBG_CRIT, "out of memory\n");
+++            return NULL;
+++        }
+++
+++        if (_can_read_file(jar)) {
+++            BD_DEBUG(DBG_BDJ, "using %s (LIBBLURAY_CP)\n", jar);
+++            return jar;
+++        }
+++
+++        X_FREE(jar);
+++        BD_DEBUG(DBG_BDJ | DBG_CRIT, "invalid LIBBLURAY_CP %s\n", classpath);
+++    }
+++
+++    // last resort: current directory
+++    BD_DEBUG(DBG_BDJ, "Checking " BDJ_JARFILE " ...\n");
+++    if (_can_read_file(BDJ_JARFILE)) {
+++        BD_DEBUG(DBG_BDJ, "using " BDJ_JARFILE "\n");
+++        return str_dup(BDJ_JARFILE);
+++    }
++ 
++     BD_DEBUG(DBG_BDJ | DBG_CRIT, BDJ_JARFILE" not found.\n");
++     return NULL;
++@@ -920,6 +943,7 @@ static int _create_jvm(void *jvm_lib, const char *java_home, BDJ_CONFIG *cfg,
++     option[n++].optionString = str_dup   ("-Xms256M");
++     option[n++].optionString = str_dup   ("-Xmx256M");
++     option[n++].optionString = str_dup   ("-Xss2048k");
+++    option[n++].optionString = str_dup   ("-Xrs");
++ #ifdef HAVE_BDJ_J2ME
++     option[n++].optionString = str_printf("-Djava.home=%s", java_home);
++     option[n++].optionString = str_printf("-Xbootclasspath/a:%s/lib/xmlparser.jar", java_home);
++diff --git a/src/libbluray/bdj/java/java/awt/BDGraphicsWarmup.java b/src/libbluray/bdj/java/java/awt/BDGraphicsWarmup.java
++new file mode 100644
++index 0000000..ced6317
++--- /dev/null
+++++ b/src/libbluray/bdj/java/java/awt/BDGraphicsWarmup.java
++@@ -0,0 +1,114 @@
+++/*
+++ * This file is part of libbluray
+++ *
+++ * This library is free software; you can redistribute it and/or
+++ * modify it under the terms of the GNU Lesser General Public
+++ * License as published by the Free Software Foundation; either
+++ * version 2.1 of the License, or (at your option) any later version.
+++ *
+++ * This library is distributed in the hope that it will be useful,
+++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+++ * Lesser General Public License for more details.
+++ *
+++ * You should have received a copy of the GNU Lesser General Public
+++ * License along with this library. If not, see
+++ * <http://www.gnu.org/licenses/>.
+++ */
+++
+++package java.awt;
+++
+++import org.videolan.Logger;
+++
+++/*
+++ * Warm up the software graphics pipeline once per JVM.
+++ *
+++ * Discs time the player's graphics speed when their menu starts and pick a
+++ * simpler menu below a threshold (e.g. Superman UHD: 100 offscreen fills +
+++ * blits, full menu at >= 85 per second). On the first disc after the JVM
+++ * started, the span/blend loops still run interpreted and score ~40% below
+++ * the same box a minute later, so the disc gets its reduced menu. A standalone
+++ * player's graphics are never cold.
+++ *
+++ * Run the same kind of work on private offscreen images in a low-priority
+++ * daemon thread so the JIT compiles those loops before the disc's menu starts.
+++ * Nothing is drawn to the screen and no disc state is touched.
+++ */
+++public final class BDGraphicsWarmup {
+++
+++    private static final Logger logger = Logger.getLogger(BDGraphicsWarmup.class.getName());
+++
+++    private static final int  MAX_ROUNDS = 300;
+++    private static final long MAX_MS     = 1500;
+++
+++    private static boolean started = false;
+++
+++    private BDGraphicsWarmup() {
+++    }
+++
+++    public static synchronized void start() {
+++        if (started)
+++            return;
+++        started = true;
+++
+++        Thread t = new Thread("BD-J graphics warm-up") {
+++            public void run() {
+++                try {
+++                    warmUp();
+++                } catch (Throwable e) {
+++                    logger.error("graphics warm-up failed: " + e);
+++                }
+++            }
+++        };
+++        t.setDaemon(true);
+++        t.setPriority(Thread.MIN_PRIORITY);
+++        t.start();
+++    }
+++
+++    private static void warmUp() {
+++        /* a parent with a font keeps BDGraphics from asking GUIManager,
+++         * which does not exist before the first title loads */
+++        Component owner = new Component() {};
+++        owner.setFont(new Font("Dialog", Font.PLAIN, 12));
+++
+++        BDImage src = new BDImage(owner, 720, 480, null);
+++        BDImage dst = new BDImage(owner, 1920, 1080, null);
+++        Color clear = new Color(0, 0, 0, 0);
+++        Color translucent = new Color(40, 80, 120, 128);
+++        Color opaque = new Color(200, 160, 120);
+++
+++        long begin = System.currentTimeMillis();
+++        long first = -1, lastTen = 0;
+++        int rounds = 0;
+++        while (rounds < MAX_ROUNDS && System.currentTimeMillis() - begin < MAX_MS) {
+++            long t0 = System.currentTimeMillis();
+++
+++            Graphics2D g = (Graphics2D)src.getGraphics();
+++            g.setComposite(AlphaComposite.SrcOver);
+++            g.setColor((rounds % 3) == 0 ? clear : ((rounds % 3) == 1 ? translucent : opaque));
+++            g.fillRect(0, 0, 720, 480);
+++            g.dispose();
+++
+++            Graphics2D d = (Graphics2D)dst.getGraphics();
+++            d.setComposite(AlphaComposite.SrcOver);
+++            d.drawImage(src, 600, 300, null);
+++            if ((rounds % 10) == 9) {
+++                d.setComposite(AlphaComposite.Clear);
+++                d.fillRect(0, 0, 1920, 1080);
+++            }
+++            d.dispose();
+++
+++            long dt = System.currentTimeMillis() - t0;
+++            if (first < 0)
+++                first = dt;
+++            if (rounds >= MAX_ROUNDS - 10)
+++                lastTen += dt;
+++            rounds++;
+++        }
+++
+++        logger.info("graphics warm-up: " + rounds + " rounds in " + (System.currentTimeMillis() - begin)
+++                    + "ms (first " + first + "ms"
+++                    + (rounds == MAX_ROUNDS ? ", last 10 avg " + (lastTen / 10) + "ms" : ", stopped at time limit")
+++                    + ")");
+++    }
+++}
++diff --git a/src/libbluray/bdj/java/org/bluray/ti/PlayItemImpl.java b/src/libbluray/bdj/java/org/bluray/ti/PlayItemImpl.java
++index ca7e0b2..2613fc0 100644
++--- a/src/libbluray/bdj/java/org/bluray/ti/PlayItemImpl.java
+++++ b/src/libbluray/bdj/java/org/bluray/ti/PlayItemImpl.java
++@@ -67,11 +67,11 @@ public class PlayItemImpl implements PlayItem {
++ 
++     public ServiceComponent[] getComponents() {
++         StreamInfo[] video = clip.getVideoStreams();
++-        StreamInfo[] audio = clip.getVideoStreams();
++-        StreamInfo[] pg = clip.getVideoStreams();
++-        StreamInfo[] ig = clip.getVideoStreams();
++-        StreamInfo[] secVideo = clip.getVideoStreams();
++-        StreamInfo[] secAudio = clip.getVideoStreams();
+++        StreamInfo[] audio = clip.getAudioStreams();
+++        StreamInfo[] pg = clip.getPgStreams();
+++        StreamInfo[] ig = clip.getIgStreams();
+++        StreamInfo[] secVideo = clip.getSecVideoStreams();
+++        StreamInfo[] secAudio = clip.getSecAudioStreams();
++ 
++         int count = video.length + audio.length + pg.length + ig.length + secVideo.length + secAudio.length;
++ 
++diff --git a/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java b/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java
++index 133a689..4bc5d38 100644
++--- a/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java
+++++ b/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java
++@@ -99,7 +99,7 @@ public class DSMCCObject extends File {
++     }
++ 
++     public void unload() throws NotLoadedException {
++-        if (loaded)
+++        if (!loaded)
++             throw new NotLoadedException();
++ 
++         loaded = false;
++diff --git a/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java b/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java
++index c2b736a..846ba2f 100644
++--- a/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java
+++++ b/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java
++@@ -24,7 +24,7 @@ import java.io.Serializable;
++ public class NPTRate implements Serializable {
++ 
++     // should only be called internally
++-    public NPTRate(int numerator, int denominator) {
+++    NPTRate(int numerator, int denominator) {
++         this.numerator = numerator;
++         this.denominator = denominator;
++     }
++diff --git a/src/libbluray/bdj/java/org/dvb/event/EventManager.java b/src/libbluray/bdj/java/org/dvb/event/EventManager.java
++index 1271d60..dff33d3 100644
++--- a/src/libbluray/bdj/java/org/dvb/event/EventManager.java
+++++ b/src/libbluray/bdj/java/org/dvb/event/EventManager.java
++@@ -37,6 +37,9 @@ public class EventManager implements ResourceServer {
++ 
++     private static final Object instanceLock = new Object();
++ 
+++    protected EventManager() {
+++    }
+++
++     public static EventManager getInstance() {
++         synchronized (instanceLock) {
++             if (instance == null)
++diff --git a/src/libbluray/bdj/java/org/havi/ui/HBackgroundDevice.java b/src/libbluray/bdj/java/org/havi/ui/HBackgroundDevice.java
++index 08c5c56..7daaabc 100644
++--- a/src/libbluray/bdj/java/org/havi/ui/HBackgroundDevice.java
+++++ b/src/libbluray/bdj/java/org/havi/ui/HBackgroundDevice.java
++@@ -57,9 +57,13 @@ public class HBackgroundDevice extends HScreenDevice {
++     public HBackgroundConfiguration getBestConfiguration(HBackgroundConfigTemplate hbct) {
++         int score = -1;
++         HBackgroundConfiguration hbc = null;
++-        for (int i = 0; i < hbcArray.length; i++)
++-            if (hbct.match(hbcArray[i]) > score)
+++        for (int i = 0; i < hbcArray.length; i++) {
+++            int s = hbct.match(hbcArray[i]);
+++            if (s > score) {
+++                score = s;
++                 hbc = hbcArray[i];
+++            }
+++        }
++         return hbc;
++     }
++ 
++@@ -67,9 +71,13 @@ public class HBackgroundDevice extends HScreenDevice {
++         int score = -1;
++         HBackgroundConfiguration hbc = null;
++         for (int i = 0; i < hbcArray.length; i++)
++-            for (int j = 0; j < hbcta.length; j++)
++-                if (hbcta[j].match(hbcArray[i]) > score)
+++            for (int j = 0; j < hbcta.length; j++) {
+++                int s = hbcta[j].match(hbcArray[i]);
+++                if (s > score) {
+++                    score = s;
++                     hbc = hbcArray[i];
+++                }
+++            }
++         return hbc;
++     }
++ 
++diff --git a/src/libbluray/bdj/java/org/havi/ui/HGraphicsDevice.java b/src/libbluray/bdj/java/org/havi/ui/HGraphicsDevice.java
++index 08ba1d9..39d3319 100644
++--- a/src/libbluray/bdj/java/org/havi/ui/HGraphicsDevice.java
+++++ b/src/libbluray/bdj/java/org/havi/ui/HGraphicsDevice.java
++@@ -60,22 +60,43 @@ public class HGraphicsDevice extends HScreenDevice {
++     public HGraphicsConfiguration getBestConfiguration(HGraphicsConfigTemplate hgct) {
++         int score = -1;
++         HGraphicsConfiguration hgc = null;
++-        for (int i = 0; i < hgcArray.length; i++)
++-            if (hgct.match(hgcArray[i]) > score)
+++        boolean current = false;
+++        for (int i = 0; i < hgcArray.length; i++) {
+++            int s = hgct.match(hgcArray[i]);
+++            boolean c = isCurrentSize(hgcArray[i]);
+++            if (s > score || (s == score && c && !current)) {
+++                score = s;
++                 hgc = hgcArray[i];
+++                current = c;
+++            }
+++        }
++         return hgc;
++     }
++ 
++     public HGraphicsConfiguration getBestConfiguration(HGraphicsConfigTemplate hgcta[]) {
++         int score = -1;
++         HGraphicsConfiguration hgc = null;
+++        boolean current = false;
++         for (int i = 0; i < hgcArray.length; i++)
++-            for (int j = 0; j < hgcta.length; j++)
++-                if (hgcta[j].match(hgcArray[i]) > score)
+++            for (int j = 0; j < hgcta.length; j++) {
+++                int s = hgcta[j].match(hgcArray[i]);
+++                boolean c = isCurrentSize(hgcArray[i]);
+++                if (s > score || (s == score && c && !current)) {
+++                    score = s;
++                     hgc = hgcArray[i];
+++                    current = c;
+++                }
+++            }
++         return hgc;
++     }
++ 
+++    /* a tie keeps the window size: the BDJO may have sized it to another configuration than the current one */
+++    private static boolean isCurrentSize(HGraphicsConfiguration hgc) {
+++        GUIManager mgr = GUIManager.getInstance();
+++        Dimension d = hgc.getPixelResolution();
+++        return d.width == mgr.getWidth() && d.height == mgr.getHeight();
+++    }
+++
++     public HGraphicsConfiguration getCurrentConfiguration() {
++         return hgc;
++     }
++diff --git a/src/libbluray/bdj/java/org/havi/ui/HScreenConfigTemplate.java b/src/libbluray/bdj/java/org/havi/ui/HScreenConfigTemplate.java
++index adf1641..9167f99 100644
++--- a/src/libbluray/bdj/java/org/havi/ui/HScreenConfigTemplate.java
+++++ b/src/libbluray/bdj/java/org/havi/ui/HScreenConfigTemplate.java
++@@ -110,6 +110,10 @@ public abstract class HScreenConfigTemplate {
++             if (supported)
++                 return -1;
++             return 1;
+++        } else if (Priority == PREFERRED) {
+++            return supported ? 1 : 0;
+++        } else if (Priority == PREFERRED_NOT) {
+++            return supported ? 0 : 1;
++         }
++         return 0;
++     }
++diff --git a/src/libbluray/bdj/java/org/havi/ui/HVideoDevice.java b/src/libbluray/bdj/java/org/havi/ui/HVideoDevice.java
++index c058438..8847c19 100644
++--- a/src/libbluray/bdj/java/org/havi/ui/HVideoDevice.java
+++++ b/src/libbluray/bdj/java/org/havi/ui/HVideoDevice.java
++@@ -55,9 +55,13 @@ public class HVideoDevice extends HScreenDevice {
++     public HVideoConfiguration getBestConfiguration(HVideoConfigTemplate hvct) {
++         int score = -1;
++         HVideoConfiguration hvc = null;
++-        for (int i = 0; i < hvcArray.length; i++)
++-            if (hvct.match(hvcArray[i]) > score)
+++        for (int i = 0; i < hvcArray.length; i++) {
+++            int s = hvct.match(hvcArray[i]);
+++            if (s > score) {
+++                score = s;
++                 hvc = hvcArray[i];
+++            }
+++        }
++         return hvc;
++     }
++ 
++@@ -65,9 +69,13 @@ public class HVideoDevice extends HScreenDevice {
++         int score = -1;
++         HVideoConfiguration hvc = null;
++         for (int i = 0; i < hvcArray.length; i++) 
++-            for (int j = 0; j < hvcta.length; j++)
++-                if (hvcta[j].match(hvcArray[i]) > score)
+++            for (int j = 0; j < hvcta.length; j++) {
+++                int s = hvcta[j].match(hvcArray[i]);
+++                if (s > score) {
+++                    score = s;
++                     hvc = hvcArray[i];
+++                }
+++            }
++         return hvc;
++     }
++ 
++diff --git a/src/libbluray/bdj/java/org/videolan/BDJAppProxy.java b/src/libbluray/bdj/java/org/videolan/BDJAppProxy.java
++index c9e861c..62fb5f5 100644
++--- a/src/libbluray/bdj/java/org/videolan/BDJAppProxy.java
+++++ b/src/libbluray/bdj/java/org/videolan/BDJAppProxy.java
++@@ -60,7 +60,27 @@ class BDJAppProxy implements DVBJProxy, Runnable {
++     }
++ 
++     public int getState() {
++-        return state;
+++        /* A PRESENT xlet that only the loader has initialised (initPresent())
+++         * is still NOT_LOADED to the disc: a player loads it only when an
+++         * application asks. BD+ Handshake xlets (Turbo 3D) start the disc's
+++         * menu xlet only while it reports NOT_LOADED, and the early init raced
+++         * them. While masked, applications see the state their own commands
+++         * produced, as if the early init had not happened. */
+++        if (masked)
+++            return shown;
+++        int s = state;
+++        /* the command thread may have masked (and started loading) since */
+++        return masked ? shown : s;
+++    }
+++
+++    /* loader only: initialise a PRESENT xlet ahead of its start, invisibly */
+++    protected void initPresent() {
+++        AppCommand cmd = new AppCommand(AppCommand.CMD_INIT, null);
+++        cmd.setLoaderInit();
+++        synchronized (cmds) {
+++            cmds.addLast(cmd);
+++            cmds.notifyAll();
+++        }
++     }
++ 
++     public void load() {
++@@ -126,6 +146,7 @@ class BDJAppProxy implements DVBJProxy, Runnable {
++ 
++     protected void notifyDestroyed() {
++         AppCommand cmd = new AppCommand(AppCommand.CMD_NOTIFY_DESTROYED, null);
+++        tagMaskEpoch(cmd);
++         synchronized (cmds) {
++             cmds.addLast(cmd);
++             cmds.notifyAll();
++@@ -134,6 +155,7 @@ class BDJAppProxy implements DVBJProxy, Runnable {
++ 
++     protected void notifyPaused() {
++         AppCommand cmd = new AppCommand(AppCommand.CMD_NOTIFY_PAUSED, null);
+++        tagMaskEpoch(cmd);
++         synchronized (cmds) {
++             cmds.addLast(cmd);
++             cmds.notifyAll();
++@@ -347,9 +369,54 @@ class BDJAppProxy implements DVBJProxy, Runnable {
++             }
++             if (cmd == null)
++                 return;
++-            int fromState = state;
+++            if (cmd.isLoaderInit()) {
+++                /* the loader's early init: no event. A proxy that was not
+++                 * fresh (not masked), or that an application command queued
+++                 * ahead of this one has already moved on, is left alone. */
+++                /* The mask is set here, on the command thread, just before the
+++                 * init: an application command queued ahead of it ran
+++                 * unmasked, as stock, and a proxy kept from the previous
+++                 * title (not NOT_LOADED) is left alone. */
+++                if (!masked && state == NOT_LOADED) {
+++                    shown = NOT_LOADED;
+++                    maskEpoch++;            /* before masked: see tagMaskEpoch() */
+++                    masked = true;
+++                    doInit();
+++                }
+++                cmd.release();
+++                continue;
+++            }
+++            /* The xlet's own notifications while masked (e.g. notifyPaused()
+++             * from initXlet during the loader's init) are held: stock would
+++             * deliver them after the application's init/start ran initXlet. */
+++            if (cmd.getCommand() == AppCommand.CMD_NOTIFY_PAUSED ||
+++                cmd.getCommand() == AppCommand.CMD_NOTIFY_DESTROYED) {
+++                if (masked) {
+++                    heldNotify.addLast(cmd);
+++                    continue;
+++                }
+++                /* sent while a mask was on that ended with the xlet stopped
+++                 * (e.g. from destroyXlet in a masked stop): stock never ran
+++                 * the xlet, so there is nothing to notify */
+++                if (cmd.getMaskEpoch() >= 0 && cmd.getMaskEpoch() == droppedEpoch) {
+++                    cmd.release();
+++                    continue;
+++                }
+++            }
+++            maskedFrom = -1;
+++            if (masked && runMasked(cmd))
+++                continue;
+++            int fromState = (maskedFrom >= 0) ? maskedFrom : state;
++             int toState;
++             boolean ret;
+++            /* where stock would have queued a notification initXlet sends
+++             * during this start: behind what is already queued now */
+++            int replayAt = -1;
+++            if (maskedFrom >= 0 && cmd.getCommand() == AppCommand.CMD_START) {
+++                synchronized (cmds) {
+++                    replayAt = cmds.size();
+++                }
+++            }
++             switch (cmd.getCommand()) {
++             case AppCommand.CMD_LOAD:
++                 toState = LOADED;
++@@ -389,16 +456,135 @@ class BDJAppProxy implements DVBJProxy, Runnable {
++             default:
++                 return;
++             }
+++            /* acted for real: nothing is masked any more (this also drops a
+++             * mask initPresent() set while this command was already running) */
+++            masked = false;
++             notifyListeners(fromState, toState, !ret);
++             cmd.release();
++             if (state == DESTROYED)
++                 state = NOT_LOADED;
+++            if (maskedFrom >= 0)
+++                endHeldNotify(cmd.getCommand() == AppCommand.CMD_START, replayAt);
+++        }
+++    }
+++
+++    /* notifications record the mask they were sent under */
+++    private void tagMaskEpoch(AppCommand cmd) {
+++        boolean m = masked;             /* masked first: maskEpoch is bumped before it */
+++        cmd.setMaskEpoch(m ? maskEpoch : -1);
+++    }
+++
+++    /* After the mask ends: replay the xlet's held notifications right after
+++     * the init/start that ran initXlet in stock, or drop them when the xlet
+++     * never got that far (a failed load, a stop). */
+++    private void endHeldNotify(boolean replay, int at) {
+++        if (masked)
+++            return;
+++        if (!replay) {
+++            droppedEpoch = maskEpoch;
+++            while (!heldNotify.isEmpty())
+++                ((AppCommand)heldNotify.removeFirst()).release();
+++            return;
+++        }
+++        if (heldNotify.isEmpty())
+++            return;
+++        synchronized (cmds) {
+++            for (int i = 0; !heldNotify.isEmpty(); i++) {
+++                Object c = heldNotify.removeFirst();
+++                if (at < 0 || at + i > cmds.size())
+++                    cmds.addLast(c);
+++                else
+++                    cmds.add(at + i, c);
+++            }
+++            cmds.notifyAll();
++         }
++     }
++ 
+++    /* A command on a masked xlet, answered from the state applications were
+++     * shown with stock semantics (see the do*() methods): the loader's init
+++     * already did the work a load or init would. Commands that move the xlet
+++     * on for real take the ordinary path with the shown state as their
+++     * from-state, and unmask it once done. Returns true when the command was
+++     * answered here. */
+++    private boolean runMasked(AppCommand cmd) {
+++        int from = shown;
+++        int to;
+++        boolean ret;
+++        switch (cmd.getCommand()) {
+++        case AppCommand.CMD_LOAD:
+++            /* the loader's init loaded the class (xlet set) or failed to */
+++            to = LOADED;
+++            if (shown == LOADED) {
+++                ret = false;                /* stock: already loaded */
+++            } else if (xlet != null) {
+++                shown = LOADED;
+++                ret = true;
+++            } else {
+++                masked = false;             /* the load failed: INVALID */
+++                ret = false;
+++            }
+++            notifyListeners(from, to, !ret);
+++            cmd.release();
+++            endHeldNotify(false, -1);
+++            return true;
+++        case AppCommand.CMD_INIT:
+++            /* done by the loader's init, or failed there as it would here */
+++            to = PAUSED;
+++            ret = (state == PAUSED);
+++            /* stock queues initXlet's notifications behind what is queued
+++             * now - ahead of anything a listener queues on this event */
+++            int at;
+++            synchronized (cmds) {
+++                at = cmds.size();
+++            }
+++            masked = false;
+++            notifyListeners(from, to, !ret);
+++            cmd.release();
+++            endHeldNotify(true, at);
+++            return true;
+++        case AppCommand.CMD_STOP:
+++            to = DESTROYED;
+++            if (state == PAUSED) {
+++                maskedFrom = from;          /* destroy the initialised xlet */
+++                return false;
+++            }
+++            /* never initialised: stock stops a NOT_LOADED/LOADED xlet
+++             * without calling it */
+++            xlet = null;
+++            state = NOT_LOADED;
+++            masked = false;
+++            notifyListeners(from, to, false);
+++            cmd.release();
+++            endHeldNotify(false, -1);
+++            return true;
+++        case AppCommand.CMD_PAUSE:
+++            to = PAUSED;                    /* never started: fails */
+++            ret = false;
+++            break;
+++        case AppCommand.CMD_RESUME:
+++            to = STARTED;                   /* never paused by an application: fails */
+++            ret = false;
+++            break;
+++        default:
+++            /* start acts for real; the mask stays on until it has */
+++            maskedFrom = from;
+++            return false;
+++        }
+++        notifyListeners(from, to, !ret);
+++        cmd.release();
+++        return true;
+++    }
+++
++     private BDJXletContext context;
++     private Xlet xlet;
++-    private int state;
+++    private volatile int state;
+++    /* the early-init mask: written only by the command thread */
+++    private volatile boolean masked = false;
+++    private volatile int shown = NOT_LOADED;
+++    private int maskedFrom = -1; /* command thread only */
+++    private LinkedList heldNotify = new LinkedList(); /* command thread only */
+++    private volatile int maskEpoch = 0; /* written by the command thread */
+++    private int droppedEpoch = -1; /* command thread only */
++     private LinkedList listeners = new LinkedList();
++     private LinkedList cmds = new LinkedList();
++     private Thread thread;
++@@ -464,8 +650,26 @@ class BDJAppProxy implements DVBJProxy, Runnable {
++         public static final int CMD_NOTIFY_DESTROYED = 6;
++         public static final int CMD_NOTIFY_PAUSED = 7;
++ 
+++        public void setLoaderInit() {
+++            loaderInit = true;
+++        }
+++
+++        public boolean isLoaderInit() {
+++            return loaderInit;
+++        }
+++
+++        public void setMaskEpoch(int epoch) {
+++            maskEpoch = epoch;
+++        }
+++
+++        public int getMaskEpoch() {
+++            return maskEpoch;
+++        }
+++
++         private int cmd;
++         private Object arg;
++         private boolean done = false;
+++        private boolean loaderInit = false;
+++        private int maskEpoch = -1;
++     }
++ }
++diff --git a/src/libbluray/bdj/java/org/videolan/BDJLoader.java b/src/libbluray/bdj/java/org/videolan/BDJLoader.java
++index 2a12607..42cf3d7 100644
++--- a/src/libbluray/bdj/java/org/videolan/BDJLoader.java
+++++ b/src/libbluray/bdj/java/org/videolan/BDJLoader.java
++@@ -294,7 +294,7 @@ public class BDJLoader {
++                     proxys[i].start();
++                 } else if (code == AppEntry.PRESENT) {
++                     logger.info("Init xlet " + i + ": " + appTable[i].getInitialClass());
++-                    proxys[i].init();
+++                    proxys[i].initPresent();
++                 } else {
++                     logger.info("Unsupported xlet code (" +code+") xlet " + i + ": " + appTable[i].getInitialClass());
++                 }
++@@ -320,6 +320,17 @@ public class BDJLoader {
++ 
++             AppsDatabase db = AppsDatabase.getAppsDatabase();
++ 
+++            /* title-bound xlets may still call disc-bound xlets while they are destroyed */
+++            Enumeration titleIds = db.getAppIDs(new CurrentServiceFilter());
+++            while (titleIds.hasMoreElements()) {
+++                AppID id = (AppID)titleIds.nextElement();
+++                BDJAppProxy proxy = (BDJAppProxy)db.getAppProxy(id);
+++                AppEntry entry = (AppEntry)db.getAppAttributes(id);
+++                if (proxy != null && entry != null && entry.getIsServiceBound()) {
+++                    proxy.stop(true, 5000);
+++                }
+++            }
+++
++             /* stop xlets first */
++             Enumeration ids = db.getAppIDs(new CurrentServiceFilter());
++             while (ids.hasMoreElements()) {
++diff --git a/src/libbluray/bdj/java/org/videolan/Libbluray.java b/src/libbluray/bdj/java/org/videolan/Libbluray.java
++index 7bca7d7..31de55c 100644
++--- a/src/libbluray/bdj/java/org/videolan/Libbluray.java
+++++ b/src/libbluray/bdj/java/org/videolan/Libbluray.java
++@@ -406,6 +406,13 @@ public class Libbluray {
++         }
++ 
++         booted = true;
+++
+++        /* once per JVM: compile the graphics loops before a disc times them */
+++        try {
+++            java.awt.BDGraphicsWarmup.start();
+++        } catch (Throwable t) {
+++            System.err.println("graphics warm-up not started: " + t);
+++        }
++     }
++ 
++     /* called only from native code */
++diff --git a/src/libbluray/bdj/java/org/videolan/StreamInfo.java b/src/libbluray/bdj/java/org/videolan/StreamInfo.java
++index 4cf4fd4..61d6eeb 100644
++--- a/src/libbluray/bdj/java/org/videolan/StreamInfo.java
+++++ b/src/libbluray/bdj/java/org/videolan/StreamInfo.java
++@@ -73,6 +73,7 @@ public class StreamInfo {
++         case (byte)0x08:
++             width = 3840;
++             height = 2160;
+++            break;
++         default:
++                 return null;
++         }
++diff --git a/src/libbluray/bdj/java/org/videolan/media/content/playlist/StreamControl.java b/src/libbluray/bdj/java/org/videolan/media/content/playlist/StreamControl.java
++index d2b8356..3fbded5 100644
++--- a/src/libbluray/bdj/java/org/videolan/media/content/playlist/StreamControl.java
+++++ b/src/libbluray/bdj/java/org/videolan/media/content/playlist/StreamControl.java
++@@ -117,6 +117,7 @@ public abstract class StreamControl implements Control {
++             if (streams[i].getLang().equals(language)) {
++                 try {
++                     selectStreamNumber(i + 1);
+++                    return;
++                 } catch (StreamNotAvailableException e) {
++                     throw new NotAuthorizedException();
++                 }
++diff --git a/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java b/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java
++index 32185ec..3f3ef80 100644
++--- a/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java
+++++ b/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java
++@@ -82,7 +82,10 @@ public abstract class VideoControl extends StreamControl implements VideoPresent
++         StreamInfo stream = getCurrentStream();
++         if (stream == null)
++             return new Dimension(0, 0);
++-        return stream.getVideoSize();
+++        Dimension size = stream.getVideoSize();
+++        if (size == null)
+++            return new Dimension(0, 0);
+++        return size;
++     }
++ 
++     public Dimension getVideoSize() {
++diff --git a/src/libbluray/bdnav/clpi_parse.c b/src/libbluray/bdnav/clpi_parse.c
++index 514afad..2e989fd 100644
++--- a/src/libbluray/bdnav/clpi_parse.c
+++++ b/src/libbluray/bdnav/clpi_parse.c
++@@ -338,6 +338,12 @@ _parse_ep_map_stream(BITSTREAM *bits, CLPI_EP_MAP_ENTRY *ee)
++     }
++     for (ii = 0; ii < ee->num_ep_coarse; ii++) {
++         coarse[ii].ref_ep_fine_id = bs_read(bits, 18);
+++        if (coarse[ii].ref_ep_fine_id >= ee->num_ep_fine) {
+++            BD_DEBUG(DBG_HDMV | DBG_CRIT, "clpi_parse: invalid EP fine reference %u\n", coarse[ii].ref_ep_fine_id);
+++            if (ee->num_ep_fine > 0) {
+++                coarse[ii].ref_ep_fine_id = ee->num_ep_fine - 1;
+++            }
+++        }
++         coarse[ii].pts_ep         = bs_read(bits, 14);
++         coarse[ii].spn_ep         = bs_read(bits, 32);
++     }
++@@ -426,7 +432,8 @@ clpi_find_stc_spn(const CLPI_CL *cl, uint8_t stc_id)
++ 
++     for (ii = 0; ii < cl->sequence.num_atc_seq; ii++) {
++         atc = &cl->sequence.atc_seq[ii];
++-        if (stc_id < atc->offset_stc_id + atc->num_stc_seq) {
+++        if (stc_id >= atc->offset_stc_id &&
+++            stc_id < atc->offset_stc_id + atc->num_stc_seq) {
++             return atc->stc_seq[stc_id - atc->offset_stc_id].spn_stc_start;
++         }
++     }
++@@ -457,6 +464,13 @@ clpi_lookup_spn(const CLPI_CL *cl, uint32_t timestamp, int before, uint8_t stc_i
++     // Assumes that there is only one pid of interest
++     entry = &cpi->entry[0];
++ 
+++    if (entry->num_ep_fine < 1) {
+++        if (before) {
+++            return 0;
+++        }
+++        return cl->clip.num_source_packets;
+++    }
+++
++     // Use sequence info to find spn_stc_start before doing
++     // PTS search. The spn_stc_start defines the point in
++     // the EP map to start searching.
++@@ -535,7 +549,10 @@ done:
++         }
++         jj = entry->coarse[ii].ref_ep_fine_id;
++     }
++-    spn = (entry->coarse[ii].spn_ep & ~0x1FFFF) + entry->fine[jj].spn_ep;
+++    if (jj < 0) {
+++        jj = 0;
+++    }
+++    spn = (entry->coarse[ii].spn_ep & ~0x1FFFF) + entry->fine[jj].spn_ep - 1;
++     return spn;
++ }
++ 
++@@ -552,6 +569,11 @@ clpi_access_point(const CLPI_CL *cl, uint32_t pkt, int next, int angle_change, u
++     int start, end;
++     int ref;
++ 
+++    if (cpi->num_stream_pid < 1 || !cpi->entry) {
+++        *time = 0;
+++        return 0;
+++    }
+++
++     // Assumes that there is only one pid of interest
++     entry = &cpi->entry[0];
++ 
++@@ -587,7 +609,9 @@ clpi_access_point(const CLPI_CL *cl, uint32_t pkt, int next, int angle_change, u
++         ii++;
++         jj = 0;
++     } else if (spn != pkt && !next) {
++-        jj--;
+++        if (jj > 0) {
+++            jj--;
+++        }
++     }
++     if (ii == entry->num_ep_coarse) {
++         *time = 0;
++diff --git a/src/libbluray/bdnav/mpls_data.h b/src/libbluray/bdnav/mpls_data.h
++index 899ca43..25a6104 100644
++--- a/src/libbluray/bdnav/mpls_data.h
+++++ b/src/libbluray/bdnav/mpls_data.h
++@@ -51,6 +51,7 @@ typedef struct
++     uint8_t         sv_num_pip_pg_ref;
++     uint8_t        *sv_secondary_audio_ref;
++     uint8_t        *sv_pip_pg_ref;
+++    uint8_t         ss_offset_sequence_id;
++ } MPLS_STREAM;
++ 
++ typedef struct
++diff --git a/src/libbluray/bdnav/mpls_parse.c b/src/libbluray/bdnav/mpls_parse.c
++index 13226f9..f67fe74 100644
++--- a/src/libbluray/bdnav/mpls_parse.c
+++++ b/src/libbluray/bdnav/mpls_parse.c
++@@ -203,6 +203,7 @@ _parse_stream(BITSTREAM *bits, MPLS_STREAM *s)
++             break;
++     };
++     s->lang[3] = '\0';
+++    s->ss_offset_sequence_id = 0xFF;
++ 
++     if (bs_seek_byte(bits, pos + len) < 0) {
++         return 0;
++@@ -474,7 +475,7 @@ _parse_playitem(BITSTREAM *bits, MPLS_PI *pi)
++     pi->is_multi_angle = bs_read(bits, 1);
++ 
++     pi->connection_condition = bs_read(bits, 4);
++-    if (pi->connection_condition != 0x01 && 
+++    if (pi->connection_condition != 0x01 &&
++         pi->connection_condition != 0x05 &&
++         pi->connection_condition != 0x06) {
++ 
++@@ -579,7 +580,7 @@ _parse_subplayitem(BITSTREAM *bits, MPLS_SUB_PI *spi)
++ 
++     spi->connection_condition = bs_read(bits, 4);
++ 
++-    if (spi->connection_condition != 0x01 && 
+++    if (spi->connection_condition != 0x01 &&
++         spi->connection_condition != 0x05 &&
++         spi->connection_condition != 0x06) {
++ 
++@@ -681,10 +682,12 @@ _clean_subpath(MPLS_SUB *sp)
++ {
++     int ii;
++ 
++-    for (ii = 0; ii < sp->sub_playitem_count; ii++) {
++-        _clean_subplayitem(&sp->sub_play_item[ii]);
+++    if (sp->sub_play_item != NULL) {
+++        for (ii = 0; ii < sp->sub_playitem_count; ii++) {
+++            _clean_subplayitem(&sp->sub_play_item[ii]);
+++        }
+++        X_FREE(sp->sub_play_item);
++     }
++-    X_FREE(sp->sub_play_item);
++ }
++ 
++ static int
++@@ -758,35 +761,33 @@ _parse_playlist(BITSTREAM *bits, MPLS_PL *pl)
++     pl->list_count = bs_read(bits, 16);
++     pl->sub_count = bs_read(bits, 16);
++ 
++-    if (pl->list_count) {
++-    pi = calloc(pl->list_count,  sizeof(MPLS_PI));
++-        if (!pi) {
++-            return 0;
++-        }
++-    pl->play_item = pi;
++-    for (ii = 0; ii < pl->list_count; ii++) {
++-        if (!_parse_playitem(bits, &pi[ii])) {
++-            BD_DEBUG(DBG_NAV | DBG_CRIT, "error parsing play list item\n");
++-            return 0;
++-        }
++-    }
++-    }
++-
++-    if (pl->sub_count) {
++-    sub_path = calloc(pl->sub_count,  sizeof(MPLS_SUB));
++-        if (!sub_path) {
++-            return 0;
++-        }
++-    pl->sub_path = sub_path;
++-    for (ii = 0; ii < pl->sub_count; ii++)
++-    {
++-        if (!_parse_subpath(bits, &sub_path[ii]))
++-        {
++-            BD_DEBUG(DBG_NAV | DBG_CRIT, "error parsing subpath\n");
++-            return 0;
++-        }
++-    }
++-    }
+++	if (pl->list_count) {
+++		pi = calloc(pl->list_count, sizeof(MPLS_PI));
+++		if (!pi) {
+++			return 0;
+++		}
+++		pl->play_item = pi;
+++		for (ii = 0; ii < pl->list_count; ii++) {
+++			if (!_parse_playitem(bits, &pi[ii])) {
+++				BD_DEBUG(DBG_NAV | DBG_CRIT, "error parsing play list item\n");
+++				return 0;
+++			}
+++		}
+++	}
+++
+++	if (pl->sub_count) {
+++		sub_path = calloc(pl->sub_count, sizeof(MPLS_SUB));
+++		if (!sub_path) {
+++			return 0;
+++		}
+++		pl->sub_path = sub_path;
+++		for (ii = 0; ii < pl->sub_count; ii++) {
+++			if (!_parse_subpath(bits, &sub_path[ii])) {
+++				BD_DEBUG(DBG_NAV | DBG_CRIT, "error parsing subpath\n");
+++				return 0;
+++			}
+++		}
+++	}
++ 
++     return 1;
++ }
++@@ -1058,6 +1059,99 @@ _parse_static_metadata_extension(BITSTREAM *bits, MPLS_PL *pl)
++     return 0;
++ }
++ 
+++static int
+++_parse_stn_ss_extension(BITSTREAM *bits, MPLS_PL *pl)
+++{
+++    int ii, s;
+++    int64_t pos;
+++
+++    for (ii = 0; ii < pl->list_count; ii++) {
+++        uint32_t len = bs_read(bits, 16);
+++        pos = bs_pos(bits) >> 3;
+++        int Fixed_offset_during_PopUp_flag = bs_read(bits, 1);
+++        bs_skip(bits, 15); // reserved
+++
+++        for (s = 0; s < pl->play_item[ii].stn.num_video; s++) {
+++            // stream_entry
+++            uint32_t slen = bs_read(bits, 8);
+++            bs_skip(bits, slen * 8);
+++
+++            // stream_attributes_ss
+++            slen = bs_read(bits, 8);
+++            bs_skip(bits, slen * 8);
+++
+++            bs_skip(bits, 10); // reserved
+++            bs_skip(bits, 6);  // number_of_offset_sequences
+++        }
+++
+++        for (s = 0; s < pl->play_item[ii].stn.num_pg; s++) {
+++            pl->play_item[ii].stn.pg[s].ss_offset_sequence_id = bs_read(bits, 8);
+++
+++            bs_skip(bits, 4); // reserved
+++            bs_skip(bits, 1); // dialog_region_offset_valid_flag
+++            int is_SS_PG = bs_read(bits, 1);
+++            int is_top_AS_PG_textST = bs_read(bits, 1);
+++            int is_bottom_AS_PG_textST = bs_read(bits, 1);
+++            if (is_SS_PG) {
+++                // stream_entry left eye
+++                uint32_t slen = bs_read(bits, 8);
+++                bs_skip(bits, slen * 8);
+++
+++                // stream_entry right eye
+++                slen = bs_read(bits, 8);
+++                bs_skip(bits, slen * 8);
+++
+++                bs_skip(bits, 8); // reserved
+++                bs_skip(bits, 8); // PG offset
+++            }
+++            if (is_top_AS_PG_textST) {
+++                // stream_entry
+++                uint32_t slen = bs_read(bits, 8);
+++                bs_skip(bits, slen * 8);
+++
+++                bs_skip(bits, 8); // reserved
+++                bs_skip(bits, 8); // PG offset
+++            }
+++            if (is_bottom_AS_PG_textST) {
+++                // stream_entry
+++                uint32_t slen = bs_read(bits, 8);
+++                bs_skip(bits, slen * 8);
+++
+++                bs_skip(bits, 8); // reserved
+++                bs_skip(bits, 8); // PG offset
+++            }
+++        }
+++
+++        for (s = 0; s < pl->play_item[ii].stn.num_ig; s++) {
+++            if (Fixed_offset_during_PopUp_flag)
+++              bs_skip(bits, 8);
+++            else
+++              pl->play_item[ii].stn.ig[s].ss_offset_sequence_id = bs_read(bits, 8);
+++
+++            bs_skip(bits, 16); // IG_Plane_offset_during_BB_video
+++            bs_skip(bits, 7); // reserved
+++            int is_SS_IG = bs_read(bits, 1);
+++            if (is_SS_IG) {
+++                // stream_entry left eye
+++                uint32_t slen = bs_read(bits, 8);
+++                bs_skip(bits, slen * 8);
+++
+++                // stream_entry right eye
+++                slen = bs_read(bits, 8);
+++                bs_skip(bits, slen * 8);
+++
+++                bs_skip(bits, 8); // reserved
+++                bs_skip(bits, 8); // PG offset
+++            }
+++        }
+++
+++        // Skip to next play item
+++        bs_seek_byte(bits, pos + len);
+++    }
+++
+++    return 0;
+++}
+++
++ static int
++ _parse_mpls_extension(BITSTREAM *bits, int id1, int id2, void *handle)
++ {
++@@ -1072,7 +1166,7 @@ _parse_mpls_extension(BITSTREAM *bits, int id1, int id2, void *handle)
++ 
++     if (id1 == 2) {
++         if (id2 == 1) {
++-            return 0;
+++            return _parse_stn_ss_extension(bits, pl);
++         }
++         if (id2 == 2) {
++             // SubPath entries extension
++diff --git a/src/libbluray/bdnav/navigation.c b/src/libbluray/bdnav/navigation.c
++index b3f719f..448ce75 100644
++--- a/src/libbluray/bdnav/navigation.c
+++++ b/src/libbluray/bdnav/navigation.c
++@@ -546,14 +546,21 @@ _fill_mark(const NAV_TITLE *title, NAV_MARK *mark, int entry)
++ 
++     mark->mark_type = plm->mark_type;
++     mark->clip_ref = plm->play_item_ref;
++-    clip = &title->clip_list.clip[mark->clip_ref];
++-    if (clip->cl != NULL && mark->clip_ref < title->pl->list_count) {
++-        mark->clip_pkt = clpi_lookup_spn(clip->cl, plm->time, 1,
++-            title->pl->play_item[mark->clip_ref].clip[title->angle].stc_id);
++-    } else {
++-        mark->clip_pkt = clip->start_pkt;
+++    if (mark->clip_ref >= title->clip_list.count) {
+++        BD_DEBUG(DBG_NAV | DBG_CRIT, "_fill_mark(): invalid play_item_ref %d\n", plm->play_item_ref);
+++        mark->clip_ref = 0;
+++    }
+++
+++    if (title->clip_list.count) {
+++        clip = &title->clip_list.clip[mark->clip_ref];
+++        if (clip->cl != NULL && mark->clip_ref < title->pl->list_count) {
+++            mark->clip_pkt = clpi_lookup_spn(clip->cl, plm->time, 1,
+++                    title->pl->play_item[mark->clip_ref].clip[clip->angle].stc_id);
+++        } else {
+++            mark->clip_pkt = clip->start_pkt;
+++        }
+++        mark->title_pkt = clip->title_pkt + mark->clip_pkt - clip->start_pkt;
++     }
++-    mark->title_pkt = clip->title_pkt + mark->clip_pkt - clip->start_pkt;
++     mark->clip_time = plm->time;
++ 
++     // Calculate start of mark relative to beginning of playlist
++@@ -743,6 +750,10 @@ NAV_TITLE* nav_title_open(BD_DISC *disc, const char *playlist, unsigned angle)
++     strncpy(title->name, playlist, 11);
++     title->name[10] = '\0';
++     title->angle_count = 0;
+++    if (angle > 8) {
+++        // invalid angle
+++        angle = 0;
+++    }
++     title->angle = angle;
++     title->pl = mpls_get(disc, playlist);
++     if (title->pl == NULL) {
++@@ -838,7 +849,7 @@ const NAV_CLIP* nav_chapter_search(const NAV_TITLE *title, unsigned chapter,
++         return NULL;
++     }
++ 
++-    if (chapter > title->chap_list.count) {
+++    if (chapter >= title->chap_list.count) {
++         clip = &title->clip_list.clip[0];
++         *clip_pkt = clip->start_pkt;
++         *out_pkt = clip->title_pkt;
++@@ -885,7 +896,7 @@ const NAV_CLIP* nav_mark_search(const NAV_TITLE *title, unsigned mark,
++         return NULL;
++     }
++ 
++-    if (mark > title->mark_list.count) {
+++    if (mark >= title->mark_list.count) {
++         clip = &title->clip_list.clip[0];
++         *clip_pkt = clip->start_pkt;
++         *out_pkt = clip->title_pkt;
++diff --git a/src/libbluray/bdnav/sound_parse.c b/src/libbluray/bdnav/sound_parse.c
++index 84647a9..0e3d345 100644
++--- a/src/libbluray/bdnav/sound_parse.c
+++++ b/src/libbluray/bdnav/sound_parse.c
++@@ -197,7 +197,7 @@ static SOUND_DATA *_sound_parse(BD_FILE_H *fp)
++ 
++     for (i = 0; i < data->num_sounds; i++) {
++ 
++-        if (bs_seek_byte(&bs, data_start + data_offsets[i]) < 0) {
+++        if (bs_seek_byte(&bs, (int64_t)data_start + data_offsets[i]) < 0) {
++             BD_DEBUG(DBG_NAV | DBG_CRIT, "error reading samples for sound %d\n", i);
++             data->sounds[i].num_frames = 0;
++             continue;
++diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
++index 1a70705..06b65ca 100644
++--- a/src/libbluray/bluray.c
+++++ b/src/libbluray/bluray.c
++@@ -36,6 +36,7 @@
++ #include "util/strutl.h"
++ #include "util/mutex.h"
++ #include "bdnav/bdid_parse.h"
+++#include "bdnav/clpi_data.h"
++ #include "bdnav/navigation.h"
++ #include "bdnav/index_parse.h"
++ #include "bdnav/meta_parse.h"
++@@ -89,6 +90,16 @@ typedef struct {
++     uint8_t         encrypted_block_cnt;
++     uint8_t         seek_flag;  /* used to fine-tune first read after seek */
++ 
+++    /* Dolby Vision dual-layer (in-mux profile 7): the EP map indexes only the
+++     * base-layer PID, and the enhancement-layer access unit of the target
+++     * frame is muxed ahead of the base-layer IDR the EP map points at. While
+++     * SPN(clip_pos) < el_recover_end_pkt, deliver only system packets and the
+++     * EL video PID (everything else wiped to padding) so the EL decoder gets
+++     * its parameter sets + IDR at windowed playitem entries and seeks.
+++     * el_recover_end_pkt == 0 -> inactive. */
+++    uint32_t        el_recover_end_pkt;
+++    uint16_t        el_recover_pid;
+++
++     M2TS_FILTER    *m2ts_filter;
++ } BD_STREAM;
++ 
++@@ -647,6 +658,51 @@ static void _close_m2ts(BD_STREAM *st)
++     m2ts_filter_close(&st->m2ts_filter);
++ }
++ 
+++/* max source packets the EL access unit start may precede the BL IDR by:
+++ * 4096 * 192 = 768 kB, comfortably above observed UHD-BD FEL EL AU sizes. */
+++#define EL_RECOVER_MAX_PKTS 4096
+++
+++static uint16_t _clip_dv_el_pid(const NAV_CLIP *clip)
+++{
+++    const struct clpi_cl *cl = clip ? clip->cl : NULL;
+++    unsigned ii, jj;
+++
+++    if (!cl) {
+++        return 0;
+++    }
+++    for (ii = 0; ii < cl->program.num_prog; ii++) {
+++        const CLPI_PROG *prog = &cl->program.progs[ii];
+++        for (jj = 0; jj < prog->num_streams; jj++) {
+++            const CLPI_PROG_STREAM *s = &prog->streams[jj];
+++            /* secondary in-mux HEVC video (0x1012..0x101f) = DV enhancement layer */
+++            if (s->pid > HDMV_PID_VIDEO && s->pid <= HDMV_PID_VIDEO + 0x0e &&
+++                s->coding_type == 0x24) {
+++                return s->pid;
+++            }
+++        }
+++    }
+++    return 0;
+++}
+++
+++static void _init_el_recover(BD_STREAM *st, uint32_t target_pkt)
+++{
+++    st->el_recover_end_pkt = 0;
+++
+++    if (target_pkt > 0) {
+++        uint16_t el_pid = _clip_dv_el_pid(st->clip);
+++        if (el_pid) {
+++            uint32_t rewind_pkt = target_pkt > EL_RECOVER_MAX_PKTS ?
+++                                  target_pkt - EL_RECOVER_MAX_PKTS : 0;
+++            st->el_recover_end_pkt = target_pkt;
+++            st->el_recover_pid     = el_pid;
+++            st->clip_pos           = (uint64_t)rewind_pkt * 192;
+++            st->clip_block_pos     = (st->clip_pos / 6144) * 6144;
+++            BD_DEBUG(DBG_STREAM, "DV EL recover: pid 0x%04x, rewind SPN %u -> target SPN %u\n",
+++                     el_pid, rewind_pkt, target_pkt);
+++        }
+++    }
+++}
+++
++ static int _open_m2ts(BLURAY *bd, BD_STREAM *st)
++ {
++     _close_m2ts(st);
++@@ -660,6 +716,9 @@ static int _open_m2ts(BLURAY *bd, BD_STREAM *st)
++     st->clip_size = 0;
++     st->clip_pos = (uint64_t)st->clip->start_pkt * 192;
++     st->clip_block_pos = (st->clip_pos / 6144) * 6144;
+++    if (st == &bd->st0) {
+++        _init_el_recover(st, st->clip->start_pkt);
+++    }
++     st->eof_hit = 0;
++     st->encrypted_block_cnt = 0;
++ 
++@@ -687,7 +746,8 @@ static int _open_m2ts(BLURAY *bd, BD_STREAM *st)
++                 st->m2ts_filter = m2ts_filter_init((int64_t)st->clip->in_time << 1,
++                                                    (int64_t)st->clip->out_time << 1,
++                                                    stn->num_video, stn->num_audio,
++-                                                   stn->num_ig, stn->num_pg);
+++                                                   stn->num_ig, stn->num_pg,
+++                                                   _clip_dv_el_pid(st->clip));
++ 
++                 _update_clip_psrs(bd, st->clip);
++ 
++@@ -797,6 +857,28 @@ static int _read_block(BLURAY *bd, BD_STREAM *st, uint8_t *buf)
++                     }
++                 }
++ 
+++                if (BD_UNLIKELY(st->el_recover_end_pkt != 0)) {
+++                    /* DV dual-layer recovery window: this unit lies (at least
+++                     * partly) before the real target packet. Keep system
+++                     * packets and the enhancement-layer video; wipe everything
+++                     * else (esp. pre-IDR base layer) to padding so only the
+++                     * EL access unit reaches the demuxer ahead of the target. */
+++                    uint32_t spn = (uint32_t)((st->clip_block_pos - len) / 192);
+++                    uint8_t *pkt = buf;
+++                    unsigned ii;
+++                    for (ii = 0; ii < len / 192; ii++, pkt += 192, spn++) {
+++                        if (spn >= st->el_recover_end_pkt) {
+++                            st->el_recover_end_pkt = 0;
+++                            break;
+++                        }
+++                        if (TS_PID(pkt) > HDMV_PID_PCR && TS_PID(pkt) != st->el_recover_pid) {
+++                            /* set pid to 0x1fff (padding) */
+++                            pkt[4 + 2] = 0xff;
+++                            pkt[4 + 1] |= 0x1f;
+++                        }
+++                    }
+++                }
+++
++                 BD_DEBUG(DBG_STREAM, "Read unit OK!\n");
++ 
++ #ifdef BLURAY_READ_ERROR_TEST
++@@ -921,6 +1003,10 @@ static int64_t _seek_stream(BLURAY *bd, BD_STREAM *st,
++     st->clip_pos = (uint64_t)clip_pkt * 192;
++     st->clip_block_pos = (st->clip_pos / 6144) * 6144;
++ 
+++    if (st == &bd->st0) {
+++        _init_el_recover(st, clip_pkt);
+++    }
+++
++     if (file_seek(st->fp, st->clip_block_pos, SEEK_SET) < 0) {
++         BD_DEBUG(DBG_BLURAY | DBG_CRIT, "Unable to seek clip %s!\n", st->clip->name);
++     }
++@@ -928,7 +1014,7 @@ static int64_t _seek_stream(BLURAY *bd, BD_STREAM *st,
++     st->int_buf_off = 6144;
++     st->seek_flag = 1;
++ 
++-    return st->clip_pos;
+++    return (uint64_t)clip_pkt * 192;
++ }
++ 
++ /*
++@@ -1696,14 +1782,16 @@ static int64_t _seek_internal(BLURAY *bd,
++ 
++         /* update title position */
++         bd->s_pos = (uint64_t)title_pkt * 192;
+++        bd->end_of_playlist = 0;
++ 
++         /* Update PSR_TIME */
++         media_time = _update_time_psr_from_stream(bd);
++ 
++         /* emit notification events */
++-        if (media_time >= clip->in_time) {
++-            media_time = media_time - clip->in_time + clip->title_time;
+++        if (media_time < clip->in_time) {
+++            media_time = clip->in_time;
++         }
+++        media_time = media_time - clip->in_time + clip->title_time;
++         _queue_event(bd, BD_EVENT_SEEK, media_time);
++         _bdj_event(bd, BDJ_EVENT_SEEK, media_time);
++ 
++@@ -1760,8 +1848,9 @@ static int64_t _seek_time(BLURAY *bd, uint64_t tick, uint8_t is_uo_mask_checked)
++         }
++     }
++ 
++-    if (bd->title &&
++-        tick < bd->title->duration) {
+++    if (bd->title) {
+++        if (tick > bd->title->duration)
+++            tick = bd->title->duration;
++ 
++         _change_angle(bd);
++ 
++@@ -2428,6 +2517,15 @@ static void _close_playlist(BLURAY *bd)
++         gc_run(bd->graphics_controller, GC_CTRL_RESET, 0, NULL);
++     }
++ 
+++    /* the menu of a dropped IG is closed */
+++    if (bd->gc_status & GC_STATUS_MENU_OPEN) {
+++        _queue_event(bd, BD_EVENT_MENU, 0);
+++    }
+++    if (bd->gc_status & GC_STATUS_POPUP) {
+++        _queue_event(bd, BD_EVENT_POPUP, 0);
+++    }
+++    bd->gc_status = GC_STATUS_NONE;
+++
++     /* stopping playback in middle of playlist ? */
++     if (bd->title && bd->st0.clip) {
++         if (bd->st0.clip->ref < bd->title->clip_list.count - 1) {
++@@ -2909,6 +3007,7 @@ static BLURAY_TITLE_INFO* _fill_title_info(BLURAY *bd, NAV_TITLE* title, uint32_
++             ci->out_time = (uint64_t)pi->out_time * 2;
++             ci->still_mode = pi->still_mode;
++             ci->still_time = pi->still_time;
+++            ci->connection_condition = pi->connection_condition;
++             ci->video_stream_count = pi->stn.num_video;
++             ci->audio_stream_count = pi->stn.num_audio;
++             ci->pg_stream_count = pi->stn.num_pg + pi->stn.num_pip_pg;
++@@ -4301,6 +4400,11 @@ struct clpi_cl *bd_read_clpi(const char *path)
++     return clpi_parse(path);
++ }
++ 
+++const struct clpi_cl *bd_get_clpi_file(BLURAY *bd, const char *file)
+++{
+++    return clpi_get(bdpriv_get_disc(bd), file);
+++}
+++
++ void bd_free_clpi(struct clpi_cl *cl)
++ {
++     clpi_free(&cl);
++@@ -4311,6 +4415,11 @@ struct mpls_pl *bd_read_mpls(const char *mpls_file)
++     return mpls_parse(mpls_file);
++ }
++ 
+++struct mpls_pl *bd_get_mpls(BLURAY *bd, const char *file)
+++{
+++    return mpls_get(bdpriv_get_disc(bd), file);
+++}
+++
++ void bd_free_mpls(struct mpls_pl *pl)
++ {
++     mpls_free(&pl);
++@@ -4335,3 +4444,28 @@ void bd_free_bdjo(struct bdjo_data *obj)
++ {
++     bdjo_free(&obj);
++ }
+++
+++int bd_get_clip_infos(BLURAY *bd, unsigned clip, uint64_t *clip_start_time, uint64_t *stream_start_time, uint64_t *pos, uint64_t *duration)
+++{
+++    if (bd && bd->title && bd->title->clip_list.count > clip) {
+++      if (clip_start_time)
+++        *clip_start_time = (uint64_t)bd->title->clip_list.clip[clip].title_time << 1;
+++      if (stream_start_time)
+++        *stream_start_time = (uint64_t)bd->title->clip_list.clip[clip].in_time << 1;
+++      if (pos)
+++        *pos = (uint64_t)bd->title->clip_list.clip[clip].title_pkt * 192;
+++      if (duration)
+++        *duration = (uint64_t)bd->title->clip_list.clip[clip].duration << 1;
+++
+++      return 1;
+++    }
+++    return 0;
+++}
+++
+++struct mpls_pl *bd_get_title_mpls(BLURAY *bd)
+++{
+++	if (bd && bd->title) {
+++		return bd->title->pl;
+++	}
+++	return NULL;
+++}
++diff --git a/src/libbluray/bluray.h b/src/libbluray/bluray.h
++index 95d551a..a70e321 100644
++--- a/src/libbluray/bluray.h
+++++ b/src/libbluray/bluray.h
++@@ -271,6 +271,7 @@ typedef struct bd_clip {
++     uint8_t            sec_audio_stream_count;  /**< Number of secondary audio streams */
++     uint8_t            sec_video_stream_count;  /**< Number of secondary video streams */
++     uint8_t            dv_stream_count;
+++    uint8_t            ext_video_stream_count;  /**< Number of extension video streams */
++     BLURAY_STREAM_INFO *video_streams;          /**< Video streams information */
++     BLURAY_STREAM_INFO *audio_streams;          /**< Audio streams information */
++     BLURAY_STREAM_INFO *pg_streams;             /**< PG (Presentation Graphics) streams information */
++@@ -278,11 +279,13 @@ typedef struct bd_clip {
++     BLURAY_STREAM_INFO *sec_audio_streams;      /**< Secondary audio streams information */
++     BLURAY_STREAM_INFO *sec_video_streams;      /**< Secondary video streams information */
++     BLURAY_STREAM_INFO *dv_streams;
+++    BLURAY_STREAM_INFO *ext_video_streams;      /**< Extension video streams information */
++ 
++     uint64_t           start_time;  /**< start media time, 90kHz, ("playlist time") */
++     uint64_t           in_time;     /**< start timestamp, 90kHz */
++     uint64_t           out_time;    /**< end timestamp, 90kHz */
++     char               clip_id[6];  /**< Clip identifier (.m2ts file name) */
+++    uint8_t            connection_condition;    /**< MPLS playitem connection_condition: 5/6 seamless, 1 non-seamless */
++ } BLURAY_CLIP_INFO;
++ 
++ /** Chapter entry */
++@@ -1126,6 +1129,9 @@ BD_PUBLIC int bd_get_sound_effect(BLURAY *bd, unsigned sound_id, struct bd_sound
++  */
++ BD_PUBLIC void bd_set_scr(BLURAY *bd, int64_t pts);
++ 
+++/* a seek raises the end of the playlist again */
+++#define BD_SEEK_REARMS_PLAYLIST_END 1
+++
++ /**
++  *
++  *  Set current playback rate.
++@@ -1211,6 +1217,7 @@ BD_PUBLIC struct clpi_cl *bd_get_clpi(BLURAY *bd, unsigned clip_ref);
++ 
++ /** Testing/debugging: Parse clip information (CLPI) file */
++ BD_PUBLIC struct clpi_cl *bd_read_clpi(const char *clpi_file);
+++BD_PUBLIC const struct clpi_cl *bd_get_clpi_file(BLURAY *bd, const char *file);
++ 
++ /**
++  *
++@@ -1226,6 +1233,8 @@ BD_PUBLIC struct mpls_pl *bd_read_mpls(const char *mpls_file);
++ /** Testing/debugging: Free parsed playlist */
++ BD_PUBLIC void bd_free_mpls(struct mpls_pl *);
++ 
+++BD_PUBLIC struct mpls_pl *bd_get_mpls(BLURAY *bd, const char *file);
+++
++ /** Testing/debugging: Parse movie objects (MOBJ) file */
++ BD_PUBLIC struct mobj_objects *bd_read_mobj(const char *mobj_file);
++ /** Testing/debugging: Free parsed movie objects */
++@@ -1258,6 +1267,19 @@ BD_PUBLIC void bd_stop_bdj(BLURAY *bd);
++  */
++ BD_PUBLIC int bd_read_file(BLURAY *bd, const char *path, void **data, int64_t *size);
++ 
+++/**
+++ *
+++ * Get information about the clip
+++ *
+++ * @param bd  BLURAY object
+++ * @param clip clip index
+++ * @param clip_start_time start of the clip (in the total title) (in 90khz)
+++ * @param stream_start_time first pts in the clip (in 90khz)
+++ * @param byte position of the clip (absolute)
+++ * @param duration duration of the clip (in 90khz)
+++ */
+++BD_PUBLIC int bd_get_clip_infos(BLURAY *bd, unsigned clip, uint64_t *clip_start_time, uint64_t *stream_start_time, uint64_t *pos, uint64_t *duration);
+++
++ /**
++  *
++  *  Open a directory from BluRay Virtual File System.
++@@ -1289,6 +1311,16 @@ BD_PUBLIC struct bd_dir_s *bd_open_dir(BLURAY *bd, const char *dir);
++  */
++ BD_PUBLIC struct bd_file_s *bd_open_file_dec(BLURAY *bd, const char *path);
++ 
+++/**
+++ * Get the MPLS struct of the current title
+++ *
+++ * @param bd BLURAY object
+++ * @return the MPLS struct
+++ *
+++ * Lifetime of the MPLS pointer is limited to the lifetime of the BD title
+++ */
+++BD_PUBLIC struct mpls_pl *bd_get_title_mpls(BLURAY * bd);
+++
++ #ifdef __cplusplus
++ }
++ #endif
++diff --git a/src/libbluray/decoders/graphics_controller.c b/src/libbluray/decoders/graphics_controller.c
++index c837da3..094168c 100644
++--- a/src/libbluray/decoders/graphics_controller.c
+++++ b/src/libbluray/decoders/graphics_controller.c
++@@ -617,17 +617,27 @@ static void _render_composition_object(GRAPHICS_CONTROLLER *gc,
++         ov.img     = object->img;
++ 
++         if (cobj->crop_flag) {
++-            if (cobj->crop_x || cobj->crop_y || cobj->crop_w != object->width) {
+++            uint16_t crop_w, crop_h;
+++
+++            if (cobj->crop_x >= object->width || cobj->crop_y >= object->height ||
+++                !cobj->crop_w || !cobj->crop_h) {
+++                BD_DEBUG(DBG_DECODE | DBG_CRIT, "PG object crop outside of object\n");
+++                return;
+++            }
+++            crop_w = BD_MIN(cobj->crop_w, object->width - cobj->crop_x);
+++            crop_h = BD_MIN(cobj->crop_h, object->height - cobj->crop_y);
+++
+++            if (cobj->crop_x || cobj->crop_y || crop_w != object->width) {
++                 cropped_img = rle_crop_object(object->img, object->width,
++-                                              cobj->crop_x, cobj->crop_y, cobj->crop_w, cobj->crop_h);
+++                                              cobj->crop_x, cobj->crop_y, crop_w, crop_h);
++                 if (!cropped_img) {
++                     BD_DEBUG(DBG_DECODE | DBG_CRIT, "Error cropping PG object\n");
++                     return;
++                 }
++                 ov.img = cropped_img;
++             }
++-            ov.w  = cobj->crop_w;
++-            ov.h  = cobj->crop_h;
+++            ov.w  = crop_w;
+++            ov.h  = crop_h;
++         }
++ 
++         ov.palette_update_flag = palette_update_flag;
++@@ -725,6 +735,8 @@ static void _select_page(GRAPHICS_CONTROLLER *gc, uint16_t page_id, int out_effe
++ 
++     if (gc->ig_open && !gc->out_effects) {
++         _clear_osd(gc, BD_OVERLAY_IG);
+++        /* the clear reaches the display even when the new page draws nothing */
+++        gc->ig_dirty = 1;
++     }
++ }
++ 
++@@ -1524,6 +1536,33 @@ static int _render_page(GRAPHICS_CONTROLLER *gc,
++ #define VK_IS_CURSOR(vk)  (vk >= BD_VK_UP && vk <= BD_VK_RIGHT)
++ #define VK_TO_NUMBER(vk)  ((vk) - BD_VK_0)
++ 
+++/* an always-on page takes keys while shown, also when its buttons draw nothing */
+++static int _page_takes_input(GRAPHICS_CONTROLLER *gc)
+++{
+++    PG_DISPLAY_SET *s       = gc->igs;
+++    unsigned        page_id = bd_psr_read(gc->regs, PSR_MENU_PAGE_ID);
+++    BD_IG_PAGE     *page;
+++    unsigned        ii;
+++
+++    if (!gc->ig_open || gc->in_effects || gc->out_effects ||
+++        s->ics->interactive_composition.ui_model != IG_UI_MODEL_ALWAYS_ON) {
+++        return 0;
+++    }
+++
+++    page = _find_page(&s->ics->interactive_composition, page_id);
+++    if (!page) {
+++        return 0;
+++    }
+++
+++    for (ii = 0; ii < page->num_bogs; ii++) {
+++        if (_find_button_bog(&page->bog[ii], gc->bog_data[ii].enabled_button)) {
+++            return 1;
+++        }
+++    }
+++
+++    return 0;
+++}
+++
++ static int _user_input(GRAPHICS_CONTROLLER *gc, uint32_t key, GC_NAV_CMDS *cmds)
++ {
++     PG_DISPLAY_SET *s          = gc->igs;
++@@ -1543,7 +1582,7 @@ static int _user_input(GRAPHICS_CONTROLLER *gc, uint32_t key, GC_NAV_CMDS *cmds)
++         return -1;
++     }
++ 
++-    if (!gc->ig_drawn) {
+++    if (!gc->ig_drawn && !_page_takes_input(gc)) {
++         GC_ERROR("_user_input(): menu not visible\n");
++         return 0;
++     }
++@@ -2079,7 +2118,7 @@ int gc_run(GRAPHICS_CONTROLLER *gc, gc_ctrl_e ctrl, uint32_t param, GC_NAV_CMDS
++         if (gc->igs->ics->interactive_composition.ui_model == IG_UI_MODEL_POPUP) {
++             cmds->status |= GC_STATUS_POPUP;
++         }
++-        if (gc->ig_drawn) {
+++        if (gc->ig_drawn || _page_takes_input(gc)) {
++             cmds->status |= GC_STATUS_MENU_OPEN;
++         }
++         if (gc->in_effects || gc->out_effects || gc->button_animation_running || gc->user_timeout) {
++diff --git a/src/libbluray/decoders/graphics_processor.c b/src/libbluray/decoders/graphics_processor.c
++index 3638a6d..7fd1eeb 100644
++--- a/src/libbluray/decoders/graphics_processor.c
+++++ b/src/libbluray/decoders/graphics_processor.c
++@@ -102,7 +102,7 @@ static PES_BUFFER *_find_segment_by_idv(PES_BUFFER *p,
++                                         uint8_t seg_type, unsigned idv_pos,
++                                         uint8_t *idv, unsigned idv_len)
++ {
++-    while (p && (p->buf[0] != seg_type || memcmp(p->buf + idv_pos, idv, idv_len))) {
+++    while (p && (p->buf[0] != seg_type || p->len < idv_pos + idv_len || memcmp(p->buf + idv_pos, idv, idv_len))) {
++         p = p->next;
++     }
++     return p;
++@@ -159,9 +159,15 @@ static int _join_segment_fragments(struct pes_buffer_s *p)
++ 
++     /* check sequence descriptor - is segment complete ? */
++ 
+++    if (p->len < sd_pos + 1) {
+++        /* invalid, incomplete header */
+++        BD_DEBUG(DBG_DECODE|DBG_CRIT, "Missing header in segment 0x%02x, len=%u\n", type, p->len);
+++        return 1;
+++    }
+++
++     BD_PG_SEQUENCE_DESCRIPTOR sd;
++     BITBUFFER bb;
++-    bb_init(&bb, p->buf + sd_pos, 3);
+++    bb_init(&bb, p->buf + sd_pos, 1);
++     pg_decode_sequence_descriptor(&bb, &sd);
++ 
++     if (sd.last_in_seq) {
++@@ -176,10 +182,19 @@ static int _join_segment_fragments(struct pes_buffer_s *p)
++     PES_BUFFER *next;
++     while (NULL != (next = _find_segment_by_idv(p->next, p->buf[0], id_pos, p->buf + id_pos, id_len))) {
++ 
++-        bb_init(&bb, next->buf + sd_pos, 3);
+++        if (next->len < sd_pos + 1) {
+++            /* invalid, incomplete header */
+++            BD_DEBUG(DBG_DECODE|DBG_CRIT, "Missing header in segment 0x%02x, len=%u\n", type, next->len);
+++            pes_buffer_remove(&p, next);
+++            continue;
+++        }
+++
+++        bb_init(&bb, next->buf + sd_pos, 1);
++         pg_decode_sequence_descriptor(&bb, &sd);
++ 
++-        _join_fragments(p, next, data_pos);
+++        if (next->len > data_pos /* at least one byte of payload */) {
+++            _join_fragments(p, next, data_pos);
+++        }
++ 
++         pes_buffer_remove(&p, next);
++ 
++diff --git a/src/libbluray/decoders/m2ts_demux.c b/src/libbluray/decoders/m2ts_demux.c
++index 73bd4d9..1319a55 100644
++--- a/src/libbluray/decoders/m2ts_demux.c
+++++ b/src/libbluray/decoders/m2ts_demux.c
++@@ -180,9 +180,17 @@ static int _parse_pes(PES_BUFFER *p, uint8_t *buf, unsigned len)
++         }
++ 
++         if (pts_exists) {
+++            if (hdr_len < 14) {
+++                BD_DEBUG(DBG_DECODE, "invalid BDAV TS (PES header too short for PTS)\n");
+++                return -1;
+++            }
++             p->pts = _parse_timestamp(buf + 9);
++         }
++         if (dts_exists) {
+++            if (hdr_len < 19) {
+++                BD_DEBUG(DBG_DECODE, "invalid BDAV TS (PES header too short for DTS)\n");
+++                return -1;
+++            }
++             p->dts = _parse_timestamp(buf + 14);
++         }
++     }
++diff --git a/src/libbluray/decoders/m2ts_filter.c b/src/libbluray/decoders/m2ts_filter.c
++index b5f64ca..32d3e1e 100644
++--- a/src/libbluray/decoders/m2ts_filter.c
+++++ b/src/libbluray/decoders/m2ts_filter.c
++@@ -56,7 +56,8 @@ struct m2ts_filter_s
++ 
++ M2TS_FILTER *m2ts_filter_init(int64_t in_pts, int64_t out_pts,
++                               unsigned num_video, unsigned num_audio,
++-                              unsigned num_ig, unsigned num_pg)
+++                              unsigned num_ig, unsigned num_pg,
+++                              uint16_t el_pid)
++ {
++     M2TS_FILTER *p = calloc(1, sizeof(*p));
++ 
++@@ -66,8 +67,8 @@ M2TS_FILTER *m2ts_filter_init(int64_t in_pts, int64_t out_pts,
++ 
++         p->in_pts   = in_pts;
++         p->out_pts  = out_pts;
++-        p->wipe_pid = calloc(num_audio + num_video + num_ig + num_pg + 1, sizeof(uint16_t));
++-        p->pass_pid = calloc(num_audio + num_video + num_ig + num_pg + 1, sizeof(uint16_t));
+++        p->wipe_pid = calloc(num_audio + num_video + num_ig + num_pg + 2, sizeof(uint16_t));
+++        p->pass_pid = calloc(num_audio + num_video + num_ig + num_pg + 2, sizeof(uint16_t));
++         if (!p->pass_pid || !p->wipe_pid) {
++             m2ts_filter_close(&p);
++             return NULL;
++@@ -78,6 +79,16 @@ M2TS_FILTER *m2ts_filter_init(int64_t in_pts, int64_t out_pts,
++         for (ii = 0, npid = 0; ii < num_video; ii++) {
++             pid[npid++] = HDMV_PID_VIDEO + ii;
++         }
+++        /* The Dolby Vision enhancement layer is cut at the playitem's in/out
+++         * time exactly like the base layer it belongs to. It is not in the
+++         * STN video list, so without this every EL access unit before the in
+++         * time (a non-seamless playitem starting inside a clip: the previous
+++         * playitem's tail, or the DV EL recovery rewind) reached the demuxer
+++         * as a duplicate with no base layer to pair with. Kept sorted: the
+++         * EL PID (0x1012..0x101f) follows the base video PIDs. */
+++        if (el_pid > HDMV_PID_VIDEO + num_video - 1 && el_pid < HDMV_PID_AUDIO_FIRST) {
+++            pid[npid++] = el_pid;
+++        }
++         for (ii = 0; ii < num_audio; ii++) {
++             pid[npid++] = HDMV_PID_AUDIO_FIRST + ii;
++         }
++@@ -259,9 +270,9 @@ static int _filter_es_pts(M2TS_FILTER *p, const uint8_t *buf, uint16_t pid)
++ 
++ static void _wipe_packet(uint8_t *p)
++ {
++-    /* set pid to 0x1fff (padding) */
+++    /* set pid to 0x1fff (padding), not a PES start */
++     p[4 + 2] = 0xff;
++-    p[4 + 1] |= 0x1f;
+++    p[4 + 1] = 0x1f;
++ }
++ 
++ int m2ts_filter(M2TS_FILTER *p, uint8_t *buf)
++diff --git a/src/libbluray/decoders/m2ts_filter.h b/src/libbluray/decoders/m2ts_filter.h
++index d84e352..767c6be 100644
++--- a/src/libbluray/decoders/m2ts_filter.h
+++++ b/src/libbluray/decoders/m2ts_filter.h
++@@ -31,9 +31,12 @@
++ 
++ typedef struct m2ts_filter_s M2TS_FILTER;
++ 
+++/* el_pid: an in-mux Dolby Vision enhancement-layer video PID to gate with the
+++ * base layer (0 = none) */
++ BD_PRIVATE M2TS_FILTER *m2ts_filter_init(int64_t in_pts, int64_t out_pts,
++                                          unsigned num_video, unsigned num_audio,
++-                                         unsigned num_ig, unsigned num_pg);
+++                                         unsigned num_ig, unsigned num_pg,
+++                                         uint16_t el_pid);
++ BD_PRIVATE void         m2ts_filter_close(M2TS_FILTER **);
++ 
++ /*
++diff --git a/src/libbluray/decoders/pg_decode.c b/src/libbluray/decoders/pg_decode.c
++index 5ccc1fa..03b0b0d 100644
++--- a/src/libbluray/decoders/pg_decode.c
+++++ b/src/libbluray/decoders/pg_decode.c
++@@ -28,6 +28,7 @@
++ #include "util/logging.h"
++ #include "util/bits.h"
++ 
+++#include <inttypes.h>
++ #include <string.h>
++ #include <stdlib.h>
++ 
++@@ -122,13 +123,16 @@ int pg_decode_palette(BITBUFFER *bb, BD_PG_PALETTE *p)
++ static int _decode_rle(BITBUFFER *bb, BD_PG_OBJECT *p)
++ {
++     BD_PG_RLE_ELEM *tmp;
++-    int pixels_left = p->width * p->height;
+++    int64_t pixels_left = (int64_t)p->width * p->height;
+++    int rle_size        = (int)(pixels_left / 4);
++     int num_rle     = 0;
++-    int rle_size    = p->width * p->height / 4;
++ 
++     if (rle_size < 1)
++         rle_size = 1;
++ 
+++    if (rle_size > 65536)
+++        rle_size = 65536;
+++
++     tmp = refcnt_realloc(p->img, rle_size * sizeof(BD_PG_RLE_ELEM), NULL);
++     if (!tmp) {
++         BD_DEBUG(DBG_DECODE | DBG_CRIT, "pg_decode_object(): realloc failed\n");
++@@ -163,7 +167,7 @@ static int _decode_rle(BITBUFFER *bb, BD_PG_OBJECT *p)
++         pixels_left -= len;
++ 
++         if (pixels_left < 0) {
++-            BD_DEBUG(DBG_DECODE, "pg_decode_object(): too many pixels (%d)\n", -pixels_left);
+++            BD_DEBUG(DBG_DECODE, "pg_decode_object(): too many pixels (%" PRId64 ")\n", -pixels_left);
++             return 0;
++         }
++ 
++@@ -180,7 +184,7 @@ static int _decode_rle(BITBUFFER *bb, BD_PG_OBJECT *p)
++     }
++ 
++     if (pixels_left > 0) {
++-        BD_DEBUG(DBG_DECODE, "pg_decode_object(): missing %d pixels\n", pixels_left);
+++        BD_DEBUG(DBG_DECODE, "pg_decode_object(): missing %" PRId64 " pixels\n", pixels_left);
++         return 0;
++     }
++ 
++diff --git a/src/libbluray/hdmv/hdmv_vm.c b/src/libbluray/hdmv/hdmv_vm.c
++index 7d6aa34..7260ee9 100644
++--- a/src/libbluray/hdmv/hdmv_vm.c
+++++ b/src/libbluray/hdmv/hdmv_vm.c
++@@ -685,6 +685,9 @@ static int _link_at(HDMV_VM *p, int playitem, int playmark)
++         _queue_event(p, HDMV_EVENT_PLAY_PM, playmark);
++     }
++ 
+++    /* terminate */
+++    p->pc = 1 << 17;
+++
++     return 0;
++ }
++ 
++@@ -1134,7 +1137,11 @@ static int _hdmv_step(HDMV_VM *p)
++                 BD_DEBUG(DBG_HDMV|DBG_CRIT, "missing operand in BRANCH/JUMP opcode 0x%08x\n", *(uint32_t*)insn);
++             }
++             switch (insn->cmp_opt) {
++-                case INSN_BC: p->pc += !!(dst & ~src); break;
+++                /* Condition passes when all bits of src (the mask) are set
+++                 * in dst (the register). The previous (dst & ~src) subset
+++                 * test had the operands reversed and never checked the
+++                 * requested bits at all (upstream libbluray MR 76). */
+++                case INSN_BC: p->pc += !!(src & ~dst); break;
++                 case INSN_EQ: p->pc += !(dst == src); break;
++                 case INSN_NE: p->pc += !(dst != src); break;
++                 case INSN_GE: p->pc += !(dst >= src); break;
++@@ -1169,10 +1176,10 @@ static int _hdmv_step(HDMV_VM *p)
++                         case INSN_AND:    dst &= src;         break;
++                         case INSN_OR:     dst |= src;         break;
++                         case INSN_XOR:    dst ^= src;         break;
++-                        case INSN_BITSET: dst |=  (1 << src); break;
++-                        case INSN_BITCLR: dst &= ~(1 << src); break;
++-                        case INSN_SHL:    dst <<= src;        break;
++-                        case INSN_SHR:    dst >>= src;        break;
+++                        case INSN_BITSET: if (src < 32) dst |=  (1 << src); break;
+++                        case INSN_BITCLR: if (src < 32) dst &= ~(1 << src); break;
+++                        case INSN_SHL:    if (src < 32) dst <<= src; else dst = 0; break;
+++                        case INSN_SHR:    if (src < 32) dst >>= src; else dst = 0; break;
++                         default:
++                             BD_DEBUG(DBG_HDMV|DBG_CRIT, "unknown SET option %d in opcode 0x%08x\n",
++                                      insn->set_opt, *(uint32_t*)insn);
++diff --git a/src/libbluray/meson.build b/src/libbluray/meson.build
++index e0dcb91..55e46d5 100644
++--- a/src/libbluray/meson.build
+++++ b/src/libbluray/meson.build
++@@ -7,8 +7,10 @@ libbluray_api_headers = files(
++     '../util/log_control.h',
++     'bluray.h',
++     'bdnav/clpi_data.h',
+++    'bdnav/mpls_data.h',
++     'keys.h',
++     'bdnav/meta_data.h',
+++    'bdnav/uo_mask_table.h',
++     'decoders/overlay.h',
++     'player_settings.h',
++ )
++diff --git a/src/util/bits.c b/src/util/bits.c
++index 670ef98..896f7b9 100644
++--- a/src/util/bits.c
+++++ b/src/util/bits.c
++@@ -28,6 +28,7 @@
++ 
++ #include "file/file.h"
++ #include "util/logging.h"
+++#include "util/macro.h"
++ 
++ #include <stdio.h>  // SEEK_*
++ 
++@@ -44,7 +45,7 @@ void bb_init( BITBUFFER *bb, const uint8_t *p_data, size_t i_data )
++     bb->i_left  = 8;
++ }
++ 
++-static int _bs_read( BITSTREAM *bs)
+++static BD_USED int _bs_read( BITSTREAM *bs)
++ {
++     int result = 0;
++     int64_t got;
++@@ -62,7 +63,7 @@ static int _bs_read( BITSTREAM *bs)
++     return result;
++ }
++ 
++-static int _bs_read_at( BITSTREAM *bs, int64_t off )
+++static BD_USED int _bs_read_at( BITSTREAM *bs, int64_t off )
++ {
++     if (file_seek(bs->fp, off, SEEK_SET) < 0) {
++         BD_DEBUG(DBG_FILE | DBG_CRIT, "bs_read(): seek failed\n");
++@@ -73,6 +74,19 @@ static int _bs_read_at( BITSTREAM *bs, int64_t off )
++     return _bs_read(bs);
++ }
++ 
+++static void _bs_refill( BITSTREAM *bs )
+++{
+++    int64_t pos = bs->pos + (bs->bb.p - bs->bb.p_start);
+++    int left = bs->bb.i_left;
+++
+++    if (_bs_read_at(bs, pos) < 0) {
+++        /* seek failed: treat as EOF */
+++        bs->size = 0;
+++        bb_init(&bs->bb, bs->buf, 0);
+++    }
+++    bs->bb.i_left = left;
+++}
+++
++ int bs_init( BITSTREAM *bs, BD_FILE_H *fp )
++ {
++     int64_t size = file_size(fp);;
++@@ -184,6 +198,11 @@ uint32_t bb_read( BITBUFFER *bb, int i_count )
++     int      i_shr;
++     uint32_t i_result = 0;
++ 
+++    if (i_count > 32) {
+++        BD_ASSERT(i_count <= 32);
+++        i_count = 32;
+++    }
+++
++     while( i_count > 0 ) {
++ 
++         if( bb->p >= bb->p_end ) {
++@@ -214,16 +233,16 @@ uint32_t bb_read( BITBUFFER *bb, int i_count )
++ 
++ uint32_t bs_read( BITSTREAM *bs, int i_count )
++ {
++-    int left;
++-    int bytes = (i_count + 7) >> 3;
+++    int bytes;
+++
+++    if (i_count > 32) {
+++        BD_ASSERT(i_count <= 32);
+++        i_count = 32;
+++    }
+++    bytes = (i_count + 7) >> 3;
++ 
++     if (bs->bb.p + bytes >= bs->bb.p_end) {
++-        bs->pos = bs->pos + (bs->bb.p - bs->bb.p_start);
++-        left = bs->bb.i_left;
++-        file_seek(bs->fp, bs->pos, SEEK_SET);
++-        bs->size = file_read(bs->fp, bs->buf, BF_BUF_SIZE);
++-        bb_init(&bs->bb, bs->buf, bs->size);
++-        bs->bb.i_left = left;
+++        _bs_refill(bs);
++     }
++     return bb_read(&bs->bb, i_count);
++ }
++@@ -241,16 +260,10 @@ void bb_skip( BITBUFFER *bb, size_t i_count )
++ 
++ void bs_skip( BITSTREAM *bs, size_t i_count )
++ {
++-    int left;
++     size_t bytes = (i_count + 7) >> 3;
++ 
++     if (bs->bb.p + bytes >= bs->bb.p_end) {
++-        bs->pos = bs->pos + (bs->bb.p - bs->bb.p_start);
++-        left = bs->bb.i_left;
++-        file_seek(bs->fp, bs->pos, SEEK_SET);
++-        bs->size = file_read(bs->fp, bs->buf, BF_BUF_SIZE);
++-        bb_init(&bs->bb, bs->buf, bs->size);
++-        bs->bb.i_left = left;
+++        _bs_refill(bs);
++     }
++     bb_skip(&bs->bb, i_count);
++ }
++diff --git a/src/util/macro.h b/src/util/macro.h
++index 9b8595a..53e3043 100644
++--- a/src/util/macro.h
+++++ b/src/util/macro.h
++@@ -33,6 +33,13 @@
++ 
++ #define BD_MAX_SSIZE ((int64_t)(((size_t)-1)>>1))
++ 
+++#define BD_ASSERT(p)                                      \
+++  do {                                                    \
+++    if (!(p)) {                                           \
+++      BD_DEBUG(DBG_CRIT, "assertion failed: '%s'\n", #p); \
+++    }                                                     \
+++  } while (0)
+++
++ /*
++  * automatic cast from void* (malloc/calloc/realloc)
++  */
+diff --git a/contrib/src/bluray/rules.mak b/contrib/src/bluray/rules.mak
+index 7310eae7a0..e78e6c3e8b 100644
+--- a/contrib/src/bluray/rules.mak
++++ b/contrib/src/bluray/rules.mak
+@@ -1,6 +1,6 @@
+ # LIBBLURAY
+ 
+-BLURAY_VERSION := 1.4.1
++BLURAY_VERSION := 1.5.0
+ BLURAY_URL := $(VIDEOLAN)/libbluray/$(BLURAY_VERSION)/libbluray-$(BLURAY_VERSION).tar.xz
+ 
+ ifdef BUILD_DISCS
+@@ -46,6 +46,7 @@ $(TARBALLS)/libbluray-$(BLURAY_VERSION).tar.xz:
+ 
+ bluray: libbluray-$(BLURAY_VERSION).tar.xz .sum-bluray
+ 	$(UNPACK)
++	$(APPLY) $(SRC)/bluray/libbluray-samurihl.patch
+ 	$(MOVE)
+ 
+ .bluray: bluray crossfile.meson
+-- 
+2.47.3
+

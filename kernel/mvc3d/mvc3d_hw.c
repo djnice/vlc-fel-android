@@ -714,6 +714,32 @@ static ssize_t hw_write(struct file *f, const char __user *u, size_t n, loff_t *
 
 	if (copy_from_user(c, u, min(n, sizeof(c) - 1)))
 		return -EFAULT;
+	/*
+	 * "gui2": the GUI in both views while frame packed (the OSD over the whole frame packed picture, the player
+	 * draws it twice: see plane_stereo()), until this file's close or "gui1"
+	 */
+	if (!strncmp(c, "gui", 3)) {
+		bool on = c[3] == '2';
+
+		if (!plane_probe_on)
+			return -ENODEV;
+		mutex_lock(&h->mlock);
+		if (on) {
+			osd_stereo_owner = f;
+		} else if (osd_stereo_owner == f || !osd_stereo_owner) {
+			osd_stereo_owner = NULL;
+		} else {
+			mutex_unlock(&h->mlock);
+			return -EBUSY;
+		}
+		if (READ_ONCE(osd_stereo) != on) {
+			plane_stereo_forget();
+			WRITE_ONCE(osd_stereo, on);
+			pr_info(HW_NAME ": the GUI in %s\n", on ? "both views" : "the left view");
+		}
+		mutex_unlock(&h->mlock);
+		return n;
+	}
 	if (strncmp(c, "arm", 3))
 		return -EINVAL;
 	if (!fp_probe_on)
@@ -732,10 +758,12 @@ static ssize_t hw_write(struct file *f, const char __user *u, size_t n, loff_t *
 
 static ssize_t hw_read(struct file *f, char __user *u, size_t n, loff_t *pos)
 {
-	char c[48];
+	char c[64];
 	loff_t at = 0;	/* always the whole line: a status */
-	int len = scnprintf(c, sizeof(c), "armed=%d on=%d started=%d\n", READ_ONCE(fp_client), READ_ONCE(fp_out),
-			    READ_ONCE(ghw->started) || READ_ONCE(gdev->owner));
+	/* gui: the GUI in both views (no "gui=": a module without it) */
+	int len = scnprintf(c, sizeof(c), "armed=%d on=%d started=%d gui=%d\n", READ_ONCE(fp_client),
+			    READ_ONCE(fp_out), READ_ONCE(ghw->started) || READ_ONCE(gdev->owner),
+			    READ_ONCE(osd_stereo));
 
 	return simple_read_from_buffer(u, n, &at, c, len);
 }
@@ -750,6 +778,12 @@ static int hw_release(struct inode *inode, struct file *f)
 			hw_stop(h);
 		WRITE_ONCE(fp_client, false);
 		h->owner = NULL;
+	}
+	if (osd_stereo_owner == f) {
+		osd_stereo_owner = NULL;
+		plane_stereo_forget();
+		WRITE_ONCE(osd_stereo, false);
+		pr_info(HW_NAME ": the GUI in the left view (closed)\n");
 	}
 	if (fp_armer == f) {
 		fp_armer = NULL;

@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later WITH Linux-syscall-note */
-/* Copyright (C) 2026 djnice <djnice@freemail.hu> */
 /*
  * mvc3d userspace interface (/dev/mvc3d)
  *
@@ -33,7 +32,7 @@
 
 #define MVC3D_DEV		"/dev/mvc3d"
 /* module version (/sys/module/mvc3d/version) */
-#define MVC3D_VERSION		"2026.11.06.1"
+#define MVC3D_VERSION		"2026.11.24.2"
 /* the S905X4 (SC2) module (mvc3d_sc2.c: /dev/mvc3dhw only, MVC3D_HW_F_DIRECT) */
 #define MVC3D_SC2_VERSION "2026.11.06.8-sc2"
 

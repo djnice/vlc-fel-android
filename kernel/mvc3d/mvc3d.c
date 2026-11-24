@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 djnice <djnice@freemail.hu>
 /*
  * mvc3d - 3D MVC frame packed output for Amlogic S5 (S928X) Android
  *
@@ -47,6 +46,8 @@
 #include <linux/kallsyms.h>
 #include <linux/ptrace.h>
 #include <drm/drm_plane.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_modes.h>
 #include <linux/amlogic/media/vfm/vframe.h>
 #include <linux/amlogic/media/vfm/vframe_provider.h>
 #include <linux/amlogic/media/vfm/vframe_receiver.h>
@@ -354,12 +355,121 @@ static bool fp_2160;
  * packed output shows its top left quarter, enlarged. While so, the plane
  * check gets the destination halved, which puts the GUI where it is on a
  * 1080p desktop (the left view's lines).
+ *
+ * The GUI in both views: "gui2" written on /dev/mvc3dhw by the player (until
+ * that file's close or "gui1"). The OSD planes then cover the whole frame
+ * packed picture (L, active space, R; 1920x2205), their destination scaled
+ * from the mode's coordinates (1080 or 2160 lines: the screen's upper
+ * 1080 / 2205 is the left view, its lower 1080 / 2205 the right one); the
+ * player draws its GUI twice, squeezed, once in each view's rows. The plane
+ * check clips the destination to the mode: while it runs, the mode has the
+ * frame packed size (restored on its return).
  */
-static int plane_check_pre(struct kprobe *p, struct pt_regs *regs)
+static bool osd_stereo;
+static struct file *osd_stereo_owner;	/* the file that asked for it (mvc3d_hw.c) */
+
+/*
+ * per plane: the destination set here last. A plane state duplicated from
+ * it (a commit that only changes the plane's buffer) has it already.
+ */
+#define PLANE_SLOTS	8
+static struct {
+	struct drm_plane *plane;
+	int x, y;
+	unsigned int w, h;
+} plane_last[PLANE_SLOTS];
+static DEFINE_SPINLOCK(plane_lock);
+static u64 plane_stereo_checks;
+
+struct plane_call {
+	struct drm_display_mode *mode;	/* its size changed for the check, restored after */
+	int hdisplay, vdisplay;
+};
+
+static void plane_stereo(struct drm_plane_state *state, struct plane_call *c)
+{
+	struct drm_crtc_state *cs = state->state ?
+		drm_atomic_get_new_crtc_state(state->state, state->crtc) : NULL;
+	struct drm_display_mode *m = cs ? &cs->mode : NULL;
+	int fw, fh, hd, vd, i, slot = -1;
+	unsigned long flags;
+	bool found = false;
+
+	if (!m || m->hdisplay <= 0 || m->vdisplay <= 0)
+		return;
+	hd = m->hdisplay;
+	vd = m->vdisplay;
+	/* the frame packed picture: 1080p (also for a 2160p mode) or 720p */
+	if (vd == 720 && hd == 1280) {
+		fw = 1280;
+		fh = 720 * 2 + 30;
+	} else {
+		fw = 1920;
+		fh = 1080 * 2 + 45;
+	}
+	spin_lock_irqsave(&plane_lock, flags);
+	for (i = 0; i < PLANE_SLOTS; i++) {
+		if (plane_last[i].plane == state->plane) {
+			slot = i;
+			found = true;
+			break;
+		}
+		if (slot < 0 && !plane_last[i].plane)
+			slot = i;
+	}
+	/*
+	 * field by field: an async update (a new buffer at the same place) puts
+	 * the user's x and y back into the plane's state, not w and h
+	 */
+	if (!found || state->crtc_y != plane_last[slot].y)
+		state->crtc_y = (int)div_s64((s64)state->crtc_y * fh + vd / 2, vd);
+	if (!found || state->crtc_h != plane_last[slot].h)
+		state->crtc_h = max((int)div_s64((s64)state->crtc_h * fh + vd / 2, vd), 1);
+	if (hd != fw) {
+		if (!found || state->crtc_x != plane_last[slot].x)
+			state->crtc_x = (int)div_s64((s64)state->crtc_x * fw + hd / 2, hd);
+		if (!found || state->crtc_w != plane_last[slot].w)
+			state->crtc_w = max((int)div_s64((s64)state->crtc_w * fw + hd / 2, hd), 1);
+	}
+	if (slot >= 0) {
+		plane_last[slot].plane = state->plane;
+		plane_last[slot].x = state->crtc_x;
+		plane_last[slot].y = state->crtc_y;
+		plane_last[slot].w = state->crtc_w;
+		plane_last[slot].h = state->crtc_h;
+	}
+	plane_stereo_checks++;
+	spin_unlock_irqrestore(&plane_lock, flags);
+	c->mode = m;
+	c->hdisplay = hd;
+	c->vdisplay = vd;
+	if (hd < fw)
+		m->hdisplay = fw;
+	m->vdisplay = fh;
+}
+
+static void plane_stereo_forget(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&plane_lock, flags);
+	memset(plane_last, 0, sizeof(plane_last));
+	spin_unlock_irqrestore(&plane_lock, flags);
+}
+
+static int plane_check_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct drm_plane_state *state = (struct drm_plane_state *)regs->regs[1];
+	struct plane_call *c = (struct plane_call *)ri->data;
 
-	if (!READ_ONCE(fp_2160) || !READ_ONCE(fp_out) || !state || !state->crtc)
+	c->mode = NULL;
+	if (!READ_ONCE(fp_out) || !state || !state->crtc)
+		return 0;
+	if (READ_ONCE(osd_stereo)) {
+		plane_stereo(state, c);
+		return 0;
+	}
+	if (!READ_ONCE(fp_2160))
 		return 0;
 	if (state->crtc_w > 1920 || state->crtc_h > 1080 || state->crtc_x >= 1920 ||
 	    state->crtc_y >= 1080) {
@@ -371,9 +481,23 @@ static int plane_check_pre(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
-static struct kprobe plane_check_probe = {
-	.symbol_name = "meson_plane_atomic_check",
-	.pre_handler = plane_check_pre,
+static int plane_check_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct plane_call *c = (struct plane_call *)ri->data;
+
+	if (c->mode) {
+		c->mode->hdisplay = c->hdisplay;
+		c->mode->vdisplay = c->vdisplay;
+	}
+	return 0;
+}
+
+static struct kretprobe plane_check_probe = {
+	.kp.symbol_name = "meson_plane_atomic_check",
+	.entry_handler = plane_check_entry,
+	.handler = plane_check_ret,
+	.data_size = sizeof(struct plane_call),
+	.maxactive = 8,
 };
 static bool plane_probe_on;
 
@@ -1921,6 +2045,8 @@ static int stats_show(struct seq_file *m, void *v)
 		   fp_probe_on ? "on" : "off", plane_probe_on ? " (+gui)" : "",
 		   fp_wanted() ? "wanted" : "not wanted", fp_out ? "frame packed" : "2D",
 		   fp_2160 ? " for 2160p" : "", fp_modesets, fp_applied, fp_enc_applied);
+	seq_printf(m, "gui: %s, plane checks in both views %llu\n",
+		   osd_stereo ? "both views" : "left view", plane_stereo_checks);
 	seq_printf(m, "display: frames per vsync gap 0:%llu 1:%llu 2:%llu 3:%llu 4+:%llu\n",
 		   d->disp_gap[0], d->disp_gap[1], d->disp_gap[2], d->disp_gap[3], d->disp_gap[4]);
 	spin_unlock_irqrestore(&d->lock, flags);
@@ -2030,7 +2156,7 @@ static int __init m3_init(void)
 	} else {
 		fp_probe_on = true;
 		/* the GUI on a 2160p desktop (optional) */
-		if (register_kprobe(&plane_check_probe))
+		if (register_kretprobe(&plane_check_probe))
 			pr_warn(DRV_NAME ": no probe on meson_plane_atomic_check: GUI misplaced in frame packing from 2160p\n");
 		else
 			plane_probe_on = true;
@@ -2064,7 +2190,7 @@ static void __exit m3_exit(void)
 
 	mvc3d_hw_exit();
 	if (plane_probe_on)
-		unregister_kprobe(&plane_check_probe);
+		unregister_kretprobe(&plane_check_probe);
 	if (fp_probe_on) {
 		unregister_kretprobe(&timing_probe);
 		unregister_kretprobe(&fmtpara_probe);

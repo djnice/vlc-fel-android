@@ -1,0 +1,149 @@
+From e29a1a035c5563a1031fb1f14cfda6120539af18 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 23 Nov 2026 15:19:06 +0000
+Subject: [PATCH 66/67] ts: --ts-seek-index, the player's key frames: time
+ seeks without a search
+
+A new option: --ts-seek-index, a file of the stream's key frames, one
+per line - the time from its start (us) and the byte offset, ascending.
+A time seek goes to the key frame at or before the time without the
+binary search (over the network some 30 reads); a precise one from the
+key frame before that one, its pictures up to the time preroll: an open
+GOP key frame's first pictures refer to the ones before it, started
+there they showed broken blocks for half a second. It works before the
+first PCR too (the start time). CineFuze writes it for a 3D Blu-ray:
+the base view's EP map placed in the .ssif by both views' extents.
+
+Message-Id: <20261123-ts-seek-index@djnice>
+---
+ modules/demux/mpeg/ts.c | 68 +++++++++++++++++++++++++++++++++++++++++
+ modules/demux/mpeg/ts.h |  6 ++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 3c0e802c5a..9a8b8e3771 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -35,6 +35,7 @@
+ #include <vlc_access.h>    /* DVB-specific things */
+ #include <vlc_demux.h>
+ #include <vlc_input.h>
++#include <vlc_fs.h>
+ 
+ #include "ts_pid.h"
+ #include "ts_streams.h"
+@@ -161,6 +162,12 @@ vlc_module_begin ()
+ 
+     add_bool( "ts-split-es", true, SPLIT_ES_TEXT, SPLIT_ES_LONGTEXT, false )
+     add_bool( "ts-seek-percent", false, SEEK_PERCENT_TEXT, SEEK_PERCENT_LONGTEXT, true )
++    add_string( "ts-seek-index", NULL, "Key frame index",
++                "A file of the stream's key frames, one per line: its time from "
++                "the start in microseconds and its byte offset, ascending (a "
++                "Blu-ray's EP map, a 3D film's place in its .ssif). Time seeks go "
++                "there without a search; a precise one from the key frame before.",
++                true )
+     add_bool( "ts-cc-check", true, CC_CHECK_TEXT, CC_CHECK_LONGTEXT, true )
+     add_bool( "ts-pmtfix-waitdata", true, TS_SKIP_GHOST_PROGRAM_TEXT, NULL, true )
+     add_bool( "ts-patfix", true, TS_PATFIX_TEXT, NULL, true )
+@@ -514,6 +521,41 @@ static int Open( vlc_object_t *p_this )
+     p_sys->b_ignore_time_for_positions = var_InheritBool( p_demux, "ts-seek-percent" );
+     p_sys->b_cc_check = var_InheritBool( p_demux, "ts-cc-check" );
+ 
++    p_sys->p_seek_time = NULL;
++    p_sys->p_seek_pos = NULL;
++    p_sys->i_seek_index = 0;
++    char *psz_index = var_InheritString( p_demux, "ts-seek-index" );
++    if( psz_index && *psz_index )
++    {
++        FILE *f = vlc_fopen( psz_index, "r" );
++        if( f )
++        {
++            size_t i_max = 0;
++            long long t, o;
++            while( fscanf( f, "%lld %lld", &t, &o ) == 2 )
++            {
++                if( p_sys->i_seek_index == i_max )
++                {
++                    i_max = i_max ? i_max * 2 : 4096;
++                    vlc_tick_t *pt = realloc( p_sys->p_seek_time, i_max * sizeof(*pt) );
++                    uint64_t *po = realloc( p_sys->p_seek_pos, i_max * sizeof(*po) );
++                    if( pt ) p_sys->p_seek_time = pt;
++                    if( po ) p_sys->p_seek_pos = po;
++                    if( !pt || !po )
++                        break;
++                }
++                p_sys->p_seek_time[p_sys->i_seek_index] = t;
++                p_sys->p_seek_pos[p_sys->i_seek_index] = o;
++                p_sys->i_seek_index++;
++            }
++            fclose( f );
++            msg_Info( p_demux, "key frame index: %zu entries from %s", p_sys->i_seek_index, psz_index );
++        }
++        else
++            msg_Warn( p_demux, "key frame index %s: not read", psz_index );
++    }
++    free( psz_index );
++
+     p_sys->standard = TS_STANDARD_AUTO;
+     char *psz_standard = var_InheritString( p_demux, "ts-standard" );
+     if( psz_standard )
+@@ -583,6 +625,8 @@ static void Close( vlc_object_t *p_this )
+     vlc_mutex_unlock( &p_sys->csa_lock );
+ 
+     ARRAY_RESET( p_sys->programs );
++    free( p_sys->p_seek_time );
++    free( p_sys->p_seek_pos );
+ 
+ #ifdef HAVE_ARIBB24
+     if ( p_sys->arib.p_instance )
+@@ -1056,6 +1100,30 @@ static int Control( demux_t *p_demux, int i_query, va_list args )
+          * frame back, paused: the same one again and again). From 3 s before
+          * (a Blu-ray's GOP is about 1 s) the key frame before it is read,
+          * the pictures up to the time are preroll. */
++        /* The player's key frame index (--ts-seek-index): the place without a
++         * search (over the network some 30 reads); a precise seek from the key
++         * frame before the time's one - an open GOP key frame's first pictures
++         * refer to the ones before it, started there they were broken blocks
++         * for half a second - its pictures up to the time preroll. Also before
++         * the first PCR (the start time). */
++        if( p_sys->i_seek_index > 0 && p_sys->b_canseek )
++        {
++            size_t k = 0;
++            while( k + 1 < p_sys->i_seek_index && p_sys->p_seek_time[k + 1] <= i64 )
++                k++;
++            if( b_bool && k > 0 )
++                k--;
++            if( vlc_stream_Seek( p_sys->stream, p_sys->p_seek_pos[k] ) == VLC_SUCCESS )
++            {
++                ReadyQueuesPostSeek( p_demux );
++                if( b_bool && p_pmt && p_pmt->pcr.i_first != VLC_TICK_INVALID )
++                    es_out_Control( p_demux->out, ES_OUT_SET_NEXT_DISPLAY_TIME,
++                                    p_pmt->pcr.i_first + i64 - VLC_TICK_0 );
++                msg_Dbg( p_demux, "seek to %"PRId64" by the index: key frame %zu at %"PRId64" (%"PRIu64")",
++                         i64, k, p_sys->p_seek_time[k], p_sys->p_seek_pos[k] );
++                return VLC_SUCCESS;
++            }
++        }
+         if( p_sys->b_canseek && p_pmt && p_pmt->pcr.i_first != VLC_TICK_INVALID &&
+            !SeekToTime( p_demux, p_pmt, p_pmt->pcr.i_first +
+                         (b_bool ? __MAX( i64 - 3 * CLOCK_FREQ, 0 ) : i64), b_bool ) )
+diff --git a/modules/demux/mpeg/ts.h b/modules/demux/mpeg/ts.h
+index 2f49236b59..b8975c1541 100644
+--- a/modules/demux/mpeg/ts.h
++++ b/modules/demux/mpeg/ts.h
+@@ -49,6 +49,12 @@ struct demux_sys_t
+     stream_t   *stream;
+     bool        b_canseek;
+     bool        b_canfastseek;
++
++    /* --ts-seek-index: the player's key frames (time from the start, byte
++     * offset; ascending) */
++    vlc_tick_t *p_seek_time;
++    uint64_t   *p_seek_pos;
++    size_t      i_seek_index;
+     vlc_mutex_t     csa_lock;
+ 
+     /* TS packet size (188, 192, 204) */
+-- 
+2.47.3
+

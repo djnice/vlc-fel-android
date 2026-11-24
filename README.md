@@ -295,7 +295,8 @@ the first MVC file is to play in 3D.
 - After a seek, 1–2 frames may be shown with the RPU mapping only (no EL residual), and the first frames
   after a seek may be a vsync late while the chain fills.
 - Subtitles and the OSD are VLC's as usual; Dolby Vision itself is shown by the player's DV core.
-- 3D MVC: the GUI (VLC's controls, subtitles) shows in the left view only; Blu-ray ISO images / folders play
+- 3D MVC: the GUI (VLC's controls, subtitles) shows in the left view only (the mvc3d module can put a player's GUI
+  into both views since 2026.11.24.2; CineFuze 1.7 does, VLC FEL not yet); Blu-ray ISO images / folders play
   in 2D; frame packing only on the tested firmware builds (elsewhere: 2D); 1080p and 720p MVC only. After a
   seek into an open GOP (Blu-ray discs), up to ~1 s may show the base view twice (2D) until the next key
   picture. Some projectors drop the HDMI connection when switching from a 2160p desktop to frame packing,
@@ -303,6 +304,13 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.23-poc** (mvc3d `2026.11.24.2` (S928X), libmvc3dplay `2026.11.24.2`, VLC patches 0060–0067; libdvfelplay,
+  the dvfel modules, the S905X4 mvc3d and the app patches unchanged): the libVLC of CineFuze 1.7
+  (`3.0.24-101-gd9645d814c`): HDR10+ on every picture for files that send it sparsely (0060), DTS-HD / DTS:X from
+  MP4 as bitstream (0061), Blu-ray menu highlights redrawn (0062), libbluray 1.5.0 with SamuriHL's fixes (0063),
+  exact fast seeks in TS / m2ts (0065); 0064, 0066 and 0067 are CineFuze's. The mvc3d module can put a player's GUI
+  into both views of frame packing (`gui2` on `/dev/mvc3dhw`; CineFuze 1.7 uses it). New **Dune HD plugin
+  `mvc3d 2026.11.24.2-0.2.23`** with this module.
 - **v0.2.22-poc** (libdvfelplay `2026.11.17.1`, VLC patches 0035–0058, libvlcjni patch 0002; the kernel modules,
   libmvc3dplay and the app patches unchanged): **S928X: FEL composition ~22% faster, bit for bit the same
   picture.** The GPU composer imports the frame buffers as `RGB10_A2` (their pixel word is `ABGR2101010`), so the

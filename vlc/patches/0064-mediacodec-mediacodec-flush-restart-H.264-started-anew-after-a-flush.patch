@@ -1,0 +1,84 @@
+From 2af547cac900bce87707bc8c09778014b1b5dba5 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 23 Nov 2026 12:54:09 +0000
+Subject: [PATCH 64/67] mediacodec: --mediacodec-flush-restart: H.264 started
+ anew after a flush
+
+A new option, off by default: an H.264 MediaCodec started anew on its
+next block after each flush (the player's flush or a discontinuity), not
+only flushed. Flushed, the Amlogic H.264 decoder of the S928X now and
+then reallocated its output pictures on the same surface and part of
+them were no longer video plane buffers: the composer took them to the
+GPU, the video plane went off and on several times a second and the
+picture flickered (a 3D Blu-ray's 2D trailers after its resume question,
+played with its menu: each next playlist flushes). A decoder started
+anew showed none of it. The player sets it for Blu-ray menus only, where
+a restart's ~0.1 s at a playlist change costs nothing. The hardware 3D
+MVC path (no MediaCodec) is left as it is.
+
+Message-Id: <20261123-mediacodec-flush-restart@djnice>
+---
+ modules/codec/omxil/mediacodec.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 1cfb98bacb..2a3a857b4a 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -850,6 +850,12 @@ vlc_module_begin ()
+     add_integer(CFG_PREFIX "mvc-hw", MVC_HW_ON,
+                 MEDIACODEC_MVC_HW_TEXT, MEDIACODEC_MVC_HW_LONGTEXT, true)
+         change_integer_list(pi_mvc_hw_values, ppsz_mvc_hw_names)
++    add_bool(CFG_PREFIX "flush-restart", false,
++             "Restart the H.264 decoder after a flush",
++             "An H.264 decoder started anew after each flush (a Blu-ray's next "
++             "playlist, a discontinuity, a seek), not only flushed: a flushed "
++             "Amlogic decoder reallocated its pictures and part of them were no "
++             "video plane buffers any more (the picture flickered).", true)
+     add_float(CFG_PREFIX "fps", 0.f,
+               MEDIACODEC_FPS_TEXT, MEDIACODEC_FPS_LONGTEXT, true)
+     add_bool(CFG_PREFIX "release-ahead", true,
+@@ -2074,12 +2080,31 @@ static void DecodeFlushLocked(decoder_t *p_dec)
+         vlc_cond_wait(&p_sys->dec_cond, &p_sys->lock);
+ }
+ 
++/* --mediacodec-flush-restart: an H.264 MediaCodec started anew after a flush
++ * (its next block), not only flushed. Flushed, the Amlogic H.264 decoder of
++ * the S928X now and then reallocated its output pictures on the same surface
++ * and part of them were no video plane buffers any more: the composer took
++ * them to the GPU, the video plane went off and on several times a second and
++ * the picture flickered (a Blu-ray played with its menu: its next playlist).
++ * A decoder started anew had none of it. The 3D MVC hardware path (no
++ * MediaCodec) is left as it is. */
++static bool FlushRestarts(decoder_t *p_dec)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    return !p_sys->b_aborted && p_dec->fmt_in.i_cat == VIDEO_ES
++        && p_dec->fmt_in.i_codec == VLC_CODEC_H264 && p_sys->api.b_started
++        && !p_sys->video.b_mvc_hw
++        && var_InheritBool(p_dec, CFG_PREFIX "flush-restart");
++}
++
+ static void DecodeFlush(decoder_t *p_dec)
+ {
+     decoder_sys_t *p_sys = p_dec->p_sys;
+ 
+     vlc_mutex_lock(&p_sys->lock);
+     DecodeFlushLocked(p_dec);
++    if (FlushRestarts(p_dec))
++        p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+     vlc_mutex_unlock(&p_sys->lock);
+ }
+ 
+@@ -2387,6 +2412,8 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
+             goto end;
+         if (p_in_block->i_flags & BLOCK_FLAG_CORRUPTED)
+             goto end;
++        if (FlushRestarts(p_dec))
++            p_sys->i_decode_flags |= DECODE_FLAG_RESTART;
+     }
+ 
+     if (p_in_block->i_flags & BLOCK_FLAG_INTERLACED_MASK
+-- 
+2.47.3
+
