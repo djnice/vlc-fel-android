@@ -34,7 +34,7 @@
 /* module version (/sys/module/mvc3d/version) */
 #define MVC3D_VERSION		"2026.11.24.2"
 /* the S905X4 (SC2) module (mvc3d_sc2.c: /dev/mvc3dhw only, MVC3D_HW_F_DIRECT) */
-#define MVC3D_SC2_VERSION "2026.11.06.8-sc2"
+#define MVC3D_SC2_VERSION "2026.11.26.4-sc2"
 
 #define MVC3D_MAX_BUFS		16
 #define MVC3D_FMT_UYVY		0

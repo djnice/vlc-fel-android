@@ -37,7 +37,12 @@
 #include <linux/mm.h>
 #include <linux/gfp.h>
 #include <linux/dma-mapping.h>
+#include <linux/namei.h>
+#include <linux/kernfs.h>
+#include <linux/device.h>
 #include <drm/drm_plane.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_modes.h>
 
 #include <linux/amlogic/media/vfm/vframe.h>
 #include <linux/amlogic/media/vfm/vframe_provider.h>
@@ -873,6 +878,9 @@ static bool fp_armed;		/* a client plays frame packed */
 static bool fp_on;		/* the hdmitx has our 3D flag (the last mode set was frame packed) */
 static char fp_attr_saved[FP_ATTR_LEN];
 static bool fp_attr_forced;
+/* while forced: the colour format the user space last wrote (else the saved one) - what amhdmitx0/attr reads */
+static char fp_attr_user[FP_ATTR_LEN];
+static u64 fp_attr_shown;
 static u64 fp_modesets, fp_maps;
 static char fp_dv_policy[8], fp_dv_mode[8];
 static bool fp_dv_saved;
@@ -986,7 +994,119 @@ static void fp_attr(bool force)
 	} else if (fp_attr_forced) {
 		memcpy(a, fp_attr_saved, FP_ATTR_LEN);
 		fp_attr_forced = false;
+		memset(fp_attr_user, 0, FP_ATTR_LEN);
 	}
+}
+
+/*
+ * amhdmitx0/attr while frame packed. The 8 bit 4:4:4 of the 3D clock table is not what the firmware's Auto HDR
+ * (SystemControl) wants for the mode (persist.sys.sctl.ahdr.stt.dc.*: ycc444,10bit): at every video content change
+ * - a seek, a chapter: the MVC decoder opened again, MVC -> NO VIDEO -> MVC - it read "444,8bit", wrote its own
+ * format and set the mode again: a new HDMI handshake each time (a projector: seconds without a picture), and the
+ * next mode set made it 8 bit again. So while forced, the attribute reads what the user space wrote last (the
+ * output stays 8 bit): the same, no mode set. Its write is kept for that and the 8 bit put back.
+ */
+static int attr_show_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	char *buf = *(char **)ri->data;
+	const char *a;
+	int n;
+
+	if (!READ_ONCE(fp_attr_forced) || !buf || (long)regs_return_value(regs) <= 0)
+		return 0;
+	a = fp_attr_user[0] ? fp_attr_user : fp_attr_saved;
+	n = strnlen(a, FP_ATTR_LEN);
+	if (!n)
+		return 0;
+	memcpy(buf, a, n);
+	buf[n] = '\n';
+	buf[n + 1] = 0;
+	regs_set_return_value(regs, n + 1);
+	fp_attr_shown++;
+	return 0;
+}
+
+static int attr_show_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	*(char **)ri->data = (char *)regs->regs[2];
+	return 0;
+}
+
+static struct kretprobe attr_show_probe = {
+	.entry_handler = attr_show_entry,
+	.handler = attr_show_ret,
+	.data_size = sizeof(char *),
+	.maxactive = 4,
+};
+
+static int attr_store_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	const char *buf = (const char *)regs->regs[2];
+	size_t count = (size_t)regs->regs[3];
+	char v[FP_ATTR_LEN];
+	size_t n;
+
+	if (!READ_ONCE(fp_attr_forced) || !buf)
+		return 0;
+	n = min(count, (size_t)FP_ATTR_LEN - 1);
+	memset(v, 0, sizeof(v));
+	memcpy(v, buf, n);
+	while (n && (v[n - 1] == '\n' || v[n - 1] == ' '))
+		v[--n] = 0;
+	if (n && strstr(v, "bit"))
+		memcpy(fp_attr_user, v, FP_ATTR_LEN);
+	return 0;
+}
+
+static int attr_store_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	char *a;
+
+	if (!READ_ONCE(fp_attr_forced))
+		return 0;
+	a = (char *)get_hdmitx_device() + FP_ATTR_OFF;
+	memset(a, 0, FP_ATTR_LEN);
+	memcpy(a, "444,8bit", 8);
+	return 0;
+}
+
+static struct kretprobe attr_store_probe = {
+	.entry_handler = attr_store_entry,
+	.handler = attr_store_ret,
+	.maxactive = 4,
+};
+static bool attr_probes_on;
+
+/* the show / store of amhdmitx0/attr (several functions of that name in aml_media: taken from the sysfs file) */
+static void attr_probes_init(void)
+{
+	struct path p;
+	struct kernfs_node *kn;
+	struct device_attribute *da;
+
+	if (kern_path("/sys/class/amhdmitx/amhdmitx0/attr", LOOKUP_FOLLOW, &p)) {
+		pr_warn(DRV_NAME ": no amhdmitx0/attr: its colour format reads 8 bit while frame packed\n");
+		return;
+	}
+	/* (5.4: the node of a positive kernfs dentry is its inode's i_private, as kernfs_dentry_node() takes it) */
+	kn = d_really_is_positive(p.dentry) ? d_inode(p.dentry)->i_private : NULL;
+	da = kn && kernfs_type(kn) == KERNFS_FILE && kn->priv ?
+		container_of((struct attribute *)kn->priv, struct device_attribute, attr) : NULL;
+	path_put(&p);
+	if (!da || !da->show || !da->store) {
+		pr_warn(DRV_NAME ": amhdmitx0/attr without its functions\n");
+		return;
+	}
+	attr_show_probe.kp.addr = (kprobe_opcode_t *)da->show;
+	attr_store_probe.kp.addr = (kprobe_opcode_t *)da->store;
+	if (register_kretprobe(&attr_show_probe))
+		return;
+	if (register_kretprobe(&attr_store_probe)) {
+		unregister_kretprobe(&attr_show_probe);
+		return;
+	}
+	attr_probes_on = true;
+	pr_info(DRV_NAME ": amhdmitx0/attr probed (%ps, %ps)\n", da->show, da->store);
 }
 
 static void fp_flag(bool on)
@@ -1131,13 +1251,115 @@ static void fp_arm(bool on)
 	}
 }
 
-/* the GUI on a 2160p Android mode with 1080p frame packing out: its destination halved (left view lines) */
-static int plane_check_pre(struct kprobe *p, struct pt_regs *regs)
+/*
+ * The GUI (OSD planes) while frame packed. Without more: on a 2160p Android mode with 1080p frame packing out,
+ * its destination halved (the left view's lines, where it is on a 1080p desktop).
+ *
+ * The GUI in both views (as on the S928X, mvc3d.c): "gui2" written on /dev/mvc3dhw by the player (until that
+ * file's close or "gui1"). The OSD planes then cover the whole frame packed picture (L, active space, R;
+ * 1920x2205), their destination scaled from the mode's coordinates (1080 or 2160 lines: the screen's upper
+ * 1080 / 2205 is the left view, its lower 1080 / 2205 the right one); the player draws its GUI twice, squeezed,
+ * once in each view's rows. The plane check clips the destination to the mode: while it runs, the mode has the
+ * frame packed size (restored on its return).
+ */
+static bool osd_stereo;
+static struct file *osd_stereo_owner;	/* the file that asked for it */
+
+/* per plane: the destination set here last (a state duplicated from it, a buffer change only, has it already) */
+#define PLANE_SLOTS	8
+static struct {
+	struct drm_plane *plane;
+	int x, y;
+	unsigned int w, h;
+} plane_last[PLANE_SLOTS];
+static DEFINE_SPINLOCK(plane_lock);
+static u64 plane_stereo_checks;
+
+struct plane_call {
+	struct drm_display_mode *mode;	/* its size changed for the check, restored after */
+	int hdisplay, vdisplay;
+};
+
+static void plane_stereo(struct drm_plane_state *state, struct plane_call *c)
+{
+	struct drm_crtc_state *cs = state->state ?
+		drm_atomic_get_new_crtc_state(state->state, state->crtc) : NULL;
+	struct drm_display_mode *m = cs ? &cs->mode : NULL;
+	int fw, fh, hd, vd, i, slot = -1;
+	unsigned long flags;
+	bool found = false;
+
+	if (!m || m->hdisplay <= 0 || m->vdisplay <= 0)
+		return;
+	hd = m->hdisplay;
+	vd = m->vdisplay;
+	/* the frame packed picture: 1080p (also for a 2160p mode) or 720p */
+	if (vd == 720 && hd == 1280) {
+		fw = 1280;
+		fh = 720 * 2 + 30;
+	} else {
+		fw = 1920;
+		fh = 1080 * 2 + 45;
+	}
+	spin_lock_irqsave(&plane_lock, flags);
+	for (i = 0; i < PLANE_SLOTS; i++) {
+		if (plane_last[i].plane == state->plane) {
+			slot = i;
+			found = true;
+			break;
+		}
+		if (slot < 0 && !plane_last[i].plane)
+			slot = i;
+	}
+	/* field by field: an async update (a new buffer at the same place) puts the user's x and y back, not w and h */
+	if (!found || state->crtc_y != plane_last[slot].y)
+		state->crtc_y = (int)div_s64((s64)state->crtc_y * fh + vd / 2, vd);
+	if (!found || state->crtc_h != plane_last[slot].h)
+		state->crtc_h = max((int)div_s64((s64)state->crtc_h * fh + vd / 2, vd), 1);
+	if (hd != fw) {
+		if (!found || state->crtc_x != plane_last[slot].x)
+			state->crtc_x = (int)div_s64((s64)state->crtc_x * fw + hd / 2, hd);
+		if (!found || state->crtc_w != plane_last[slot].w)
+			state->crtc_w = max((int)div_s64((s64)state->crtc_w * fw + hd / 2, hd), 1);
+	}
+	if (slot >= 0) {
+		plane_last[slot].plane = state->plane;
+		plane_last[slot].x = state->crtc_x;
+		plane_last[slot].y = state->crtc_y;
+		plane_last[slot].w = state->crtc_w;
+		plane_last[slot].h = state->crtc_h;
+	}
+	plane_stereo_checks++;
+	spin_unlock_irqrestore(&plane_lock, flags);
+	c->mode = m;
+	c->hdisplay = hd;
+	c->vdisplay = vd;
+	if (hd < fw)
+		m->hdisplay = fw;
+	m->vdisplay = fh;
+}
+
+static void plane_stereo_forget(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&plane_lock, flags);
+	memset(plane_last, 0, sizeof(plane_last));
+	spin_unlock_irqrestore(&plane_lock, flags);
+}
+
+static int plane_check_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct drm_plane_state *state = (struct drm_plane_state *)regs->regs[1];
+	struct plane_call *c = (struct plane_call *)ri->data;
 
+	c->mode = NULL;
 	if (!READ_ONCE(fp_on) || !state || !state->crtc)
 		return 0;
+	if (READ_ONCE(osd_stereo)) {
+		plane_stereo(state, c);
+		return 0;
+	}
 	if (state->crtc_w > 1920 || state->crtc_h > 1080 || state->crtc_x >= 1920 || state->crtc_y >= 1080) {
 		state->crtc_x /= 2;
 		state->crtc_y /= 2;
@@ -1147,9 +1369,23 @@ static int plane_check_pre(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
-static struct kprobe plane_check_probe = {
-	.symbol_name = "meson_plane_atomic_check",
-	.pre_handler = plane_check_pre,
+static int plane_check_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct plane_call *c = (struct plane_call *)ri->data;
+
+	if (c->mode) {
+		c->mode->hdisplay = c->hdisplay;
+		c->mode->vdisplay = c->vdisplay;
+	}
+	return 0;
+}
+
+static struct kretprobe plane_check_probe = {
+	.kp.symbol_name = "meson_plane_atomic_check",
+	.entry_handler = plane_check_entry,
+	.handler = plane_check_ret,
+	.data_size = sizeof(struct plane_call),
+	.maxactive = 8,
 };
 static bool plane_probe_on;
 
@@ -1474,7 +1710,7 @@ static void fp_init(void)
 		pr_warn(DRV_NAME ": no mode set probes: no frame packing\n");
 		return;
 	}
-	plane_probe_on = !register_kprobe(&plane_check_probe);
+	plane_probe_on = !register_kretprobe(&plane_check_probe);
 	win_probe_on = !register_kprobe(&win_probe);
 	if (vsf_code_ok())
 		vsf_probe_on = !register_kprobe(&vsf_probe);
@@ -1494,15 +1730,40 @@ static void fp_init(void)
 		vdpos_probe_on = !register_kprobe(&vdpos_probe);
 	if (!vskip_probe_on || !vdpos_probe_on)
 		pr_warn(DRV_NAME ": VPP not the r25 code: vskip fix %d, position fix %d\n", vskip_probe_on, vdpos_probe_on);
+	attr_probes_init();
 	fp_ok = true;
-	pr_info(DRV_NAME ": HDMI frame packing ready (attr \"%s\", GUI probe %s)\n", attr,
-		plane_probe_on ? "on" : "off");
+	pr_info(DRV_NAME ": HDMI frame packing ready (attr \"%s\", GUI probe %s, attr probes %s)\n", attr,
+		plane_probe_on ? "on" : "off", attr_probes_on ? "on" : "off");
+}
+
+/*
+ * Frame packing there, set up now if the load could not (process context): loaded at boot before the hdmitx had
+ * its first mode (the TV / projector not on yet: no cur_video_param), the layout check failed and 3D stayed off
+ * until the next boot (#96, the .101 started with the projector off). Tried again at a client's arm / start.
+ */
+static DEFINE_MUTEX(fp_init_lock);
+
+static bool fp_ensure(void)
+{
+	if (READ_ONCE(fp_ok))
+		return true;
+	mutex_lock(&fp_init_lock);
+	if (!fp_ok) {
+		pr_info(DRV_NAME ": frame packing set up again (not at the load)\n");
+		fp_init();
+	}
+	mutex_unlock(&fp_init_lock);
+	return READ_ONCE(fp_ok);
 }
 
 static void fp_exit(void)
 {
+	if (attr_probes_on) {
+		unregister_kretprobe(&attr_store_probe);
+		unregister_kretprobe(&attr_show_probe);
+	}
 	if (plane_probe_on)
-		unregister_kprobe(&plane_check_probe);
+		unregister_kretprobe(&plane_check_probe);
 	if (win_probe_on)
 		unregister_kprobe(&win_probe);
 	if (vsf_probe_on)
@@ -1650,7 +1911,7 @@ static long ioc_start(struct sc2_dev *h, void __user *p)
 		pr_warn(DRV_NAME ": no probes on the MVC decoder's allocations: hardware MVC refused (its 31 bit DMA corrupts memory)\n");
 		return -ENODEV;
 	}
-	if (s.mode == MVC3D_HW_FP && !fp_ok)
+	if (s.mode == MVC3D_HW_FP && !fp_ensure())
 		return -ENODEV;
 	/* (the last client's decoder, its process going: a moment for it) */
 	for (r = 0; h->routed && r < 75 && READ_ONCE(h->prov_reg); r++)
@@ -1825,7 +2086,7 @@ static long hw_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&on, p, sizeof(on)))
 			return -EFAULT;
 		/* frame packing is armed by MVC3D_HW_START in MVC3D_HW_FP mode */
-		return on && !fp_ok ? -ENODEV : 0;
+		return on && !fp_ensure() ? -ENODEV : 0;
 	}
 	}
 	return -ENOTTY;
@@ -1852,9 +2113,30 @@ static ssize_t hw_write(struct file *f, const char __user *u, size_t n, loff_t *
 
 	if (copy_from_user(c, u, min(n, sizeof(c) - 1)))
 		return -EFAULT;
-	if (strncmp(c, "arm", 3))
-		return -EINVAL;
-	if (!fp_ok)
+	/* "gui2": the GUI in both views while frame packed (see plane_stereo()), until this file's close or "gui1" */
+	if (!strncmp(c, "gui", 3)) {
+		bool on = c[3] == '2';
+
+		if (!plane_probe_on)
+			return -ENODEV;
+		mutex_lock(&h->mlock);
+		if (on) {
+			osd_stereo_owner = f;
+		} else if (osd_stereo_owner == f || !osd_stereo_owner) {
+			osd_stereo_owner = NULL;
+		} else {
+			mutex_unlock(&h->mlock);
+			return -EBUSY;
+		}
+		if (READ_ONCE(osd_stereo) != on) {
+			plane_stereo_forget();
+			WRITE_ONCE(osd_stereo, on);
+			pr_info(HW_NAME ": the GUI in %s\n", on ? "both views" : "the left view");
+		}
+		mutex_unlock(&h->mlock);
+		return n;
+	}
+	if (!fp_ensure())
 		return -ENODEV;
 	mutex_lock(&h->mlock);
 	if (fp_armer && fp_armer != f) {
@@ -1869,10 +2151,11 @@ static ssize_t hw_write(struct file *f, const char __user *u, size_t n, loff_t *
 
 static ssize_t hw_read(struct file *f, char __user *u, size_t n, loff_t *pos)
 {
-	char c[48];
+	char c[64];
 	loff_t at = 0;	/* always the whole line: a status */
-	int len = scnprintf(c, sizeof(c), "armed=%d on=%d started=%d\n", READ_ONCE(fp_armed), READ_ONCE(fp_on),
-			    READ_ONCE(gd->started));
+	/* gui: the GUI in both views (no "gui=": a module without it) */
+	int len = scnprintf(c, sizeof(c), "armed=%d on=%d started=%d gui=%d\n", READ_ONCE(fp_armed), READ_ONCE(fp_on),
+			    READ_ONCE(gd->started), READ_ONCE(osd_stereo));
 
 	return simple_read_from_buffer(u, n, &at, c, len);
 }
@@ -1886,6 +2169,12 @@ static int hw_release(struct inode *inode, struct file *f)
 		if (h->started)
 			hw_stop(h);
 		h->owner = NULL;
+	}
+	if (osd_stereo_owner == f) {
+		osd_stereo_owner = NULL;
+		plane_stereo_forget();
+		WRITE_ONCE(osd_stereo, false);
+		pr_info(HW_NAME ": the GUI in the left view (closed)\n");
 	}
 	if (fp_armer == f) {
 		fp_armer = NULL;
