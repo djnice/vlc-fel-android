@@ -296,7 +296,7 @@ the first MVC file is to play in 3D.
   after a seek may be a vsync late while the chain fills.
 - Subtitles and the OSD are VLC's as usual; Dolby Vision itself is shown by the player's DV core.
 - 3D MVC: the GUI (VLC's controls, subtitles) shows in the left view only (the mvc3d module can put a player's GUI
-  into both views since 2026.11.24.2; VLC FEL does not ask for it yet); Blu-ray ISO images / folders play
+  into both views, on the S928X since 2026.11.24.2 and on the S905X4 since 2026.11.26.4-sc2; VLC FEL does not ask for it yet); Blu-ray ISO images / folders play
   in 2D; frame packing only on the tested firmware builds (elsewhere: 2D); 1080p and 720p MVC only. After a
   seek into an open GOP (Blu-ray discs), up to ~1 s may show the base view twice (2D) until the next key
   picture. Some projectors drop the HDMI connection when switching from a 2160p desktop to frame packing,
@@ -304,6 +304,11 @@ the first MVC file is to play in 3D.
 
 ## Changes
 
+- **v0.2.24-poc** (mvc3d `2026.11.26.4-sc2` (S905X4) in libmvc3dplay; libVLC, libdvfelplay, the dvfel modules, the
+  S928X mvc3d and the app patches unchanged): on the S905X4, a seek or chapter change in 3D no longer makes the
+  firmware's Auto HDR set the HDMI mode again (the module reads back the colour format it expects while frame
+  packing forces 8 bit 4:4:4); 3D works when the box was started before the TV; the module puts a player's GUI into
+  both views on request, as on the S928X. New **Dune HD plugin `mvc3d 2026.11.26.1-0.2.24`** with this module.
 - **v0.2.23-poc** (mvc3d `2026.11.24.2` (S928X), libmvc3dplay `2026.11.24.2`, VLC patches 0060–0067; libdvfelplay,
   the dvfel modules, the S905X4 mvc3d and the app patches unchanged): libVLC with VLC patches 0060–0067
   (`3.0.24-101-gd9645d814c`): HDR10+ on every picture for files that send it sparsely (0060), DTS-HD / DTS:X from
